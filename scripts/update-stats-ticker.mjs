@@ -1,10 +1,17 @@
 #!/usr/bin/env node
 // Generates assets/stats-ticker.svg: a split-flap (airport departure board)
-// style widget showing live 14-day views, total release downloads, and
-// GitHub stars, in the MelonDMA brand palette. Each digit tile "flips" open
-// once when the image loads (no continuous scrolling).
+// style widget showing cumulative-all-time views, total release downloads,
+// and GitHub stars, in the MelonDMA brand palette. Each digit tile "flips"
+// open once when the image loads (no continuous scrolling).
+//
+// GitHub's traffic API only exposes a rolling 14-day view window, not an
+// all-time total, so assets/stats-state.json banks each day's count exactly
+// once (the day it first ages out of "today") into a running total that
+// only grows. Today's own count is re-read fresh every run and added on
+// top, so the number is live intraday without ever double-counting a
+// finalized day.
 
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const owner = process.env.GITHUB_REPOSITORY_OWNER || "denmrnngp-cloud";
 const repo = (process.env.GITHUB_REPOSITORY || `${owner}/MelonDMA`).split("/")[1];
@@ -47,8 +54,20 @@ function xml(value) {
     .replaceAll('"', "&quot;");
 }
 
+function readJson(path, fallback) {
+  if (!existsSync(path)) return fallback;
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    console.warn(`warning: ${path}: ${error.message}`);
+    return fallback;
+  }
+}
+
+const statePath = "assets/stats-state.json";
+
 const repoInfo = await github("", { stargazers_count: 0 });
-const views = await github("/traffic/views", { count: 0, uniques: 0 });
+const viewsResp = await github("/traffic/views?per=day", { views: [] });
 const releases = await githubPages("/releases?per_page=100");
 
 let totalDownloads = 0;
@@ -58,8 +77,31 @@ for (const release of releases) {
   }
 }
 
+// Bank each day's view count exactly once, the first time we see it as a
+// day strictly before "today" (so a day's count is only ever added after
+// it can no longer change). Today's count is re-read fresh every run.
+const state = readJson(statePath, { countedDays: {}, finalizedViews: 0 });
+const todayKey = new Date().toISOString().slice(0, 10);
+let todayViews = 0;
+for (const day of viewsResp.views || []) {
+  const dateKey = String(day.timestamp).slice(0, 10);
+  if (dateKey === todayKey) {
+    todayViews = day.count || 0;
+  } else if (dateKey < todayKey && !state.countedDays[dateKey]) {
+    state.finalizedViews += day.count || 0;
+    state.countedDays[dateKey] = true;
+  }
+}
+// Keep the counted-days ledger from growing forever (14-day API window
+// means anything older than ~30 days can never be re-seen).
+const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+for (const dateKey of Object.keys(state.countedDays)) {
+  if (dateKey < cutoff) delete state.countedDays[dateKey];
+}
+writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
 const stars = repoInfo.stargazers_count || 0;
-const viewCount = views.count || 0;
+const viewCount = state.finalizedViews + todayViews;
 
 // --- layout constants (brand: warm melon rind palette) ---
 // Fixed total width: matches the logo's display width in README.md
@@ -90,7 +132,7 @@ function padded(value, minDigits) {
 }
 
 const groups = [
-  { label: "VIEWS (14D)", digits: padded(viewCount, 3) },
+  { label: "VIEWS", digits: padded(viewCount, 3) },
   { label: "DOWNLOADS", digits: padded(totalDownloads, 2) },
   { label: "STARS", digits: padded(stars, 2) },
 ];
@@ -133,9 +175,9 @@ groups.forEach((group, groupIndex) => {
       <rect width="${TILE_W.toFixed(1)}" height="${TILE_H}" rx="10" fill="url(#tileBg)" stroke="${COLORS.border}" stroke-opacity="0.25"/>
       <line x1="3" y1="${TILE_H / 2}" x2="${(TILE_W - 3).toFixed(1)}" y2="${TILE_H / 2}" stroke="${COLORS.seam}" stroke-width="1.5" opacity="0.85"/>
       <text x="${(TILE_W / 2).toFixed(1)}" y="${TILE_H / 2 + DIGIT_FONT * 0.36}" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="${DIGIT_FONT}" fill="${COLORS.digit}">${digit}</text>
-      <rect x="0" y="0" width="${TILE_W.toFixed(1)}" height="${TILE_H}" rx="10" fill="${COLORS.flap}">
-        <animate attributeName="height" values="${TILE_H};0" keyTimes="0;1" dur="0.45s" begin="${delay}s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
-        <animate attributeName="y" values="0;${TILE_H / 2}" keyTimes="0;1" dur="0.45s" begin="${delay}s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+      <rect x="0" y="${TILE_H / 2}" width="${TILE_W.toFixed(1)}" height="0" rx="10" fill="${COLORS.flap}">
+        <animate attributeName="height" values="0;${TILE_H};0" keyTimes="0;0.55;1" dur="0.7s" begin="${delay}s" calcMode="spline" keySplines="0.3 0.7 0.3 1;0.3 0 0.7 1"/>
+        <animate attributeName="y" values="${TILE_H / 2};0;${TILE_H / 2}" keyTimes="0;0.55;1" dur="0.7s" begin="${delay}s" calcMode="spline" keySplines="0.3 0.7 0.3 1;0.3 0 0.7 1"/>
       </rect>
     </g>`);
   });
@@ -153,7 +195,7 @@ groups.forEach((group, groupIndex) => {
 const width = TOTAL_WIDTH;
 const now = new Date();
 const updated = now.toISOString().slice(0, 16).replace("T", " ") + " UTC";
-const ariaLabel = `MelonDMA live stats — 14-day views: ${viewCount}, total downloads: ${totalDownloads}, GitHub stars: ${stars}. Updated ${updated}.`;
+const ariaLabel = `MelonDMA live stats — total views: ${viewCount} (tracked since ${Object.keys(state.countedDays).sort()[0] || todayKey}, GitHub only retains 14 days per API call so earlier history can't be recovered), total downloads: ${totalDownloads}, GitHub stars: ${stars}. Updated ${updated}.`;
 
 const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${HEIGHT}" viewBox="0 0 ${width} ${HEIGHT}" role="img" aria-label="${xml(ariaLabel)}">
   <defs>
