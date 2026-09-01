@@ -1,7 +1,7 @@
 # MelonDMA
 
 <p align="center">
-  <img src="MelonDMA.png" width="280" alt="MelonDMA logo" />
+  <img src="MelonDMA.png" width="640" alt="MelonDMA logo" />
 </p>
 
 A macOS **DriverKit (DEXT)** RDMA provider for **Mellanox/NVIDIA ConnectX** cards
