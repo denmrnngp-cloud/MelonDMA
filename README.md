@@ -4,6 +4,10 @@
   <img src="MelonDMA.png" width="640" alt="MelonDMA logo" />
 </p>
 
+<p align="center">
+  <img src="assets/stats-ticker.svg" alt="MelonDMA live stats: 14-day views, total downloads, GitHub stars" />
+</p>
+
 A macOS **DriverKit (DEXT)** RDMA provider for **Mellanox/NVIDIA ConnectX** cards
 over **RoCEv2**, with a **libibverbs-compatible userspace layer**.
 
@@ -342,3 +346,21 @@ GPL-2.0 — see [LICENSE](LICENSE). MelonDMA is a port of GPL-2.0-only mlx5
 driver code (AppleMCX → MLNX_OFED 5.9), so the project is licensed as a whole
 under GPL-2.0. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the full
 provenance and what is deliberately kept out of the repository.
+
+---
+
+## Support the Project
+
+This is a one-person effort, tested against real hardware out of pocket. If
+MelonDMA is useful to you and you'd like to help fund new network cards, better
+test rigs, and continued development, donations are welcome:
+
+| Currency | Address |
+|----------|---------|
+| BTC | `bc1q0grdsuh0a5hh360yksa5j07zqme2vgaxuwettl` |
+| ETH | `0xC19ee0fE4e39A877Fa170fDa17B551b5e2815BA5` |
+| USDT (ERC-20) | `0xC19ee0fE4e39A877Fa170fDa17B551b5e2815BA5` |
+| USDC (ERC-20) | `0xC19ee0fE4e39A877Fa170fDa17B551b5e2815BA5` |
+
+USDT/USDC addresses are on the **Ethereum network only** — do not send on
+another chain.

@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="371" height="114" viewBox="0 0 371 114" role="img" aria-label="MelonDMA live stats — 14-day views: 288, total downloads: 0, GitHub stars: 1. Updated 2026-09-01 23:38 UTC.">
+  <defs>
+    <linearGradient id="boardBg" x1="0" y1="0" x2="371" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#241608"/>
+      <stop offset="0.5" stop-color="#1a0f06"/>
+      <stop offset="1" stop-color="#241608"/>
+    </linearGradient>
+    <linearGradient id="tileBg" x1="0" y1="0" x2="0" y2="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2f1e0e"/>
+      <stop offset="1" stop-color="#190f06"/>
+    </linearGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="370" height="113" rx="18" fill="url(#boardBg)" stroke="#C97A1E" stroke-opacity="0.35"/>
+  <text x="75" y="30" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="10" letter-spacing="2" fill="#D9A566">VIEWS (14D)</text>
+  
+    <g transform="translate(22.0,40)">
+      <rect width="32" height="46" rx="7" fill="url(#tileBg)" stroke="#C97A1E" stroke-opacity="0.25"/>
+      <line x1="2" y1="23" x2="30" y2="23" stroke="#0f0904" stroke-width="1" opacity="0.85"/>
+      <text x="16" y="32" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="26" fill="#FFD27A">2</text>
+      <rect x="0" y="0" width="32" height="46" rx="7" fill="#3a2410">
+        <animate attributeName="height" values="46;0" keyTimes="0;1" dur="0.45s" begin="0.15s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+        <animate attributeName="y" values="0;23" keyTimes="0;1" dur="0.45s" begin="0.15s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+      </rect>
+    </g>
+  
+    <g transform="translate(59.0,40)">
+      <rect width="32" height="46" rx="7" fill="url(#tileBg)" stroke="#C97A1E" stroke-opacity="0.25"/>
+      <line x1="2" y1="23" x2="30" y2="23" stroke="#0f0904" stroke-width="1" opacity="0.85"/>
+      <text x="16" y="32" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="26" fill="#FFD27A">8</text>
+      <rect x="0" y="0" width="32" height="46" rx="7" fill="#3a2410">
+        <animate attributeName="height" values="46;0" keyTimes="0;1" dur="0.45s" begin="0.24s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+        <animate attributeName="y" values="0;23" keyTimes="0;1" dur="0.45s" begin="0.24s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+      </rect>
+    </g>
+  
+    <g transform="translate(96.0,40)">
+      <rect width="32" height="46" rx="7" fill="url(#tileBg)" stroke="#C97A1E" stroke-opacity="0.25"/>
+      <line x1="2" y1="23" x2="30" y2="23" stroke="#0f0904" stroke-width="1" opacity="0.85"/>
+      <text x="16" y="32" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="26" fill="#FFD27A">8</text>
+      <rect x="0" y="0" width="32" height="46" rx="7" fill="#3a2410">
+        <animate attributeName="height" values="46;0" keyTimes="0;1" dur="0.45s" begin="0.33s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+        <animate attributeName="y" values="0;23" keyTimes="0;1" dur="0.45s" begin="0.33s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+      </rect>
+    </g>
+  <text x="204" y="30" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="10" letter-spacing="2" fill="#D9A566">DOWNLOADS</text>
+  
+    <g transform="translate(169.5,40)">
+      <rect width="32" height="46" rx="7" fill="url(#tileBg)" stroke="#C97A1E" stroke-opacity="0.25"/>
+      <line x1="2" y1="23" x2="30" y2="23" stroke="#0f0904" stroke-width="1" opacity="0.85"/>
+      <text x="16" y="32" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="26" fill="#FFD27A">0</text>
+      <rect x="0" y="0" width="32" height="46" rx="7" fill="#3a2410">
+        <animate attributeName="height" values="46;0" keyTimes="0;1" dur="0.45s" begin="0.42s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+        <animate attributeName="y" values="0;23" keyTimes="0;1" dur="0.45s" begin="0.42s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+      </rect>
+    </g>
+  
+    <g transform="translate(206.5,40)">
+      <rect width="32" height="46" rx="7" fill="url(#tileBg)" stroke="#C97A1E" stroke-opacity="0.25"/>
+      <line x1="2" y1="23" x2="30" y2="23" stroke="#0f0904" stroke-width="1" opacity="0.85"/>
+      <text x="16" y="32" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="26" fill="#FFD27A">0</text>
+      <rect x="0" y="0" width="32" height="46" rx="7" fill="#3a2410">
+        <animate attributeName="height" values="46;0" keyTimes="0;1" dur="0.45s" begin="0.51s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+        <animate attributeName="y" values="0;23" keyTimes="0;1" dur="0.45s" begin="0.51s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+      </rect>
+    </g>
+  <text x="314.5" y="30" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="10" letter-spacing="2" fill="#D9A566">STARS</text>
+  
+    <g transform="translate(280.0,40)">
+      <rect width="32" height="46" rx="7" fill="url(#tileBg)" stroke="#C97A1E" stroke-opacity="0.25"/>
+      <line x1="2" y1="23" x2="30" y2="23" stroke="#0f0904" stroke-width="1" opacity="0.85"/>
+      <text x="16" y="32" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="26" fill="#FFD27A">0</text>
+      <rect x="0" y="0" width="32" height="46" rx="7" fill="#3a2410">
+        <animate attributeName="height" values="46;0" keyTimes="0;1" dur="0.45s" begin="0.60s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+        <animate attributeName="y" values="0;23" keyTimes="0;1" dur="0.45s" begin="0.60s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+      </rect>
+    </g>
+  
+    <g transform="translate(317.0,40)">
+      <rect width="32" height="46" rx="7" fill="url(#tileBg)" stroke="#C97A1E" stroke-opacity="0.25"/>
+      <line x1="2" y1="23" x2="30" y2="23" stroke="#0f0904" stroke-width="1" opacity="0.85"/>
+      <text x="16" y="32" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="26" fill="#FFD27A">1</text>
+      <rect x="0" y="0" width="32" height="46" rx="7" fill="#3a2410">
+        <animate attributeName="height" values="46;0" keyTimes="0;1" dur="0.45s" begin="0.69s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+        <animate attributeName="y" values="0;23" keyTimes="0;1" dur="0.45s" begin="0.69s" calcMode="spline" keySplines="0.2 0.8 0.2 1" fill="freeze"/>
+      </rect>
+    </g>
+  <text x="148.0" y="68" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#D9A566" opacity="0.5">&#8226;</text>
+  <text x="260.0" y="68" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#D9A566" opacity="0.5">&#8226;</text>
+  <circle cx="18" cy="100" r="4" fill="#5FA347">
+    <animate attributeName="opacity" values="1;0.35;1" dur="1.8s" repeatCount="indefinite"/>
+  </circle>
+  <text x="30" y="104" font-family="Arial, Helvetica, sans-serif" font-size="9" fill="#8B7860">auto-updates hourly &#8226; updated 2026-09-01 23:38 UTC</text>
+</svg>
