@@ -1,0 +1,43 @@
+# macOS
+.DS_Store
+
+# Python bytecode / caches
+__pycache__/
+*.pyc
+
+# Build artifacts (`build/` covers src/dext/build/ and
+# src/dext/kext-test/build/; build2/ is a kext-test leftover)
+build/
+build2/
+*.dSYM/
+*.dylib
+*.o
+*.so
+
+# Bundled driver/app products. The source .dext bundle definition in
+# src/dext/MlxRDMA.dext/ is KEPT — it holds the Info.plist and entitlements
+# the Makefile signs and copies. Compiled bundles land under build/.
+*.dext
+!src/dext/MlxRDMA.dext/
+*.app
+
+# Xcode
+xcuserdata/
+DerivedData/
+
+# XNU/DriverKit kernel sources kept locally as research reference (APSL-2.0,
+# not GPL-2.0-compatible for redistribution as part of this repo) — see
+# THIRD_PARTY_NOTICES.md "What is deliberately not in this repository".
+/IOService.cpp
+/IOUserClient.cpp
+/IOUserServer.cpp
+
+# Compiled dev-tool binaries (build from the .c source next to them instead;
+# a committed binary here would embed the builder's real code-signing
+# certificate — see notes/README.md).
+/src/dext/scripts/build_mlxdetach
+/src/dext/scripts/takeover2
+
+# Third-party donor and archived prototypes remain local-only.
+/donors/
+/archive/

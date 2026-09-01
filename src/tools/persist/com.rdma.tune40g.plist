@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rdma.tune40g</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>/usr/local/libexec/rdma-tune40g.sh</string>
+    </array>
+
+    <!-- Watchdog: launch at boot AND keep alive continuously -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Restart on crash after 5 sec -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/rdma-tune40g.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/rdma-tune40g.log</string>
+</dict>
+</plist>

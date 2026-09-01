@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Entitlements for MlxRDMA.dext (PCIDriverKit port of AppleMCX).
+      These are requested via the Apple Developer entitlement request form at
+      https://developer.apple.com/contact/request-entitlements/ and are NOT
+      granted automatically by the paid Apple Developer Program membership.
+      Both are required:
+        - transport.pci:        DEXT matches on IOPCIDevice 15b3:1015
+        - userclient-access:    belongs to each client executable, not the DEXT
+      Team ID: <your Team ID> (Developer ID Application: <your name>)
+    -->
+
+    <!-- Direct PCI BAR/MMIO/DMA/interrupt access to the ConnectX-4 Lx. -->
+    <key>com.apple.developer.driverkit.transport.pci</key>
+    <array>
+        <dict>
+            <key>IOPCIMatch</key>
+            <string>0x101515b3</string>
+        </dict>
+    </array>
+
+    <!-- Required for the driver_extension system-extension category
+         (sysextd checks this on every dext, separate from transport.pci). -->
+    <key>com.apple.developer.driverkit</key>
+    <true/>
+
+    <!-- Clients are authorized individually with userclient-access.  Production
+         builds intentionally do not use allow-any-userclient-access. -->
+</dict>
+</plist>

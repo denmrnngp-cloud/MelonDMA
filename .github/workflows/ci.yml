@@ -1,0 +1,24 @@
+# CI gate: host encoder tests + arm64e DriverKit syntax check.
+#
+# Catches the failure modes this project has already paid for once, without
+# needing hardware (notes/27, docs/roadmap.md "CI build gate"):
+#   - a plain-arm64 (non-arm64e) dext, which panics the kernel on spawn;
+#   - DriverKit SDK / IIG regressions (check-iig runs inside check-dext);
+#   - portable-IFC encoder regressions (the host suite runs under ASan/UBSan).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host tests (portable IFC encoders + shim + service matching)
+        run: make -C src/dext check-host
+
+      - name: DEXT syntax check (arm64e, DriverKit SDK)
+        run: make -C src/dext check-dext

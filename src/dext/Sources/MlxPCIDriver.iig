@@ -1,0 +1,146 @@
+/*
+ * MlxPCIDriver.iig — DriverKit DEXT PCI binding layer (core entry).
+ *
+ * PCIDriverKit port of AppleMCX's MlxPCIDriver (kext). The kext version used
+ * IOPCIDevice (kernel IOKit) + IOMemoryMap::getVirtualAddress() for MMIO.
+ * The DEXT version uses PCIDriverKit.framework's IOPCIDevice with MemoryRead/
+ * Write32 and _CopyDeviceMemoryWithIndex for the BAR aperture, and
+ * IOBufferMemoryDescriptor + IODMACommand for DMA.
+ *
+ * One instance per ConnectX device. Matches 15b3:1015 (ConnectX-4 Lx) with a
+ * high IOProbeScore to win against the system AppleEthernetMLX5 DEXT.
+ *
+ * References: notes/11 §2 (DriverKit memory API), notes/19 Phase 2,
+ *             notes/21 (entitlement checklist).
+ */
+#ifndef MLX_PCI_DRIVER_IIG
+#define MLX_PCI_DRIVER_IIG
+
+#include <DriverKit/IOService.iig>
+#include <DriverKit/IOTimerDispatchSource.iig>
+#include <PCIDriverKit/IOPCIDevice.iig>
+
+class MlxUserClient;
+class MlxCmd;
+class MlxEQ;
+class MlxUAR;
+class MlxHCA;
+class MlxHealth;
+class MlxDMA;
+class MlxFwPages;
+class MlxRoCE;
+struct mlx_stable_init_cycle_resp;
+
+class MlxPCIDriver : public IOService
+{
+public:
+    virtual bool
+    init() override;
+
+    virtual void
+    free() override;
+
+    virtual kern_return_t
+    Start(IOService * provider) LOCAL;
+
+    virtual kern_return_t
+    Stop(IOService * provider) LOCAL;
+
+    virtual kern_return_t
+    NewUserClient(uint32_t type, IOUserClient **userClient) override;
+
+    /* Hardware accessors for sub-modules. */
+    IOPCIDevice *   GetPCI()   LOCALONLY { return fPci; }
+    MlxCmd *        GetCmd()   LOCALONLY { return fCmd; }
+    MlxEQ *         GetEQ()    LOCALONLY { return fEQ; }
+    MlxUAR *        GetUAR()   LOCALONLY { return fUAR; }
+    MlxHCA *        GetHCA()   LOCALONLY { return fHCA; }
+    MlxHealth *     GetHealth()LOCALONLY { return fHealth; }
+    MlxDMA *        GetDMA()   LOCALONLY { return fDMA; }
+    MlxFwPages *    GetPages() LOCALONLY { return fFwPages; }
+    MlxRoCE *       GetRoCE()  LOCALONLY { return fRoCE; }
+
+    /* Firmware command shortcut (implemented by MlxCmd). */
+    kern_return_t   Exec(uint32_t opcode, const void *in, uint32_t inSize,
+                         void *out, uint32_t outSize, uint32_t timeoutMs) LOCALONLY;
+
+    /* BAR0 access for MMIO helpers. LOCALONLY inline. */
+    IOMemoryDescriptor * GetBar0Memory() LOCALONLY { return fBar0Mem; }
+    uint8_t              GetBar0Index()  LOCALONLY { return fBar0Index; }
+
+    uint32_t        GetIssi() const  LOCALONLY { return fIssi; }
+    uint32_t        GetPd() const    LOCALONLY { return fPd; }
+    uint32_t        GetXrcd() const  LOCALONLY { return fXrcd; }
+    uint32_t        GetDevIdx() const LOCALONLY { return fDevIdx; }
+    const char *    GetDevName() const LOCALONLY { return fDevName; }
+
+    bool            RoCEPublicationAllowed() const LOCALONLY;
+    bool            Phase2Ready() const LOCALONLY;
+    bool            DmaQuarantined() const LOCALONLY;
+    void            RetainDmaUntilReset(void *mem,
+                                        void *dma,
+                                        uint32_t reason) LOCALONLY;
+    void            EnterDmaQuarantine(uint32_t reason) LOCALONLY;
+
+private:
+    kern_return_t StartEqPoller() LOCALONLY;
+    void StopEqPoller() LOCALONLY;
+    virtual void EqTimerOccurred(OSAction *action, uint64_t time)
+        TYPE(IOTimerDispatchSource::TimerOccurred) LOCAL;
+    void DestroyPhase2FirmwareResources() LOCALONLY;
+    bool InitPhase2Runtime() LOCALONLY;
+
+    bool    FwInit() LOCALONLY;
+    bool    EnableHca() LOCALONLY;
+    bool    SetIssi() LOCALONLY;
+    bool    SetHcaCaps() LOCALONLY;
+    bool    InitHca() LOCALONLY;
+    bool    TeardownHca() LOCALONLY;
+    bool    DisableHca() LOCALONLY;
+    bool    QueryHcaCaps() LOCALONLY;
+    bool    QueryHcaCap(uint16_t type, uint16_t mode, uint8_t *capability) LOCALONLY;
+    bool    SetAtomicReqEndianness() LOCALONLY;
+    bool    AllocPd() LOCALONLY;
+    bool    AllocXrcd() LOCALONLY;
+    void    Cleanup() LOCALONLY;
+    bool    PerformFlr() LOCALONLY;
+    /* Called from MlxUserClient (kMlxUCMethodFwReinit): restart
+     * firmware init without changing the card owner. */
+    kern_return_t   ReinitFw() LOCALONLY;
+    kern_return_t   StableInitCycle(struct mlx_stable_init_cycle_resp *report)
+        LOCALONLY;
+
+    /* Debug interface for mlx_probe (notes/35): FLR without FwInit. */
+    kern_return_t   DbgPerformFlr() LOCALONLY;
+
+    bool    DisableBusMasterAndVerify() LOCALONLY;
+    bool    NegotiateRoceCap() LOCALONLY;
+    bool    PublishNubs() LOCALONLY;
+
+    IOPCIDevice     *fPci;
+    IOMemoryDescriptor *fBar0Mem;   /* BAR0 aperture from _CopyDeviceMemoryWithIndex */
+    uint8_t          fBar0Index;    /* BAR index (memory index for MemoryRead/Write) */
+    uint16_t         fDeviceId;
+    MlxCmd          *fCmd;
+    MlxEQ           *fEQ;
+    MlxUAR          *fUAR;
+    MlxHCA          *fHCA;
+    MlxHealth       *fHealth;
+    MlxDMA          *fDMA;
+    MlxFwPages      *fFwPages;
+    MlxRoCE         *fRoCE;
+    IODispatchQueue *fEqQueue;
+    IOTimerDispatchSource *fEqTimer;
+    uint32_t         fIssi;
+    uint32_t         fPd;
+    uint32_t         fXrcd;
+    uint32_t         fDevIdx;
+    char             fDevName[16];
+    bool             fHcaEnabled;
+    bool             fHcaInitialized;
+    bool             fRuntimePagesStarted;
+    bool             fStopping;
+    bool             fDmaQuarantined;
+};
+
+#endif /* MLX_PCI_DRIVER_IIG */

@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>MlxRDMA</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.mlx5.rdma.dext</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>MlxRDMA</string>
+	<key>CFBundlePackageType</key>
+	<string>DEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.308</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>DriverKit</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>0.308</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>MlxPCIDriver</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.mlx5.rdma.dext</string>
+			<key>CFBundleIdentifierKernel</key>
+			<string>com.apple.kpi.iokit</string>
+			<key>IOClass</key>
+			<string>IOUserService</string>
+			<key>IOPCIMatch</key>
+			<string>0x101515b3</string>
+			<key>IOPCITunnelCompatible</key>
+			<true/>
+			<key>IOProbeScore</key>
+			<integer>5000</integer>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOUserClass</key>
+			<string>MlxPCIDriver</string>
+			<key>IOUserServerName</key>
+			<string>com.mlx5.rdma.dext</string>
+			<key>MlxBuildTag</key>
+			<string>p3-cq-arm-1</string>
+			<key>MlxRDMAUserClient</key>
+			<dict>
+				<key>IOClass</key>
+				<string>IOUserUserClient</string>
+				<key>IOServiceDEXTEntitlements</key>
+				<array>
+					<string>com.apple.developer.driverkit.userclient-access</string>
+				</array>
+				<key>IOUserClass</key>
+				<string>MlxUserClient</string>
+			</dict>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.DriverKit</key>
+		<string>20.0</string>
+		<key>com.apple.driverkit-family.ApplePCIDriverKit</key>
+		<string>20.0</string>
+	</dict>
+	<key>OSBundleUsageDescription</key>
+	<string>User-space RoCEv2 RDMA driver over PCIDriverKit for Mellanox ConnectX. Direct PCI BAR access, DMA, and interrupts implement hardware-offloaded RDMA transport; the built-in AppleEthernetMLX5 only exposes Ethernet.</string>
+</dict>
+</plist>

@@ -1,0 +1,72 @@
+/*
+ * MlxUserClient.iig — DriverKit user client (app ↔ DEXT boundary).
+ *
+ * PCIDriverKit port of AppleMCX's MlxUserClient (kext IOUserClient).
+ * The selector table and POD ABI structs live in MlxUCIO.h (shared with
+ * userspace). The kext used IOExternalMethodDispatch + OSArray/OSData ownership
+ * tracking; the DEXT version uses IOUserClientMethodDispatch + the same
+ * ownership logic via OSArray/OSData (available in DriverKit).
+ *
+ * Doorbell model: Option B (kernel-mediated posting) from REMEDIATION_PLAN §7.1.
+ * Hardware queues and doorbells stay private to the DEXT; the Phase 2 data
+ * path is kernel-mediated through ExternalMethod.
+ */
+#ifndef MLX_USERCLIENT_IIG
+#define MLX_USERCLIENT_IIG
+
+#include <DriverKit/IOUserClient.iig>
+
+class MlxRoCE;
+class MlxPCIDriver;
+
+class MlxUserClient : public IOUserClient
+{
+public:
+    virtual bool
+    init() override;
+
+    virtual void
+    free() override;
+
+    virtual kern_return_t
+    Start(IOService * provider) LOCAL;
+
+    virtual kern_return_t
+    Stop(IOService * provider) LOCAL;
+
+    virtual kern_return_t
+    ExternalMethod(
+        uint64_t                             selector,
+        IOUserClientMethodArguments        * arguments,
+        const IOUserClientMethodDispatch   * dispatch,
+        OSObject                           * target,
+        void                               * reference) LOCAL;
+
+    virtual kern_return_t
+    CopyClientMemoryForType(uint64_t type, uint64_t *options,
+                            IOMemoryDescriptor **memory) LOCAL;
+
+private:
+    void Cleanup() LOCALONLY;
+    void ReleaseOwnedResources() LOCALONLY;
+
+    /* Debug interface dispatch (mlx_probe, notes/35). */
+    kern_return_t DispatchDebugMethod(uint64_t selector,
+                                      IOUserClientMethodArguments *arguments) LOCALONLY;
+
+    bool AddOwned(class OSArray *table, uint32_t handle) LOCALONLY;
+    bool RemoveOwned(class OSArray *table, uint32_t handle) LOCALONLY;
+    bool Owns(class OSArray *table, uint32_t handle) LOCALONLY;
+    bool TakeOwned(class OSArray *table, uint32_t *handle) LOCALONLY;
+    MlxRoCE        *fRoce;
+    MlxPCIDriver   *fCore;
+    class OSArray  *fOwnedQp;
+    class OSArray  *fOwnedCq;
+    class OSArray  *fOwnedMr;
+    class OSArray  *fOwnedMw;
+    class OSArray  *fOwnedAh;
+    class OSArray  *fOwnedGid;
+    struct IOLock  *fOwnedLock;
+};
+
+#endif /* MLX_USERCLIENT_IIG */
