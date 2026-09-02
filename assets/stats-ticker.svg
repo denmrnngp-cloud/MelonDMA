@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="640" height="181" viewBox="0 0 640 181" role="img" aria-label="MelonDMA live stats — total views: 288 (tracked since 2026-08-18, GitHub only retains 14 days per API call so earlier history can't be recovered), total downloads: 0, GitHub stars: 1. Updated 2026-09-02 06:20 UTC.">
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="181" viewBox="0 0 640 181" role="img" aria-label="MelonDMA live stats — total views: 288 (tracked since 2026-08-18, GitHub only retains 14 days per API call so earlier history can't be recovered), total downloads: 0, GitHub stars: 1. Updated 2026-09-02 11:31 UTC.">
   <defs>
     <linearGradient id="boardBg" x1="0" y1="0" x2="640" y2="0" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#241608"/>
@@ -89,5 +89,5 @@
   <circle cx="30" cy="165" r="5" fill="#5FA347">
     <animate attributeName="opacity" values="1;0.35;1" dur="1.8s" repeatCount="indefinite"/>
   </circle>
-  <text x="42" y="169" font-family="Arial, Helvetica, sans-serif" font-size="11" fill="#8B7860">auto-updates every few minutes &#8226; updated 2026-09-02 06:20 UTC</text>
+  <text x="42" y="169" font-family="Arial, Helvetica, sans-serif" font-size="11" fill="#8B7860">auto-updates every few minutes &#8226; updated 2026-09-02 11:31 UTC</text>
 </svg>
