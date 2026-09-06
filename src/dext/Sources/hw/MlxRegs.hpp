@@ -91,6 +91,11 @@ enum {
     MLX_CMD_OP_ALLOC_UAR              = 0x802,
     MLX_CMD_OP_FREE_UAR               = 0x803,
     MLX_CMD_OP_ACCESS_REG             = 0x805,
+    /* ACCESS_REG register ids. PPCNT carries the port counter sets; MPEIN
+     * describes the PCIe link the card sits behind, which on this host is a
+     * Thunderbolt tunnel rather than a slot. */
+    MLX_REG_ID_PPCNT                  = 0x5008,
+    MLX_REG_ID_MPEIN                  = 0x9050,
     MLX_CMD_OP_CREATE_MKEY            = 0x200,
     MLX_CMD_OP_QUERY_MKEY             = 0x201,
     MLX_CMD_OP_DESTROY_MKEY           = 0x202,

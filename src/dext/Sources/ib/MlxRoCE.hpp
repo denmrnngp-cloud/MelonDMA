@@ -63,6 +63,17 @@ public:
     kern_return_t   DestroyAH(uint32_t ahHandle);
     kern_return_t   QueryDevice(struct mlx_query_device_resp *resp);
     kern_return_t   QueryPort(struct mlx_query_port_resp *resp);
+    /* ACCESS_REG (0x805). `write` selects the firmware's write op_mod; the
+     * caller supplies and receives the register payload only, without the
+     * command header. Diagnostics-only at the UserClient boundary. */
+    kern_return_t   AccessReg(uint16_t registerId, bool write, uint32_t argument,
+                              const void *dataIn, uint32_t dataInSize,
+                              void *dataOut, uint32_t dataOutSize);
+    /* Port counters straight from the card: PPCNT group 0 (IEEE 802.3) and
+     * group 1 (RFC 2863), plus link state from QUERY_VPORT_STATE. This is the
+     * receive-side view the host has no other way to see, because the DEXT
+     * owns the port and no macOS netif exists behind it. */
+    kern_return_t   PortStats(struct mlx_port_stats_resp *resp);
     kern_return_t   QueryGidTable(const struct mlx_query_gid_table_req *req,
                                  struct mlx_query_gid_table_resp *resp);
     kern_return_t   PostSendInline(const struct mlx_post_send_inline_req *req);

@@ -82,7 +82,7 @@ struct mlx_query_abi_resp {
     uint32_t features;
 };
 
-/* Shared-page fast path: the per-QP DB-record
+/* Shared-page fast path (docs/shared-page-fast-path.md): the per-QP DB-record
  * slot is 128 bytes; hardware doorbell records use offsets 0..7.  The software
  * producer/consumer shadow state lives at offset 8 so a trusted client can
  * publish sq/rq heads and tails without a DriverKit crossing.  All indices are
@@ -833,17 +833,20 @@ enum {
 
 /* ===== firmware management structs (POD) ===== */
 
-/* ACCESS_REG request: register_id + read/write direction + data */
+/* ACCESS_REG request: register_id + read/write direction + data.
+ * 512 bytes of payload so the wide counter registers fit: PPCNT alone is
+ * 264 bytes (8 byte header + a 256 byte counter set). */
+#define MLX_UC_ACCESS_REG_MAX_DATA 512u
 struct mlx_access_reg_req {
-    uint32_t  registerId;      /* e.g. PFCC/QTCT/PVLC, etc. */
-    uint32_t  opMod;           /* 0=read 1=write */
+    uint32_t  registerId;      /* e.g. PPCNT/MPEIN/PFCC/PTYS */
+    uint32_t  opMod;           /* 0=write 1=read, as the firmware defines it */
     uint32_t  argument;        /* additional argument */
-    uint8_t   data[256];       /* register data */
-    uint32_t  dataSize;
+    uint8_t   data[MLX_UC_ACCESS_REG_MAX_DATA];  /* register payload */
+    uint32_t  dataSize;        /* payload bytes supplied, and requested back */
 };
 struct mlx_access_reg_resp {
-    uint8_t   data[256];
-    uint32_t  dataSize;
+    uint8_t   data[MLX_UC_ACCESS_REG_MAX_DATA];
+    uint32_t  dataSize;        /* payload bytes written */
 };
 
 /* firmware command passthrough (used by mlxup) */
@@ -873,14 +876,26 @@ struct mlx_port_stats_resp {
     uint64_t  txPkts;
     uint64_t  rxBytes;
     uint64_t  txBytes;
-    uint64_t  rxDrop;
-    uint64_t  txDrop;
-    uint64_t  rxErrors;
-    uint64_t  txErrors;
+    uint64_t  rxDrop;          /* RFC 2863 if_in_discards */
+    uint64_t  txDrop;          /* RFC 2863 if_out_discards */
+    uint64_t  rxErrors;        /* FCS + alignment + too-long */
+    uint64_t  txErrors;        /* RFC 2863 if_out_errors */
+    uint64_t  rxPause;         /* 802.3 pause frames received */
+    uint64_t  txPause;         /* 802.3 pause frames transmitted */
     uint32_t  linkSpeed;
     uint8_t   linkState;       /* 0=down 1=up */
     uint8_t   portNum;
+    uint16_t  reserved0;
 };
+
+#if defined(__cplusplus)
+static_assert(sizeof(struct mlx_port_stats_resp) == 88,
+              "mlx_port_stats_resp ABI mismatch");
+static_assert(sizeof(struct mlx_access_reg_req) == 528,
+              "mlx_access_reg_req ABI mismatch");
+static_assert(sizeof(struct mlx_access_reg_resp) == 516,
+              "mlx_access_reg_resp ABI mismatch");
+#endif
 
 /* ========== struct definitions (POD) ========== */
 

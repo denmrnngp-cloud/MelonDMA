@@ -95,7 +95,7 @@ int main(void) {
     // Wrapping the UAR VA (PCIe BAR MMIO) in a Metal buffer via
     // newBufferWithBytesNoCopy: hard-panics the kernel (IOGPUFamily/AGXG14X
     // dereferences the MMIO phys page 0x290004 < DRAM start 0x4000000).
-    // Do not re-add. See header RESULT.
+    // Do not re-add. See header RESULT + docs/apple-silicon-metal-dma.md §7.1.
     printf("Phase B (UAR doorbell via GPU): CLOSED — Apple GPU cannot write "
            "PCIe MMIO; probing via bytesNoCopy panics the kernel (see source).\n");
 

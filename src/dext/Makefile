@@ -537,6 +537,21 @@ build/mlx_datapath_bench: tools/mlx_datapath_bench.c build/libibverbs.dylib tool
 datapath-bench: build/mlx_datapath_bench
 	@echo "=== built P0 datapath baseline bench: $< ==="
 
+# The card's own port counters: the only receive-side view of the wire on a
+# host where the DEXT owns the port and no netif exists. --pcie adds MPEIN and
+# needs the diagnostic entitlement.
+build/mlx_port_counters: tools/mlx_port_counters.c build/librdma_shim.dylib tools/diagnostic.entitlements | build
+	clang -std=c11 -Wall -Wextra -Werror -g -O2 \
+	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
+	    -I usermode/librdma_shim -L build -lrdma_shim \
+	    -rpath $(CURDIR)/build -framework IOKit -framework CoreFoundation \
+	    tools/mlx_port_counters.c -o $@
+	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
+	    --entitlements tools/diagnostic.entitlements $@
+
+port-counters: build/mlx_port_counters
+	@echo "=== built port counter reader: $< ==="
+
 # Large-MR loopback: proves the coalesced MTT translates VA->IOVA correctly,
 # not just that CREATE_MKEY was firmware-accepted (self RDMA_WRITE + memcmp).
 build/mlx_large_mr_dma: tools/mlx_large_mr_dma.c build/libibverbs.dylib tools/reinit.entitlements | build

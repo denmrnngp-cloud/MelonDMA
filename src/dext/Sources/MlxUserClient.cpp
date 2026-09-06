@@ -696,6 +696,10 @@ static const MlxMethodSpec sMlxMethods[] = {
                   sizeof(struct mlx_query_device_resp)),
     MLX_UC_METHOD(kMlxUCMethodQueryPort, 0,
                   sizeof(struct mlx_query_port_resp)),
+    MLX_UC_METHOD(kMlxUCMethodPortStats, 0,
+                  sizeof(struct mlx_port_stats_resp)),
+    MLX_UC_METHOD(kMlxUCMethodAccessReg, sizeof(struct mlx_access_reg_req),
+                  sizeof(struct mlx_access_reg_resp)),
     MLX_UC_METHOD(kMlxUCMethodQueryHealth, 0,
                   sizeof(struct mlx_health_resp)),
     MLX_UC_METHOD(kMlxUCMethodQueryInterrupts, 0,
@@ -994,6 +998,24 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         return ivars->fRoce->QueryDevice((struct mlx_query_device_resp *)out);
     case kMlxUCMethodQueryPort:
         return ivars->fRoce->QueryPort((struct mlx_query_port_resp *)out);
+    case kMlxUCMethodPortStats:
+        if (!out) return kIOReturnBadArgument;
+        return ivars->fRoce->PortStats((struct mlx_port_stats_resp *)out);
+    case kMlxUCMethodAccessReg: {
+        /* Privileged: the early diagnostics gate above rejects this selector
+         * for ordinary clients. Raw register access stays a debugging tool. */
+        if (!in || !out) return kIOReturnBadArgument;
+        const struct mlx_access_reg_req *req = (const struct mlx_access_reg_req *)in;
+        struct mlx_access_reg_resp *resp = (struct mlx_access_reg_resp *)out;
+        if (req->dataSize > sizeof(req->data)) return kIOReturnBadArgument;
+        if (req->registerId > 0xffff) return kIOReturnBadArgument;
+        kern_return_t regKr = ivars->fRoce->AccessReg((uint16_t)req->registerId,
+                                                      req->opMod == 0, req->argument,
+                                                      req->data, req->dataSize,
+                                                      resp->data, req->dataSize);
+        resp->dataSize = (regKr == kIOReturnSuccess) ? req->dataSize : 0;
+        return regKr;
+    }
     case kMlxUCMethodQueryHealth: {
         struct mlx_health_resp *resp = (struct mlx_health_resp *)out;
         MlxHealth *health = ivars->fCore ? ivars->fCore->GetHealth() : NULL;

@@ -56,8 +56,10 @@ requests and work completions, GID resolution, RC atomics, and QoS/service-level
   developed and exercised with **SIP disabled** (or `systemextensionsctl developer on`)
   and a locally signed driver.
 * These two facts — passing hardware gates and the outstanding entitlement grant —
-  are the real state of the project. See `docs/architecture.md` for the design and
-  `docs/inference-client-guide.md` for the client API; status and gate results
+  are the real state of the project. See `docs/architecture.md` for the design,
+  `docs/inference-client-guide.md` for the client API and
+  `docs/llama-rdma-tuning.md` for the settings llama.cpp needs to run this
+  transport at full speed; status and gate results
   are in `CHANGELOG.md`.
 
 ---
@@ -76,7 +78,7 @@ requests and work completions, GID resolution, RC atomics, and QoS/service-level
 | `src/dext/loader/` | The `MlxRDMA.app` activation host |
 | `src/dext/kext-test/` | Standalone Phase-1a test kext (parallel to the DEXT) |
 | `src/tools/` | Thermal / 40G link / card reconnect helpers |
-| `docs/` | Architecture and the inference-client guide |
+| `docs/` | Architecture, the inference-client guide, and llama.cpp tuning |
 
 ---
 

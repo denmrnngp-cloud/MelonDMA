@@ -207,7 +207,7 @@ static rdma_cq *rdma_find_cq_token(rdma_device *dev, uint32_t token)
 }
 
 /* Publish the QP producer/consumer shadow state into the per-QP DB-record
- * slot (shared-page fast path).  Hardware doorbell records occupy the
+ * slot (docs/shared-page-fast-path.md).  Hardware doorbell records occupy the
  * first 8 bytes; the shadow state starts at MLX_QP_SHADOW_OFFSET and is read
  * by the DEXT once the trusted fast path is enabled.  Writing it is always
  * safe: the rest of the 128-byte slot is otherwise zeroed and unused. */
@@ -1715,6 +1715,45 @@ int rdma_set_roce_address_vlan(rdma_device *dev, const uint8_t gid[16],
                                         &index, sizeof(index), NULL, 0);
     }
     return -EIO;
+}
+
+int rdma_query_port_stats(rdma_device *dev, struct rdma_port_stats *stats)
+{
+    if (!dev || !stats) return -EINVAL;
+    struct mlx_port_stats_resp resp = {};
+    size_t out = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodPortStats, NULL, 0, &resp, &out);
+    if (kr != kIOReturnSuccess || out != sizeof(resp)) return -EIO;
+    stats->rx_pkts = resp.rxPkts;      stats->tx_pkts = resp.txPkts;
+    stats->rx_bytes = resp.rxBytes;    stats->tx_bytes = resp.txBytes;
+    stats->rx_drop = resp.rxDrop;      stats->tx_drop = resp.txDrop;
+    stats->rx_errors = resp.rxErrors;  stats->tx_errors = resp.txErrors;
+    stats->rx_pause = resp.rxPause;    stats->tx_pause = resp.txPause;
+    stats->link_speed = resp.linkSpeed;
+    stats->link_state = resp.linkState;
+    stats->port_num = resp.portNum;
+    return 0;
+}
+
+int rdma_access_reg(rdma_device *dev, uint16_t register_id, int write,
+                    uint32_t argument, void *data, uint32_t size)
+{
+    if (!dev || (size && !data) || size > MLX_UC_ACCESS_REG_MAX_DATA) return -EINVAL;
+    struct mlx_access_reg_req req = {};
+    struct mlx_access_reg_resp resp = {};
+    req.registerId = register_id;
+    req.opMod = write ? 0 : 1;
+    req.argument = argument;
+    req.dataSize = size;
+    if (size) memcpy(req.data, data, size);
+    size_t out = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodAccessReg, &req, sizeof(req), &resp, &out);
+    if (kr != kIOReturnSuccess) return kr == kIOReturnNotPermitted ? -EPERM : -EIO;
+    if (out != sizeof(resp) || resp.dataSize != size) return -EIO;
+    if (size) memcpy(data, resp.data, size);
+    return 0;
 }
 
 int rdma_query_gid(rdma_device *dev, uint32_t gid_index,

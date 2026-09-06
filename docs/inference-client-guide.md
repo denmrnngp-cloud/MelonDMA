@@ -12,9 +12,9 @@ llama.cpp, MLX or any runner.
 
 ## 1. What the API gives you (verbs subset)
 
-For the disaggregated KV path (7–15% TTFT target), a single destination MR does not imply one batched RPC. Reuse requires allocation ownership/generation, not just a cache hit by virtual address. Current driver pin quotas also require bounded transfer windows for large contexts.
+For the disaggregated KV path, see the 7–15% TTFT target and implementation candidates (engineering note `ttft-7-15-target-2026-09-05.md` in the development tree). A single destination MR does not imply one batched RPC. Reuse requires allocation ownership/generation, not just a cache hit by virtual address. Current driver pin quotas also require bounded transfer windows for large contexts.
 
-The companion llama.cpp now has an opt-in one-request KV batch, direct TX-ring filling and an owned host arena. Its accepted profile requires `MELONDMA_COMPLETION_POLICY=latency`; this does not establish working low-latency hardware IRQ delivery. The destination is a serialized host-state buffer, not final Metal KV tensors.
+The companion llama.cpp now has an opt-in one-request KV batch, direct TX-ring filling and owned host arena (engineering note `kv-transfer-batch-pipeline-2026-09-05.md` in the development tree). Its accepted profile requires `MELONDMA_COMPLETION_POLICY=latency`; this does not establish working low-latency hardware IRQ delivery. The destination is a serialized host-state buffer, not final Metal KV tensors.
 
 Header: `src/dext/usermode/libibverbs_compat/include/infiniband/verbs.h`.
 Objects: `ibv_context` → `ibv_pd` → `ibv_mr` + `ibv_cq` + `ibv_qp` (+ `ibv_ah`,
@@ -221,10 +221,10 @@ The Mac and Spark device names are intentionally different. MelonDMA exposes
 `rocep1s0f1`. The benchmark launcher must therefore use:
 
 ```sh
-# Mac
-GGML_RDMA_DEV=mlx5_0 GGML_RDMA_GID=0
-# Spark
-GGML_RDMA_DEV=rocep1s0f1 GGML_RDMA_GID=3
+# Mac: name the device, never the GID index (see 8.2)
+GGML_RDMA_DEV=mlx5_0
+# Spark: select the GID by address, not by index
+GGML_RDMA_DEV=rocep1s0f1 GGML_RDMA_GID_ADDR=192.168.200.2
 ```
 
 The control socket remains TCP (`192.168.100.1` to `192.168.100.2`) because it
@@ -247,6 +247,73 @@ full-model smoke; the signal interval should be relaxed only after a workload
 gate confirms that the SQ does not exhaust. The smoke result is stored at
 `/tmp/llama-rdma-disagg-split-smoke.csv`.
 
+### 8.2 State on 2026-09-06 (what a client must do differently)
+
+Five things changed on this cluster in one day. Details and measurements are in
+the KV batch and WRITE tuning note (engineering note `kv-prefetch-write-tuning-2026-09-06.md` in the development tree),
+the inbound ceiling note (engineering note `rdma-inbound-ceiling-2026-09-06.md` in the development tree) and
+the production rollout note (engineering note `prod-rollout-kv-batch-2026-09-06.md` in the development tree).
+
+**GID slots are per client; never pin an index.** The provider hands every
+`ibv_open_device` its own GID slot and answers `ibv_query_gid` only for the slot
+that client owns. A pinned `GGML_RDMA_GID` therefore works for the first process
+on the host and fails for every later one — that is what limited this cluster to
+one RDMA client at a time, and it was our configuration, not a driver limit.
+Indices also move across reboots as link-local entries appear. Leave the variable
+unset on the Mac (the transport takes the slot it was given) and use
+`GGML_RDMA_GID_ADDR=<local RDMA IPv4>` on Linux.
+
+**One KV batch, and an ordering barrier that is not free.** The disaggregated KV
+handoff is one batched one-sided transfer instead of 80 RPCs
+(`GGML_RPC_RDMA_KV_BATCH=1`, `GGML_RPC_RDMA_FINAL_DEST=host`). Dropping its
+ordering barrier (`GGML_RPC_RDMA_KV_FENCE=0`) buys real overlap, but only if the
+peer can absorb a whole graph's uploads while it computes: otherwise the sender
+stalls on RNR and its completion wait becomes a spin that cost 1.09 s of CPU per
+request here. The peer's absorb window is negotiated and the client honours the
+request only when it is at least 32 MiB.
+
+**Receive depth is a throughput knob.** `GGML_RPC_RDMA_RX_DEPTH` (8..256 slots of
+`rx_capacity`) sets the pre-posted receive ring. 24 slots is 6 MiB, which a
+2k-token prefill overruns; 160 slots is 40 MiB and removes the stall. Cost is
+one MR per slot, so a provider with a small mkey quota keeps the default.
+
+**The one-sided WRITE scheduler takes at most 256 regions per batch** and has
+independent geometry: `GGML_RPC_RDMA_WRITE_CHUNK` (256/512/1024 KiB),
+`GGML_RPC_RDMA_WRITE_WINDOW` (2/4), `GGML_RPC_RDMA_WRITE_DEPTH` (4/8). Measured
+on this hardware the geometry does not matter; the defaults stay.
+
+**Host DMA settings dominate everything the transport can do.** On the Linux
+peer, `iommu.passthrough=1` took the same one-sided WRITE from 12.6 to 100.8
+Gbit/s in loopback and from 13.2 to 23.0 Gbit/s across the wire; nothing in the
+transport came close to that. The Mac's card sits behind a Thunderbolt-tunnelled
+PCIe Gen3 x4 link (31.5 Gbit/s per direction), so plan against that, not against
+the 40 Gb/s wire. RoCE path MTU is capped at 4096 by the protocol — a 9000-byte
+Ethernet MTU only exists to let 4096 fit in a frame, and bandwidth here does not
+depend on path MTU at all.
+
+**The completion policy is provider-wide, not a KV setting.** Without
+`MELONDMA_COMPLETION_POLICY=latency` the completion worker falls back to the
+device's blocking wait after 40 empty ticks: median wakeup 205 µs against 79 µs
+for the mapped-ring poller. Bulk transfers barely notice. Tensor-parallel split
+decode, which exchanges small activations per layer per token, loses three
+quarters of its throughput — measured 16.3 tok/s against 55.2 tok/s on the same
+build, with TCP at 46.9. Set it for every mode, not only for the KV path.
+
+**Zero copy as far as Mac memory, not as far as Metal tensors.** The KV handoff
+is genuinely one-sided: every region arrives by the NIC's DMA
+(`one_sided=80 fallback=0` in every request, zero errors and zero discards in the
+card's own counters), and the Mac CPU takes no part in receiving it. But the
+destination is a registered host arena, not the model's KV tensors: the KV batch
+path hardcodes `RPC_RDMA_DEST_HOST` (`ggml-rpc.cpp:1842`), so a local copy still
+follows. It is small — see the measured cost in the implementation status of §12
+— and closing it is worth less than the levers above.
+
+Two new driver selectors landed with this work: `kMlxUCMethodPortStats` (port
+counters from PPCNT: packets, bytes, errors, discards, pause) and
+`kMlxUCMethodAccessReg` (diagnostic-only ACCESS_REG passthrough, e.g. MPEIN for
+the PCIe link). `tools/mlx_port_counters --watch N --pcie` reads both; it is the
+only receive-side view of the wire on a host where the DEXT owns the port.
+
 ## 9. Known driver limits (important for a client)
 
 - MR ≤ ~1.875 MiB in one direct mkey (480×4 KiB PAS); larger buffers are chunked
@@ -259,20 +326,33 @@ gate confirms that the SQ does not exhaust. The smoke result is stored at
   MR. This gives NIC↔UMA↔Metal zero-copy data movement. `.private` buffers and
   GPU-issued PCIe UAR doorbells are not supported.
 - Device: explicit GID/MAC configuration (`rdma_set_roce_address`), no automatic
-  `enX`/ARP.
+  `enX`/ARP. The client must supply `MELONDMA_LOCAL_IP`, `MELONDMA_LOCAL_MAC` and
+  `MELONDMA_REMOTE_MAC`; without them the probe opens the device, creates a QP and
+  then fails with no further explanation.
+- Every client gets its own GID slot and may query only that slot. Do not pin a
+  GID index (see 8.2); a pinned index is a one-process-per-host limit in disguise.
 - No UD/DC/XRC/SRQ/multicast; RC only.
 
-The full list and the firmware/RoCE protocol facts are in `docs/architecture.md`.
+The full list — `docs/rdma-driver-spec.md`; the firmware/RoCE protocol facts — `docs/research.md` and `docs/architecture.md`.
 
 ## 10. Overhead reduction roadmap — beat TCP
 
-Measured baseline (RDMA vs the
+Measured baseline (`docs/benchmark-rdma-cluster-2026-09-02.md`, RDMA vs the
 10GbE TCP control-path fallback): RDMA already wins the bulk path (prefill
 +2–12 %, TTFT up to −10.7 % at 65K) but pays for it twice — the Mac receiver
 burns **~45 % of a core** on `ibv_poll_cq` busy-poll in disagg, and **split
 mode decode is 4–13 % *slower* than TCP** (small activation messages, where
-per-message cost dominates). The goal is to remove that per-message overhead so
-RDMA wins everywhere, not just on bulk.
+per-message cost dominates).
+
+> Superseded on 2026-09-06. Both halves are fixed: the busy-poll is gone (11 %
+> of a core in disagg, and the long-context spin is bounded by the run-ahead
+> guard), and split decode now beats TCP by 4–18 % once the completion policy is
+> set. The numbers are in the rollout note (engineering note `prod-rollout-kv-batch-2026-09-06.md` in the development tree).
+> The reasoning below is kept because the levers it lists are still the ones that
+> matter.
+
+The goal was to remove that per-message overhead so RDMA wins everywhere, not
+just on bulk.
 
 Historical root cause: every `ibv_poll_cq` / `ibv_post_send` used to be a
 kernel-mediated `IOConnectCallStructMethod` into the DEXT. The mapped trusted
@@ -409,9 +489,10 @@ Gotchas:
 
 ### 10.3 Benchmark-harness gotchas (when re-running the sweep)
 
-- The Spark `rpc-server` needs `GGML_RDMA_DEV=rocep1s0f1 GGML_RDMA_GID=3`
-  explicitly — auto-detect fails because the TCP control host (192.168.100.2)
-  ≠ the RDMA GID (192.168.200.2).
+- The Spark `rpc-server` needs the device named and the GID selected by
+  address: `GGML_RDMA_DEV=rocep1s0f1 GGML_RDMA_GID_ADDR=192.168.200.2`.
+  Plain auto-detect fails because the TCP control host (192.168.100.2) is not
+  the RDMA address (192.168.200.2), and a pinned index breaks on reboot (8.2).
 - `bench_rdma_cluster.py` inherits the parent env, so export
   `MELONDMA_DIRECT_UAR=1 MELONDMA_DIRECT_CQ=1` before launching to test the
   direct path.
@@ -489,6 +570,23 @@ split by the caller (or use `posix_memalign` + `bytesNoCopy`, §4.B of the recip
 - [ ] Next: make that destination the final `ctx_tgt`/KV Metal buffer rather
       than an intermediate `cmd.dest`; publish its MR persistently and remove
       the post-transfer `set(local)` copy.
+
+      **Measured cost of leaving it open (2026-09-06).** The KV batch selects
+      `RPC_RDMA_DEST_HOST` unconditionally (`ggml-rpc.cpp:1842`), so every
+      handoff lands in a host arena and is then copied into the KV cache. On the
+      35B model, disaggregated:
+
+      | Context | Handoff | `get(net)` | `set(local)` | share of transfer | share of TTFT |
+      |---:|---:|---:|---:|---:|---:|
+      | 3 tokens | 62.84 MiB | 98.2 ms | 1.5 ms | 1.5 % | — |
+      | 2180 tokens | 85.5 MiB | 57 ms | 3.7 ms | 6.5 % | 0.24 % of 1.5 s |
+      | 16384 tokens | 251.9 MiB | 194–278 ms | 9.0–9.6 ms | ~4 % | 0.07 % of 12.4 s |
+
+      So the "no copy into Mac memory" goal is met and the "no copy into Metal
+      tensors" goal is not, and what the second one is still worth is about 9 ms
+      out of a 12.4 s TTFT. Two other items on this page are worth an order of
+      magnitude more: the fixed 65.9 MB that every handoff carries regardless of
+      prompt length, and host DMA settings on the peer (§8.2). Do those first.
       In the current llama Metal backend this does not require a new allocator:
       Apple unified-memory devices default to page-aligned `vm_allocate` backing
       wrapped by `newBufferWithBytesNoCopy(...StorageModeShared)`. Register the
@@ -502,7 +600,8 @@ split by the caller (or use `posix_memalign` + `bytesNoCopy`, §4.B of the recip
 
 ## 13. Consumer-side transport levers (llama.cpp — not the driver)
 
-These live in `ggml/src/ggml-rpc/transport.cpp`, not MelonDMA. Ordered by impact.
+These live in `ggml/src/ggml-rpc/transport.cpp`, not MelonDMA. Ordered by impact
+(reasoning in `docs/rdma-optimization-levers.md`).
 
 1. **Pipeline the one-sided `rdma_write`.** ✅ DONE — `rdma_write` now posts a
    batch of up to 16 WRITEs in flight (unsignaled except the last) and waits once,
@@ -519,6 +618,8 @@ These live in `ggml/src/ggml-rpc/transport.cpp`, not MelonDMA. Ordered by impact
    independently produced mailbox items into one bounded post/completion.
 5. **KV directly into `ctx_tgt`.** DRIVER DONE / CLIENT OPEN — register the final
    `.shared | .untracked` Metal KV buffer and WRITE into its exact offsets.
+   Worth about 9 ms of `set(local)` on a 252 MiB handoff, 0.07 % of TTFT at 16k
+   context; sized in §12. Low priority against reducing the bytes themselves.
 6. **Remove source staging.** Avoid the current Spark-side
    `ggml_backend_tensor_get()` → temporary vector → `rdma_write()` path when the
    backend exposes a stable registrable address; otherwise double-buffer it.

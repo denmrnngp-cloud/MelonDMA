@@ -89,6 +89,16 @@ capped by that Gen3 x4 link (~31.5 Gbit/s theoretical).
 - Gates added: `mlx_cq_idle_cpu` (idle cost of an armed channel on either
   worker path) and `mlx_irq_probe` (rebind the completion EQ to a chosen
   interrupt index).
+- `PortStats` and `AccessReg` implemented. Both selectors had been declared in
+  the ABI header and in the privilege check for a long time with no method table
+  entry and no handler. `PortStats` reads PPCNT groups 0 and 1 (packets, bytes,
+  errors, discards, pause frames) plus link state; `AccessReg` is a
+  diagnostics-only ACCESS_REG passthrough, its payload raised 256 → 512 bytes so
+  PPCNT's 264 fits. On a host where the DEXT owns the port and no netif exists,
+  this is the only receive-side view of the wire.
+- `tools/mlx_port_counters` reads them: `--watch <seconds>` prints the delta over
+  an interval, `--pcie` adds the PCIe link behind the Thunderbolt tunnel (MPEIN)
+  and the device's own stall counters (MPCNT).
 
 ---
 
@@ -167,8 +177,20 @@ capped by that Gen3 x4 link (~31.5 Gbit/s theoretical).
 - The `Mbit/s` figures in the Phase-2 gate output are `size × 2 × 8 / 73µs` — a
   restatement of the fixed message rate, **not** a bandwidth measurement. Cite the
   73 µs RTT as latency, never as throughput.
-- Application-layer (LLM inference) RDMA-vs-TCP runs were also collected
-  (`llama_bench_*.csv`, `muser_rdma_*.csv` in the dev tree): RDMA and TCP are within
-  a few percent at those sizes (RDMA slightly better on decode tok/s, mixed on TTFT).
-  Those results are workload-bound, not driver-bound, and are kept in the dev tree
-  only.
+- Application-layer (LLM inference) RDMA-vs-TCP was re-measured on 2026-09-06
+  after the client-side work below, and RDMA now wins on both inference layouts.
+  Against a stored 40G TCP baseline on the same hardware, 3 repetitions per
+  point, Qwen3.6-35B-A3B: disaggregated TTFT 0.974 → 0.909 of TCP as context
+  grows from 512 to 65536 tokens, prefill 1.03 → 1.10; tensor-parallel decode
+  55.2 vs 46.9 tok/s at 512 and 22.1 vs 21.2 at 65536. Qwen3.8-27B is smaller
+  but the same direction. The one remaining loss is split-mode TTFT at 32k–65k,
+  0.6–1.7 % behind. Details and the settings that produce it are in
+  `docs/llama-rdma-tuning.md`; raw CSVs stay in the dev tree.
+- Three findings from that work belong to the host, not to this driver, and
+  dominate anything the transport does. The peer's IOMMU in translation mode
+  held one-sided WRITE to 12.6 Gbit/s in loopback; `iommu.passthrough=1` took it
+  to 100.8, and across the wire from 13.2 to 23.0. RoCE path MTU is capped at
+  4096 by the protocol, so a 9000-byte Ethernet MTU only exists to let 4096 fit
+  in a frame. And the KV handoff carries a fixed 65.9 MB per request regardless
+  of prompt length plus 10.6 KiB per token, which bounds what any further
+  transport work can win.

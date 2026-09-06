@@ -6,7 +6,7 @@
  * hang, never a crash. This is the trust-boundary hardening the DEXT must
  * provide before untrusted multi-process use.
  *
- * Covered (P2.2):
+ * Covered (mirrors Plan.md P2.2):
  *   - input/output size mismatch (truncated structure)
  *   - reserved fields (CreateQP rsvd, sqBufAddr/rqBufAddr/maxInlineData)
  *   - integer overflow (RegMR / RegMRIndirect address + length)

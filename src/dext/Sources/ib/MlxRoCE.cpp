@@ -201,6 +201,101 @@ MlxRoCE::QueryDevice(struct mlx_query_device_resp *resp)
     return kIOReturnSuccess;
 }
 
+/* ACCESS_REG (0x805): one firmware register in or out.
+ * Command layout is header + payload on both sides: opcode/op_mod/register_id/
+ * argument occupy the first 16 bytes, the register itself follows. op_mod is
+ * the firmware's own encoding, 0 = write and 1 = read. */
+kern_return_t
+MlxRoCE::AccessReg(uint16_t registerId, bool write, uint32_t argument,
+                   const void *dataIn, uint32_t dataInSize,
+                   void *dataOut, uint32_t dataOutSize)
+{
+    if (!s || !s->core) return kIOReturnNotAttached;
+    if (dataInSize > MLX_UC_ACCESS_REG_MAX_DATA ||
+        dataOutSize > MLX_UC_ACCESS_REG_MAX_DATA) return kIOReturnBadArgument;
+    if ((dataInSize && !dataIn) || (dataOutSize && !dataOut)) return kIOReturnBadArgument;
+
+    const uint32_t inSize  = 16 + dataInSize;
+    const uint32_t outSize = 16 + dataOutSize;
+    uint8_t *in  = (uint8_t *)IOMallocZero(inSize);
+    uint8_t *out = (uint8_t *)IOMallocZero(outSize);
+    if (!in || !out) {
+        if (in)  IOFree(in, inSize);
+        if (out) IOFree(out, outSize);
+        return kIOReturnNoMemory;
+    }
+    mlxSetBits(in, 0x00, 16, MLX_CMD_OP_ACCESS_REG);
+    mlxSetBits(in, 0x30, 16, write ? 0 : 1);
+    mlxSetBits(in, 0x50, 16, registerId);
+    mlxSetBits(in, 0x60, 32, argument);
+    if (dataInSize) memcpy(in + 16, dataIn, dataInSize);
+
+    kern_return_t kr = s->core->Exec(MLX_CMD_OP_ACCESS_REG, in, inSize,
+                                     out, outSize, 5000);
+    if (kr == kIOReturnSuccess && dataOutSize)
+        memcpy(dataOut, out + 16, dataOutSize);
+    else if (kr != kIOReturnSuccess)
+        MLX_LOG("ACCESS_REG 0x%x failed: 0x%x", registerId, kr);
+    IOFree(in, inSize);
+    IOFree(out, outSize);
+    return kr;
+}
+
+/* PPCNT (0x5008) payload: swid[8] local_port[8] pnat[2] rsvd[8] grp[6],
+ * then clr[1] rsvd[28] prio_tc[3], then a 256-byte counter set at byte 8.
+ * Every counter in the sets used here is a 64-bit big-endian pair. */
+static uint64_t
+mlxPpcntCounter(const uint8_t *payload, uint32_t counterByte)
+{
+    return mlxGetBits(payload, (8 + counterByte) * 8, 64);
+}
+
+kern_return_t
+MlxRoCE::PortStats(struct mlx_port_stats_resp *resp)
+{
+    if (!s || !resp) return kIOReturnBadArgument;
+    memset(resp, 0, sizeof(*resp));
+    resp->portNum = 1;
+
+    uint8_t payload[264] = {};
+    auto readGroup = [&](uint8_t group) -> kern_return_t {
+        memset(payload, 0, sizeof(payload));
+        mlxSetBits(payload, 0x08, 8, 1);        /* local_port */
+        mlxSetBits(payload, 0x1a, 6, group);    /* grp */
+        return AccessReg(MLX_REG_ID_PPCNT, false, 0, payload, sizeof(payload),
+                         payload, sizeof(payload));
+    };
+
+    kern_return_t kr = readGroup(0);            /* IEEE 802.3 */
+    if (kr != kIOReturnSuccess) return kr;
+    resp->txPkts   = mlxPpcntCounter(payload, 0x00);
+    resp->rxPkts   = mlxPpcntCounter(payload, 0x08);
+    resp->rxErrors = mlxPpcntCounter(payload, 0x10) +   /* FCS errors */
+                     mlxPpcntCounter(payload, 0x18) +   /* alignment */
+                     mlxPpcntCounter(payload, 0x60);    /* frame too long */
+    resp->txBytes  = mlxPpcntCounter(payload, 0x20);
+    resp->rxBytes  = mlxPpcntCounter(payload, 0x28);
+    resp->rxPause  = mlxPpcntCounter(payload, 0x88);
+    resp->txPause  = mlxPpcntCounter(payload, 0x90);
+
+    kr = readGroup(1);                          /* RFC 2863 */
+    if (kr == kIOReturnSuccess) {
+        resp->rxDrop   = mlxPpcntCounter(payload, 0x10);
+        resp->txDrop   = mlxPpcntCounter(payload, 0x38);
+        resp->txErrors = mlxPpcntCounter(payload, 0x40);
+    }
+
+    /* Link state and speed, same source as QueryPort. */
+    uint8_t in[16] = {}, out[16] = {};
+    mlxSetBits(in, 0x00, 16, MLX_CMD_OP_QUERY_VPORT_STATE);
+    if (s->core->Exec(MLX_CMD_OP_QUERY_VPORT_STATE, in, sizeof(in),
+                      out, sizeof(out), 5000) == kIOReturnSuccess) {
+        resp->linkState = (uint8_t)(mlxGetBits(out, 0x7c, 4) ? 1 : 0);
+        resp->linkSpeed = (uint32_t)mlxGetBits(out, 0x60, 16);
+    }
+    return kIOReturnSuccess;
+}
+
 kern_return_t
 MlxRoCE::QueryPort(struct mlx_query_port_resp *resp)
 {

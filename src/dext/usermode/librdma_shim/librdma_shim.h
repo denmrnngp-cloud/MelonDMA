@@ -384,6 +384,21 @@ struct rdma_gid_attr {
     uint8_t gid_type;         /* ibv_gid_type: 2=RoCEv2 */
     uint8_t ifindex;          /* 0: no macOS netif */
 };
+/* Port counters straight from the card. The DEXT owns the port and macOS has
+ * no netif behind it, so this is the only receive-side view of the wire. */
+struct rdma_port_stats {
+    uint64_t rx_pkts, tx_pkts, rx_bytes, tx_bytes;
+    uint64_t rx_drop, tx_drop, rx_errors, tx_errors;
+    uint64_t rx_pause, tx_pause;
+    uint32_t link_speed;
+    uint8_t  link_state, port_num;
+};
+int  rdma_query_port_stats(rdma_device *dev, struct rdma_port_stats *stats);
+/* ACCESS_REG passthrough; requires the diagnostic entitlement. `data` carries
+ * the register payload in and out, `size` bytes in both directions. */
+int  rdma_access_reg(rdma_device *dev, uint16_t register_id, int write,
+                     uint32_t argument, void *data, uint32_t size);
+
 int  rdma_query_gid(rdma_device *dev, uint32_t gid_index,
                     struct rdma_gid_attr *attr);
 
