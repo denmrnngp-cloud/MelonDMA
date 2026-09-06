@@ -208,7 +208,7 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     if (!req->sqSize || !req->rqSize || req->sqSize < 64 || req->rqSize < 64 ||
         req->sqBufAddr || req->rqBufAddr ||
         req->maxInlineData > MLX_UC_MAX_INLINE_DATA ||
-        req->rsvd ||
+        (req->rsvd & ~MLX_UC_QP_TRUSTED) ||
         (req->sqSize & (req->sqSize - 1)) || (req->rqSize & (req->rqSize - 1)))
         return kIOReturnBadArgument;
     uint32_t logSq = 31u - __builtin_clz(req->sqSize);
@@ -360,6 +360,10 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     resp->bfOffset = MLX_BF_OFFSET;
     resp->mappingVersion = bundle ? MLX_FAST_PATH_ABI_VERSION : 0;
     resp->uarPage = uarPage;
+    const uint8_t logBf = s->core->GetHCA() ?
+        s->core->GetHCA()->Caps().logBfRegSize : 0;
+    const uint32_t bfRegSize = logBf && logBf < 13 ? (1u << logBf) : 0;
+    resp->bfBufSize = bfRegSize / 2u;
 
     /* Record the context. */
     IOLockLock(s->tableLock);
@@ -423,6 +427,7 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     ctx->dbRecord = bundle ? s->core->GetUAR()->GetClientDbRecord(
         bundle, dbOffset) : s->core->GetUAR()->GetDbRecord(dbOffset);
     ctx->clientBundle = bundle;
+    ctx->trustedFastPath = bundle != NULL && (req->rsvd & MLX_UC_QP_TRUSTED);
     ctx->sqWrid = sqWrid;
     ctx->rqWrid = rqWrid;
     ctx->sqOpcode = sqOpcode;
@@ -594,6 +599,74 @@ MlxQP::ModifyQP(const struct mlx_modify_qp_req *req)
 }
 
 kern_return_t
+MlxQP::SyncQpTails(uint32_t qpn, uint64_t sqTail, uint64_t rqTail)
+{
+    if (!s) return kIOReturnBadArgument;
+    MlxQPContext *ctx = LockQp(qpn);
+    if (!ctx) return kIOReturnNotFound;
+    if (!RefreshFastPathStateLocked(ctx) || sqTail > ctx->sqHead ||
+        rqTail > ctx->rqHead) {
+        UnlockQp(ctx);
+        return kIOReturnBadArgument;
+    }
+    if (sqTail > ctx->sqTail) ctx->sqTail = sqTail;
+    if (rqTail > ctx->rqTail) ctx->rqTail = rqTail;
+    UnlockQp(ctx);
+    return kIOReturnSuccess;
+}
+
+bool
+MlxQP::RefreshFastPathStateLocked(MlxQPContext *ctx)
+{
+    if (!ctx || !ctx->trustedFastPath || !ctx->dbRecord) return true;
+    volatile const struct mlx_qp_shadow *shadow =
+        (volatile const struct mlx_qp_shadow *)
+        ((volatile const uint8_t *)ctx->dbRecord + MLX_QP_SHADOW_OFFSET);
+
+    /* A bounded seqlock read avoids accepting a head/tail mixture while the
+     * userspace provider is publishing a new snapshot. This runs only for
+     * teardown/query/fallback, never for normal direct posts or CQ drains. */
+    for (uint32_t attempt = 0; attempt < 8; attempt++) {
+        uint64_t before = shadow->sequence;
+        if (before & 1u) continue;
+        mlxMemoryBarrier();
+        uint64_t sqHead = shadow->sq_head;
+        uint64_t sqTail = shadow->sq_tail;
+        uint64_t rqHead = shadow->rq_head;
+        uint64_t rqTail = shadow->rq_tail;
+        mlxMemoryBarrier();
+        uint64_t after = shadow->sequence;
+        if (before != after || (after & 1u)) continue;
+
+        /* Never move backwards and never accept a client snapshot that would
+         * make an impossible queue distance. The UAR/SQ/RQ/DB mappings are
+         * isolated to this UserClient and the hardware PD still enforces all
+         * lkey/rkey access checks. */
+        if (sqHead < ctx->sqHead || sqTail < ctx->sqTail || sqTail > sqHead ||
+            rqHead < ctx->rqHead || rqTail < ctx->rqTail || rqTail > rqHead ||
+            sqHead - sqTail > ctx->sqSize || rqHead - rqTail > ctx->rqSize)
+            return false;
+        ctx->sqHead = sqHead;
+        ctx->sqTail = sqTail;
+        ctx->rqHead = rqHead;
+        ctx->rqTail = rqTail;
+        return true;
+    }
+    return false;
+}
+
+kern_return_t
+MlxQP::RefreshFastPathState(uint32_t qpn)
+{
+    if (!s) return kIOReturnBadArgument;
+    MlxQPContext *ctx = LockQp(qpn);
+    if (!ctx) return kIOReturnNotFound;
+    bool valid = RefreshFastPathStateLocked(ctx);
+    UnlockQp(ctx);
+    return valid ? kIOReturnSuccess : kIOReturnBusy;
+}
+
+kern_return_t
 MlxQP::DestroyQP(uint32_t qpn)
 {
     if (!s) return kIOReturnBadArgument;
@@ -605,6 +678,11 @@ MlxQP::DestroyQP(uint32_t qpn)
      * in-flight check and the firmware destroy (P1.2). */
     MlxQPContext *ctx = LockQp(qpn);
     if (!ctx) return kIOReturnNotFound;
+    if (!RefreshFastPathStateLocked(ctx)) {
+        UnlockQp(ctx);
+        MLX_LOG("QP[%u] destroy refused: unstable/invalid fast-path shadow", qpn);
+        return kIOReturnBusy;
+    }
     if (ctx->sqHead != ctx->sqTail || ctx->rqHead != ctx->rqTail) {
         UnlockQp(ctx);
         MLX_LOG("QP[%u] destroy refused with in-flight WQEs", qpn);
@@ -730,7 +808,10 @@ MlxQP::PostSend(const struct mlx_post_send_req *req)
 kern_return_t
 MlxQP::PostSendSge(const struct mlx_post_send_sge_req *req)
 {
-    if (!s || !req || !req->numSge || req->numSge > MLX_UC_MAX_SGE)
+    bool zeroWriteImm = req && req->opcode == MLX_UC_WR_RDMA_WRITE_IMM &&
+                        req->numSge == 0;
+    if (!s || !req || (!zeroWriteImm && !req->numSge) ||
+        req->numSge > MLX_UC_MAX_SGE)
         return kIOReturnBadArgument;
     MlxQPContext *ctx = LockQp(req->qpn);
     if (!ctx || ctx->state != MLX_QP_STATE_RTS || !ctx->sqCpu || !ctx->dbRecord) {
@@ -935,7 +1016,10 @@ MlxQP::SyncFastPath(const struct mlx_post_send_req *req, uint32_t count)
 kern_return_t
 MlxQP::SyncSendSge(const struct mlx_sync_send_sge_req *req)
 {
-    if (!s || !req || !req->numSge || req->numSge > MLX_UC_MAX_SGE)
+    bool zeroWriteImm = req && req->opcode == MLX_UC_WR_RDMA_WRITE_IMM &&
+                        req->numSge == 0;
+    if (!s || !req || (!zeroWriteImm && !req->numSge) ||
+        req->numSge > MLX_UC_MAX_SGE)
         return kIOReturnBadArgument;
     MlxQPContext *ctx = LockQp(req->qpn);
     bool valid = ctx && ctx->state == MLX_QP_STATE_RTS && ctx->sqCpu &&
@@ -1455,6 +1539,12 @@ MlxQP::CompleteCQE(uint32_t cqHandle, const struct MlxCqe64 *cqe,
     wc->qpNum = ctx->qpNum;
     wc->wqeCounter = counter;
     wc->byteLen = errorCqe ? 0 : OSSwapBigToHostInt32(cqe->byte_cnt);
+    /* Trusted fast-path posts skip SyncFastPath, so sqHead/sqTail can be
+     * stale on this exceptional kernel-decode path.  Reconcile the counters
+     * from the shadow before expanding the wqe_counter; wr_id stays
+     * best-effort here because the shadow carries counters, not per-slot
+     * wr_id/opcode/span metadata. */
+    (void)RefreshFastPathStateLocked(ctx);
     if (errorCqe) {
         const uint8_t *raw = reinterpret_cast<const uint8_t *>(cqe);
         uint8_t vendorErrSynd = raw[54];

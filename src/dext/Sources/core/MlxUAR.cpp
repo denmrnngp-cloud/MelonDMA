@@ -185,6 +185,7 @@ void
 MlxUAR::FreeDbSlot(uint32_t offset)
 {
     if (!s || (offset & 127) || offset >= 4096) return;
+    if (s->core->DmaQuarantined()) return;
     uint32_t slot = offset / 128;
     IOLockLock(s->lock);
     memset((void *)(uintptr_t)(s->dbRecordAddr + offset), 0, 128);
@@ -308,6 +309,11 @@ void
 MlxUAR::FreeClientBundle(MlxClientDoorbellBundle *bundle)
 {
     if (!s || !bundle) return;
+    if (s->core->DmaQuarantined()) {
+        s->core->RetainDmaUntilReset(bundle->dbMemory, bundle->dbDma, 0x55415244u);
+        bundle->dbMemory = NULL; bundle->dbDma = NULL;
+        bundle->uarIndex = 0; /* do not reuse a potentially live hardware UAR */
+    }
     if (bundle->dbDma) { mlxCompleteDma(bundle->dbDma); bundle->dbDma = NULL; }
     if (bundle->dbMemory) { bundle->dbMemory->release(); bundle->dbMemory = NULL; }
     if (bundle->uarMemory) { bundle->uarMemory->release(); bundle->uarMemory = NULL; }
@@ -339,6 +345,7 @@ MlxUAR::FreeClientDbSlot(MlxClientDoorbellBundle *bundle, uint32_t offset)
 {
     if (!s || !bundle || !bundle->dbCpu || (offset & 127) || offset >= 4096)
         return;
+    if (s->core->DmaQuarantined()) return;
     IOLockLock(s->lock);
     memset((void *)(uintptr_t)(bundle->dbCpu + offset), 0, 128);
     bundle->dbSlotBitmap &= ~(1u << (offset / 128));

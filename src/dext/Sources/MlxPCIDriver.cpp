@@ -27,6 +27,7 @@
 #include "MlxUAR.hpp"
 #include "MlxHealth.hpp"
 #include "MlxDMA.hpp"
+#include "MlxSafety.hpp"
 #include "MlxFwPages.hpp"
 #include "../hw/MlxHCA.hpp"
 #include "../ib/MlxRoCE.hpp"
@@ -40,8 +41,10 @@
 #include <DriverKit/IOService.h>
 #include <DriverKit/OSDictionary.h>
 #include <DriverKit/IOTimerDispatchSource.h>
+#include <DriverKit/IOInterruptDispatchSource.h>
 #include <DriverKit/IODispatchQueue.h>
 #include <PCIDriverKit/IOPCIDevice.h>
+#include <PCIDriverKit/IOPCIFamilyDefinitions.h>
 #include <string.h>
 #include <time.h>
 
@@ -54,66 +57,94 @@
  * until a later verified FLR establishes a DMA boundary. */
 static const uint32_t kMlxQuarantineRegistrySize = 16;
 static MlxFwPages *gMlxQuarantinedPages[kMlxQuarantineRegistrySize] = {};
+static IOPCIDevice *gMlxQuarantinedPageDevices[kMlxQuarantineRegistrySize] = {};
 struct MlxQuarantinedDma {
     IOMemoryDescriptor *mem;
     IODMACommand *dma;
+    IOPCIDevice *pci;
+    MlxQuarantinedDma *next;
 };
-static MlxQuarantinedDma gMlxQuarantinedDummy[kMlxQuarantineRegistrySize] = {};
+static MlxQuarantinedDma *gMlxQuarantinedDma;
+static unsigned char gMlxQuarantineLock;
+static void MlxLockQuarantine() {
+    while (__atomic_test_and_set(&gMlxQuarantineLock, __ATOMIC_ACQUIRE)) IOSleep(1);
+}
+static void MlxUnlockQuarantine() {
+    __atomic_clear(&gMlxQuarantineLock, __ATOMIC_RELEASE);
+}
 
 static void
-MlxRetainQuarantinedPages(MlxFwPages *pages)
+MlxRetainQuarantinedPages(MlxFwPages *pages, IOPCIDevice *pci)
 {
     if (!pages) return;
+    MlxLockQuarantine();
     for (uint32_t i = 0; i < kMlxQuarantineRegistrySize; i++) {
-        if (gMlxQuarantinedPages[i] == pages) return;
+        if (gMlxQuarantinedPages[i] == pages) { MlxUnlockQuarantine(); return; }
         if (!gMlxQuarantinedPages[i]) {
             gMlxQuarantinedPages[i] = pages;
+            gMlxQuarantinedPageDevices[i] = pci;
+            if (pci) pci->retain();
+            MlxUnlockQuarantine();
             MLX_LOG("DMA quarantine registry: retained slot=%u ambiguous=%u",
                     i, pages->GetAmbiguousOwned());
             return;
         }
     }
+    MlxUnlockQuarantine();
     /* Preserve ownership by intentionally not deleting the object even if the
      * diagnostic registry is exhausted. */
     MLX_LOG("DMA quarantine registry FULL — object intentionally leaked/pinned");
 }
 
 static void
-MlxReleaseQuarantinedPagesAfterReset()
+MlxReleaseQuarantinedPagesAfterReset(IOPCIDevice *pci)
 {
     for (uint32_t i = 0; i < kMlxQuarantineRegistrySize; i++) {
+        MlxLockQuarantine();
         MlxFwPages *pages = gMlxQuarantinedPages[i];
-        if (!pages) continue;
+        if (!pages || gMlxQuarantinedPageDevices[i] != pci) {
+            MlxUnlockQuarantine(); continue;
+        }
         gMlxQuarantinedPages[i] = NULL;
+        gMlxQuarantinedPageDevices[i] = NULL;
+        MlxUnlockQuarantine();
+        if (pci) pci->release();
         pages->ReleaseQuarantineAfterReset();
         pages->Free();
         delete pages;
         MLX_LOG("DMA quarantine registry: released slot=%u after verified reset", i);
     }
-    for (uint32_t i = 0; i < kMlxQuarantineRegistrySize; i++) {
-        if (gMlxQuarantinedDummy[i].dma)
-            mlxCompleteDma(gMlxQuarantinedDummy[i].dma);
-        if (gMlxQuarantinedDummy[i].mem)
-            gMlxQuarantinedDummy[i].mem->release();
-        if (gMlxQuarantinedDummy[i].dma || gMlxQuarantinedDummy[i].mem)
-            MLX_LOG("dummy DMA quarantine: released slot=%u after verified reset", i);
-        gMlxQuarantinedDummy[i].dma = NULL;
-        gMlxQuarantinedDummy[i].mem = NULL;
+    MlxLockQuarantine();
+    MlxQuarantinedDma *release = NULL;
+    MlxQuarantinedDma **link = &gMlxQuarantinedDma;
+    while (*link) {
+        MlxQuarantinedDma *node = *link;
+        if (node->pci != pci) { link = &node->next; continue; }
+        *link = node->next; node->next = release; release = node;
+    }
+    MlxUnlockQuarantine();
+    while (release) {
+        MlxQuarantinedDma *node = release; release = node->next;
+        if (node->dma) mlxCompleteDma(node->dma);
+        if (node->mem) node->mem->release();
+        if (node->pci) node->pci->release();
+        IODelete(node, MlxQuarantinedDma, 1);
     }
 }
 
 static void
-MlxRetainQuarantinedDummy(IOMemoryDescriptor *mem, IODMACommand *dma)
+MlxRetainQuarantinedDummy(IOMemoryDescriptor *mem, IODMACommand *dma, IOPCIDevice *pci)
 {
-    for (uint32_t i = 0; i < kMlxQuarantineRegistrySize; i++) {
-        if (!gMlxQuarantinedDummy[i].mem && !gMlxQuarantinedDummy[i].dma) {
-            gMlxQuarantinedDummy[i].mem = mem;
-            gMlxQuarantinedDummy[i].dma = dma;
-            MLX_LOG("dummy DMA quarantine: retained slot=%u", i);
-            return;
-        }
+    MlxQuarantinedDma *node = IONewZero(MlxQuarantinedDma, 1);
+    if (!node) {
+        MLX_LOG("DMA quarantine allocation failed — references intentionally retained");
+        return; /* fail safe even under memory pressure */
     }
-    MLX_LOG("dummy DMA quarantine registry FULL — mapping intentionally pinned");
+    node->mem = mem; node->dma = dma; node->pci = pci;
+    if (pci) pci->retain();
+    MlxLockQuarantine();
+    node->next = gMlxQuarantinedDma; gMlxQuarantinedDma = node;
+    MlxUnlockQuarantine();
 }
 
 /* ---- instance state (private; typed via MlxPCIDriver_DECLARE_IVARS) ---- */
@@ -124,6 +155,7 @@ struct MlxPCIDriver_IVars {
     uint16_t             fDeviceId;
     MlxCmd              *fCmd;
     MlxEQ               *fEQ;
+    MlxEQ               *fCompletionEQ;
     MlxUAR              *fUAR;
     MlxHCA              *fHCA;
     MlxHealth           *fHealth;
@@ -133,6 +165,43 @@ struct MlxPCIDriver_IVars {
     IODispatchQueue     *fEqQueue;
     IOTimerDispatchSource *fEqTimer;
     OSAction             *fEqTimerAction;
+    IODispatchQueue      *fInterruptQueue;
+    IODispatchQueue      *fCompletionWaitQueue;
+    IOInterruptDispatchSource *fAsyncInterrupt;
+    IOInterruptDispatchSource *fCompletionInterrupt;
+    OSAction             *fAsyncInterruptAction;
+    OSAction             *fCompletionInterruptAction;
+    uint64_t              fCompletionGeneration;
+    /* Completion MSI-X interrupts that advanced fCompletionGeneration. Only
+     * the completion-interrupt handler writes it, under the wait queue. */
+    uint64_t              fCompletionEvents;
+    /* Waits released with a fresh generation. Device-wide because the shim
+     * blocks on a dedicated UserClient connection, so a per-client count is
+     * invisible to the connection that reads the telemetry. */
+    uint64_t              fCompletionWakeups;
+    /* IRQ counters are kept per vector. Completion readiness is based only on
+     * the dedicated completion vector; an async EQ interrupt is not evidence
+     * that completion IRQ delivery works. */
+    uint64_t              fAsyncIrqCount;
+    uint64_t              fCompletionIrqCount;
+    uint64_t              fIrqCompletionEqes, fTimerCompletionEqes, fLastCompletionIrqNs;
+    uint64_t              fDeviceEpoch, fQuarantineBytes, fQuarantineObjects;
+    bool                  fBmeFenced;
+    /* MSI-X bring-up result, kept for QueryInterrupts: the kernel log channel
+     * is disabled on some dev machines, so the StartInterrupts log line is
+     * not a reliable way to find out why the completion vector is missing. */
+    uint32_t              fIrqVectors;
+    uint32_t              fIrqSetupStatus;
+    uint32_t              fIrqSetupStage;
+    /* Completion-EQ bring-up result. The MSI-X vectors can be live while this
+     * EQ is rejected, which is exactly the case that leaves clients polling. */
+    uint32_t              fCqEqStatus;
+    uint32_t              fCqEqStage;
+    uint32_t              fCqEqSyndrome;
+    uint32_t              fCqEqFwStatus;
+    uint32_t              fCqEqVariant;          /* 1-based, 0 = none worked */
+    uint32_t              fCqEqVariantTried;     /* bitmask of attempts */
+    uint32_t              fCqEqVariantSyndrome[4];
     uint64_t             fLastHealthCheck;
     uint64_t             fEqTickCount;
     uint32_t             fIssi;
@@ -445,10 +514,25 @@ MlxEnableVportRoce(MlxPCIDriver *core)
 }
 
 static uint64_t
-MlxEqPollDeadline()
+MlxEqPollDeadline(uint64_t periodMs)
 {
-    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 10ULL * 1000 * 1000;
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + periodMs * 1000 * 1000;
 }
+
+/* The EQ timer is the only event delivery while MSI-X is unproven, so it runs
+ * hot until the first interrupt arrives. After that it is insurance and can be
+ * rare: 50 ms matches the client's own blocking-wait backstop, so a dead
+ * vector costs the same bounded delay on both sides instead of 100 pointless
+ * wakeups a second inside the DEXT.
+ *
+ * On a card where MSI-X is never delivered the timer stays the delivery path,
+ * and then the thing worth cutting is its cost when nobody is using the
+ * device. With no CQ allocated there is no completion to deliver and no
+ * traffic to make the firmware ask for pages, so the timer drops to the idle
+ * rate and the DEXT stops charging a busy machine for an unused NIC. */
+#define MLX_EQ_POLL_UNPROVEN_MS  1ULL
+#define MLX_EQ_POLL_PROVEN_MS    50ULL
+#define MLX_EQ_POLL_IDLE_MS      100ULL
 
 struct MlxEqTimerArmContext {
     IOTimerDispatchSource *timer;
@@ -461,7 +545,7 @@ MlxArmEqTimerOnQueue(void *opaque)
     MlxEqTimerArmContext *ctx = static_cast<MlxEqTimerArmContext *>(opaque);
     if (!ctx || !ctx->timer) return;
     ctx->result = ctx->timer->WakeAtTime(kIOTimerClockUptimeRaw,
-                                          MlxEqPollDeadline(), 1000000);
+                                          MlxEqPollDeadline(MLX_EQ_POLL_UNPROVEN_MS), 1000000);
 }
 
 static void
@@ -469,6 +553,346 @@ MlxDrainEqTimerQueue(void *)
 {
     /* DispatchSync_f is the teardown barrier; all earlier timer callbacks on
      * this serial queue have completed when it returns. */
+}
+
+kern_return_t
+MlxPCIDriver::StartInterrupts()
+{
+    if (!ivars || !ivars->fPci) return kIOReturnNotReady;
+    ivars->fIrqSetupStage = MLX_IRQ_STAGE_CONFIGURE;
+    kern_return_t kr = ivars->fPci->ConfigureInterrupts(
+        kIOInterruptTypePCIMessagedX, 2, 2, 0);
+    if (kr != kIOReturnSuccess) {
+        ivars->fIrqSetupStatus = (uint32_t)kr;
+        MLX_LOG("MSI-X allocation (2 vectors) failed: 0x%x", kr);
+        return kr;
+    }
+    ivars->fIrqVectors = 2;
+    if (ivars->fCompletionInterrupt) {
+        /* Re-arm after a reinit FLR. The host-side dispatch sources survive a
+         * reset, the device's MSI-X capability does not, so only the device
+         * side is redone; recreating the sources would race DriverKit's
+         * asynchronous disable/cancel. */
+        ivars->fIrqSetupStage = MLX_IRQ_STAGE_ENABLE;
+        kr = ivars->fAsyncInterrupt->SetEnableWithCompletion(true, nullptr);
+        if (kr == kIOReturnSuccess)
+            kr = ivars->fCompletionInterrupt->SetEnableWithCompletion(true, nullptr);
+        if (kr != kIOReturnSuccess) {
+            ivars->fIrqSetupStatus = (uint32_t)kr;
+            MLX_LOG("MSI-X re-arm after reset failed: 0x%x", kr);
+            return kr;
+        }
+        ivars->fIrqSetupStage = MLX_IRQ_STAGE_NONE;
+        ivars->fIrqSetupStatus = 0;
+        MLX_LOG("MSI-X re-armed after reset");
+        return kIOReturnSuccess;
+    }
+    ivars->fIrqSetupStage = MLX_IRQ_STAGE_QUEUE;
+    kr = IODispatchQueue::Create("MlxIRQ", 0, 0, &ivars->fInterruptQueue);
+    if (kr == kIOReturnSuccess)
+        kr = IODispatchQueue::Create("MlxCQWait", kIODispatchQueueReentrant,
+                                     0, &ivars->fCompletionWaitQueue);
+    if (kr == kIOReturnSuccess) {
+        ivars->fIrqSetupStage = MLX_IRQ_STAGE_SOURCE;
+        kr = IOInterruptDispatchSource::Create(
+            ivars->fPci, 0, ivars->fInterruptQueue, &ivars->fAsyncInterrupt);
+    }
+    if (kr == kIOReturnSuccess)
+        kr = IOInterruptDispatchSource::Create(
+            ivars->fPci, 1, ivars->fInterruptQueue,
+            &ivars->fCompletionInterrupt);
+    if (kr == kIOReturnSuccess) {
+        ivars->fIrqSetupStage = MLX_IRQ_STAGE_ACTION;
+        kr = CreateActionAsyncInterruptOccurred(0, &ivars->fAsyncInterruptAction);
+    }
+    if (kr == kIOReturnSuccess)
+        kr = CreateActionCompletionInterruptOccurred(
+            0, &ivars->fCompletionInterruptAction);
+    if (kr == kIOReturnSuccess) {
+        ivars->fIrqSetupStage = MLX_IRQ_STAGE_HANDLER;
+        kr = ivars->fAsyncInterrupt->SetHandler(ivars->fAsyncInterruptAction);
+    }
+    if (kr == kIOReturnSuccess)
+        kr = ivars->fCompletionInterrupt->SetHandler(
+            ivars->fCompletionInterruptAction);
+    if (kr == kIOReturnSuccess) {
+        ivars->fIrqSetupStage = MLX_IRQ_STAGE_ENABLE;
+        kr = ivars->fAsyncInterrupt->SetEnableWithCompletion(true, nullptr);
+    }
+    if (kr == kIOReturnSuccess)
+        kr = ivars->fCompletionInterrupt->SetEnableWithCompletion(true, nullptr);
+    if (kr != kIOReturnSuccess) {
+        ivars->fIrqSetupStatus = (uint32_t)kr;
+        MLX_LOG("MSI-X dispatch setup failed at stage %u: 0x%x",
+                ivars->fIrqSetupStage, kr);
+        StopInterrupts();
+        return kr;
+    }
+    ivars->fIrqSetupStage = MLX_IRQ_STAGE_NONE;
+    ivars->fIrqSetupStatus = 0;
+    MLX_LOG("MSI-X dispatch active: async vector=0 completion vector=1");
+    return kIOReturnSuccess;
+}
+
+void
+MlxPCIDriver::GetInterruptStatus(uint32_t *vectors, uint32_t *status,
+                                 uint32_t *stage) const
+{
+    if (vectors) *vectors = ivars ? ivars->fIrqVectors : 0;
+    if (status)  *status  = ivars ? ivars->fIrqSetupStatus : 0;
+    if (stage)   *stage   = ivars ? ivars->fIrqSetupStage
+                                  : (uint32_t)MLX_IRQ_STAGE_NOT_ATTEMPTED;
+}
+
+void
+MlxPCIDriver::GetEqServiceStats(uint64_t *asyncIrq, uint64_t *completionIrq,
+                                uint64_t *timerTicks,
+                                uint32_t *timerPeriodMs) const
+{
+    if (asyncIrq)   *asyncIrq   = ivars ?
+        __atomic_load_n(&ivars->fAsyncIrqCount, __ATOMIC_RELAXED) : 0;
+    if (completionIrq) *completionIrq = ivars ?
+        __atomic_load_n(&ivars->fCompletionIrqCount, __ATOMIC_RELAXED) : 0;
+    if (timerTicks) *timerTicks = ivars ? __atomic_load_n(&ivars->fEqTickCount, __ATOMIC_RELAXED) : 0;
+    if (timerPeriodMs) {
+        bool inUse = ivars && ivars->fRoCE && ivars->fRoCE->GetCQ() &&
+                     ivars->fRoCE->GetCQ()->LiveCount();
+        *timerPeriodMs = mlxEqPollPeriodMs(inUse, CompletionInterruptReady());
+    }
+}
+
+void
+MlxPCIDriver::GetCompletionEqVariants(uint32_t *variant, uint32_t *tried,
+                                      uint32_t *syndromes) const
+{
+    if (variant) *variant = ivars ? ivars->fCqEqVariant : 0;
+    if (tried)   *tried   = ivars ? ivars->fCqEqVariantTried : 0;
+    if (syndromes)
+        for (uint32_t i = 0; i < 4; i++)
+            syndromes[i] = ivars ? ivars->fCqEqVariantSyndrome[i] : 0;
+}
+
+void
+MlxPCIDriver::GetCompletionEqStatus(uint32_t *status, uint32_t *stage,
+                                    uint32_t *syndrome, uint32_t *fwStatus) const
+{
+    if (status)   *status   = ivars ? ivars->fCqEqStatus : 0;
+    if (stage)    *stage    = ivars ? ivars->fCqEqStage
+                                    : (uint32_t)MLX_CQEQ_STAGE_NOT_ATTEMPTED;
+    if (syndrome) *syndrome = ivars ? ivars->fCqEqSyndrome : 0;
+    if (fwStatus) *fwStatus = ivars ? ivars->fCqEqFwStatus : 0;
+}
+
+/* Brings up the dedicated completion EQ, trying the CreateEQ inputs firmware
+ * is known to object to. ConnectX-4 rejects the baseline here with BAD_PARAM
+ * and the kernel log channel is dead on the dev machine, so each attempt's
+ * syndrome is kept for QueryInterrupts instead. Failure is not fatal: without
+ * this EQ, MlxCQ::CreateCQ binds CQs to the async EQ and completion events
+ * ride vector 0. */
+void
+MlxPCIDriver::BringUpCompletionEq()
+{
+    if (!ivars || !ivars->fCompletionInterrupt || ivars->fCompletionEQ) return;
+
+    struct Variant { uint32_t intr; uint32_t logSize; bool ownUar; bool usable; };
+    static const Variant kVariants[] = {
+        { 1, 8, false, true  },  /* baseline: own vector, 256 entries */
+        { 1, 6, false, true  },  /* smaller ring */
+        { 1, 8, true,  true  },  /* its own UAR page rather than the boot one */
+        { 0, 8, false, false },  /* diagnostic only: is the vector index it? */
+    };
+    const uint32_t count = sizeof(kVariants) / sizeof(kVariants[0]);
+
+    for (uint32_t i = 0; i < count; i++) {
+        ivars->fCqEqVariantTried |= (1u << i);
+        MlxEQ *eq = new MlxEQ();
+        if (!eq) {
+            RecordCompletionEqResult(MLX_CQEQ_STAGE_ALLOC, kIOReturnNoMemory);
+            return;
+        }
+        uint32_t stage = MLX_CQEQ_STAGE_INIT;
+        uint32_t eqn = 0;
+        kern_return_t kr = eq->Init(this, kVariants[i].intr, true,
+                                    kVariants[i].logSize);
+        if (kr == kIOReturnSuccess) {
+            if (kVariants[i].ownUar && ivars->fUAR) {
+                uint32_t uar = 0;
+                if (ivars->fUAR->AllocUAR(&uar) == kIOReturnSuccess)
+                    eq->SetUarPage(uar);
+            }
+            stage = MLX_CQEQ_STAGE_CREATE;
+            kr = eq->CreateEQ(&eqn);
+        }
+        ivars->fCqEqVariantSyndrome[i] =
+            ivars->fCmd ? ivars->fCmd->LastSyndrome() : 0;
+        if (kr != kIOReturnSuccess) {
+            RecordCompletionEqResult(stage, kr);
+            eq->Free();
+            delete eq;
+            continue;
+        }
+        ivars->fCqEqVariant = i + 1;
+        if (!kVariants[i].usable) {
+            /* Accepted only on the async vector: that pins the objection to
+             * the interrupt index, and the EQ itself is no use there. */
+            (void)eq->DestroyEQ(eqn);
+            eq->Free();
+            delete eq;
+            MLX_LOG("completion EQ: only intr=0 accepted — firmware rejects "
+                    "the second interrupt vector");
+            return;
+        }
+        RecordCompletionEqResult(MLX_CQEQ_STAGE_OK, kIOReturnSuccess);
+        ivars->fCompletionEQ = eq;
+        (void)eq->Arm();
+        MLX_LOG("completion EQ created eqn=%u variant=%u vector=%u logSize=%u",
+                eqn, i + 1, kVariants[i].intr, kVariants[i].logSize);
+        return;
+    }
+    MLX_LOG("completion EQ unavailable after %u variants — CQs bind to the "
+            "async EQ and completion events ride vector 0", count);
+}
+
+/* Rebinds the completion EQ to a chosen MSI-X index, so the two failure modes
+ * behind a silent vector can be told apart: either MSI-X is not delivered to
+ * this dext at all, or the firmware's intr index does not line up with the
+ * dispatch-source index the handler is attached to. Refused while any CQ is
+ * live, because a CQ carries the old EQ number in its c_eqn. */
+kern_return_t
+MlxPCIDriver::ProbeCompletionVector(uint32_t intr, uint32_t *outEqn)
+{
+    if (!ivars || !ivars->fCompletionInterrupt) return kIOReturnNotReady;
+    if (intr > 1) return kIOReturnBadArgument;
+    if (ivars->fRoCE && ivars->fRoCE->GetCQ() &&
+        ivars->fRoCE->GetCQ()->LiveCount())
+        return kIOReturnBusy;
+
+    if (ivars->fCompletionEQ) {
+        uint32_t eqn = ivars->fCompletionEQ->EqNumber();
+        if (eqn) (void)ivars->fCompletionEQ->DestroyEQ(eqn);
+        ivars->fCompletionEQ->Free();
+        delete ivars->fCompletionEQ;
+        ivars->fCompletionEQ = NULL;
+    }
+
+    MlxEQ *eq = new MlxEQ();
+    if (!eq) return kIOReturnNoMemory;
+    uint32_t eqn = 0;
+    kern_return_t kr = eq->Init(this, intr, true, 8);
+    uint32_t stage = MLX_CQEQ_STAGE_INIT;
+    if (kr == kIOReturnSuccess) {
+        stage = MLX_CQEQ_STAGE_CREATE;
+        kr = eq->CreateEQ(&eqn);
+    }
+    if (kr != kIOReturnSuccess) {
+        RecordCompletionEqResult(stage, kr);
+        eq->Free();
+        delete eq;
+        MLX_LOG("completion vector probe intr=%u failed: 0x%x", intr, kr);
+        return kr;
+    }
+    RecordCompletionEqResult(MLX_CQEQ_STAGE_OK, kIOReturnSuccess);
+    ivars->fCompletionEQ = eq;
+    if (ivars->fRoCE) ivars->fCompletionEQ->AddNotifier(ivars->fRoCE);
+    (void)eq->Arm();
+    if (outEqn) *outEqn = eqn;
+    MLX_LOG("completion vector probe: EQ %u now on intr=%u", eqn, intr);
+    return kIOReturnSuccess;
+}
+
+/* Records why the completion EQ did not come up. Called from both Phase 2
+ * bring-up paths so the answer survives a dead kernel log channel. */
+void
+MlxPCIDriver::RecordCompletionEqResult(uint32_t stage, kern_return_t kr)
+{
+    if (!ivars) return;
+    ivars->fCqEqStage = stage;
+    ivars->fCqEqStatus = (uint32_t)kr;
+    ivars->fCqEqSyndrome = ivars->fCmd ? ivars->fCmd->LastSyndrome() : 0;
+    ivars->fCqEqFwStatus = ivars->fCmd ? ivars->fCmd->LastFwStatus() : 0;
+}
+
+void
+MlxPCIDriver::StopInterrupts()
+{
+    if (!ivars) return;
+    if (ivars->fCompletionWaitQueue)
+        ivars->fCompletionWaitQueue->WakeupWithOptions(
+            &ivars->fCompletionGeneration, kIODispatchQueueWakeupAll);
+    if (ivars->fAsyncInterrupt)
+        (void)ivars->fAsyncInterrupt->SetEnableWithCompletion(false, nullptr);
+    if (ivars->fCompletionInterrupt)
+        (void)ivars->fCompletionInterrupt->SetEnableWithCompletion(false, nullptr);
+    /* DriverKit disable/cancel completion is asynchronous. Retain the source
+     * objects until the DEXT process exits instead of racing an in-flight IRQ. */
+}
+
+/* Releases clients blocked in WaitCompletionEvent. Called from whichever
+ * poller actually drained the completion EQEs: the dedicated completion
+ * vector when firmware granted that EQ, otherwise the async vector and the
+ * EQ timer, because MlxCQ::CreateCQ then binds every CQ to the async EQ. */
+void
+MlxPCIDriver::SignalCompletionEvent(uint32_t completions)
+{
+    if (!completions || !ivars || !ivars->fCompletionWaitQueue) return;
+    ivars->fCompletionWaitQueue->DispatchSync(^{
+        ivars->fCompletionGeneration++;
+        __atomic_fetch_add(&ivars->fCompletionEvents, 1, __ATOMIC_RELAXED);
+        ivars->fCompletionWaitQueue->WakeupWithOptions(
+            &ivars->fCompletionGeneration, kIODispatchQueueWakeupAll);
+    });
+}
+
+void
+MlxPCIDriver::AsyncInterruptOccurred_Impl(OSAction *, uint64_t, uint64_t)
+{
+    if (!ivars || ivars->fStopping || !ivars->fEQ) return;
+    __atomic_fetch_add(&ivars->fAsyncIrqCount, 1, __ATOMIC_RELAXED);
+    uint32_t completions = 0;
+    (void)ivars->fEQ->Poll(&completions);
+    (void)ivars->fEQ->Arm();
+    /* The async EQ remains a valid completion fallback when no dedicated EQ
+     * was accepted. Its CQEs wake waiters, but do not prove vector 1 works. */
+    SignalCompletionEvent(completions);
+}
+
+void
+MlxPCIDriver::CompletionInterruptOccurred_Impl(OSAction *, uint64_t, uint64_t)
+{
+    if (!ivars || ivars->fStopping || !ivars->fCompletionEQ) return;
+    __atomic_fetch_add(&ivars->fCompletionIrqCount, 1, __ATOMIC_RELAXED);
+    uint32_t processed = 0;
+    (void)ivars->fCompletionEQ->Poll(&processed);
+    (void)ivars->fCompletionEQ->Arm();
+    if (processed) {
+        __atomic_fetch_add(&ivars->fIrqCompletionEqes, processed, __ATOMIC_RELAXED);
+        __atomic_store_n(&ivars->fLastCompletionIrqNs, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELEASE);
+    }
+    SignalCompletionEvent(processed);
+}
+
+kern_return_t
+MlxPCIDriver::WaitCompletionEvent(uint64_t generation, uint32_t timeoutMs,
+                                  uint64_t *newGeneration)
+{
+    if (!ivars || !newGeneration || !ivars->fCompletionWaitQueue ||
+        !CompletionEventReady())
+        return kIOReturnNotReady;
+    __block kern_return_t result = kIOReturnSuccess;
+    ivars->fCompletionWaitQueue->DispatchSync(^{
+        if (DmaQuarantined() || ivars->fStopping) { result = kIOReturnNotReady; return; }
+        if (ivars->fCompletionGeneration == generation) {
+            uint64_t timeout = (uint64_t)(timeoutMs ? timeoutMs : 1000u) *
+                               1000ULL * 1000ULL;
+            result = ivars->fCompletionWaitQueue->Sleep(
+                &ivars->fCompletionGeneration, timeout);
+        }
+        *newGeneration = ivars->fCompletionGeneration;
+        if (DmaQuarantined() || ivars->fStopping) result = kIOReturnNotReady;
+    });
+    if (*newGeneration != generation)
+        __atomic_fetch_add(&ivars->fCompletionWakeups, 1, __ATOMIC_RELAXED);
+    return result;
 }
 
 kern_return_t
@@ -562,9 +986,24 @@ MlxPCIDriver::EqTimerOccurred_Impl(OSAction *action, uint64_t time)
 {
     (void)action; (void)time;
     if (!ivars || ivars->fStopping || !ivars->fEqTimer) return;
-    uint64_t tick = ++ivars->fEqTickCount;
+    uint64_t tick = __atomic_add_fetch(&ivars->fEqTickCount, 1, __ATOMIC_RELAXED);
     if (tick == 1) MLX_LOG("EQ timer first callback entered");
-    if (ivars->fEQ) ivars->fEQ->Poll();
+    if (ivars->fEQ) {
+        uint32_t completions = 0;
+        (void)ivars->fEQ->Poll(&completions);
+        __atomic_fetch_add(&ivars->fTimerCompletionEqes, completions, __ATOMIC_RELAXED);
+        SignalCompletionEvent(completions);
+    }
+    /* The dedicated completion EQ needs the same insurance as the async one.
+     * Once it exists, MlxCQ::CreateCQ binds CQs to it, so if its vector stays
+     * silent nothing else drains the ring and every armed CQ waits out the
+     * client's backstop instead. Poll re-arms on drain. */
+    if (ivars->fCompletionEQ) {
+        uint32_t completions = 0;
+        (void)ivars->fCompletionEQ->Poll(&completions);
+        __atomic_fetch_add(&ivars->fTimerCompletionEqes, completions, __ATOMIC_RELAXED);
+        SignalCompletionEvent(completions);
+    }
     if (ivars->fRoCE &&
         ivars->fRoCE->DrainPendingPageRequests() != kIOReturnSuccess)
         ivars->fRuntimePagesOk = false;
@@ -577,8 +1016,11 @@ MlxPCIDriver::EqTimerOccurred_Impl(OSAction *action, uint64_t time)
     }
     if (tick == 1) MLX_LOG("EQ timer first callback poll/drain passed");
     if (ivars->fEqTimer) {
+        bool inUse = ivars->fRoCE && ivars->fRoCE->GetCQ() &&
+                     ivars->fRoCE->GetCQ()->LiveCount();
+        uint64_t periodMs = mlxEqPollPeriodMs(inUse, CompletionInterruptReady());
         kern_return_t kr = ivars->fEqTimer->WakeAtTime(
-            kIOTimerClockUptimeRaw, MlxEqPollDeadline(), 1000000);
+            kIOTimerClockUptimeRaw, MlxEqPollDeadline(periodMs), 1000000);
         if (kr != kIOReturnSuccess) {
             ivars->fRuntimePagesOk = false;
             MLX_LOG("EQ timer rearm failed tick=%llu kr=0x%x",
@@ -588,7 +1030,7 @@ MlxPCIDriver::EqTimerOccurred_Impl(OSAction *action, uint64_t time)
         }
     }
     if ((tick % 500) == 0)
-        MLX_LOG("EQ timer heartbeat ticks=%llu", (unsigned long long)tick);
+        MLX_DBG("EQ timer heartbeat ticks=%llu", (unsigned long long)tick);
 }
 
 void
@@ -604,6 +1046,11 @@ MlxPCIDriver::DestroyPhase2FirmwareResources()
     if (!(pciCommand & 0x2)) {
         EnterDmaQuarantine(0x50324442u); /* 'P2DB': no safe command path */
         return;
+    }
+    if (ivars->fCompletionEQ && ivars->fCompletionEQ->EqNumber()) {
+        uint32_t eqn = ivars->fCompletionEQ->EqNumber();
+        if (ivars->fCompletionEQ->DestroyEQ(eqn) != kIOReturnSuccess)
+            EnterDmaQuarantine(0x43455100u | (eqn & 0xffu));
     }
     if (ivars->fEQ && ivars->fEQ->EqNumber()) {
         uint32_t eqn = ivars->fEQ->EqNumber();
@@ -689,7 +1136,11 @@ MlxPCIDriver::InitPhase2Runtime()
         kern_return_t kr = ivars->fEQ->CreateEQ(&eqn);
         if (kr != kIOReturnSuccess)
             MLX_PHASE2_FAIL(MLX_PHASE2_SUB_CREATE_EQ, kr);
+        (void)ivars->fEQ->Arm();
     }
+    /* Not fatal: without it, CQs bind to the async EQ (MlxCQ::CreateCQ) and
+     * completion events ride vector 0. */
+    BringUpCompletionEq();
     ivars->fRoCE = new MlxRoCE();
     if (!ivars->fRoCE)
         MLX_PHASE2_FAIL(MLX_PHASE2_SUB_ROCE_INIT, kIOReturnNoMemory);
@@ -699,6 +1150,8 @@ MlxPCIDriver::InitPhase2Runtime()
             MLX_PHASE2_FAIL(MLX_PHASE2_SUB_ROCE_INIT, kr);
     }
     ivars->fEQ->AddNotifier(ivars->fRoCE);
+    if (ivars->fCompletionEQ)
+        ivars->fCompletionEQ->AddNotifier(ivars->fRoCE);
     {
         kern_return_t kr = MlxEnableVportRoce(this);
         if (kr != kIOReturnSuccess)
@@ -781,6 +1234,7 @@ fail:
     StopEqPoller();
     if (ivars->fRoCE) { ivars->fRoCE->Free(); delete ivars->fRoCE; ivars->fRoCE = NULL; }
     DestroyPhase2FirmwareResources();
+    if (ivars->fCompletionEQ) { ivars->fCompletionEQ->Free(); delete ivars->fCompletionEQ; ivars->fCompletionEQ = NULL; }
     if (ivars->fEQ) { ivars->fEQ->Free(); delete ivars->fEQ; ivars->fEQ = NULL; }
     if (ivars->fUAR) { ivars->fUAR->Free(); delete ivars->fUAR; ivars->fUAR = NULL; }
     if (ivars->fDMA) { ivars->fDMA->Free(); delete ivars->fDMA; ivars->fDMA = NULL; }
@@ -819,6 +1273,9 @@ MlxPCIDriver::init()
     ivars->fPd                  = 0;
     ivars->fXrcd                = 0;
     ivars->fDevIdx              = 0;
+    /* Stage 0 means "MSI-X is live"; until Start runs it, say so honestly. */
+    ivars->fIrqSetupStage       = MLX_IRQ_STAGE_NOT_ATTEMPTED;
+    ivars->fCqEqStage           = MLX_CQEQ_STAGE_NOT_ATTEMPTED;
     strlcpy(ivars->fDevName, "mlx5_0", sizeof(ivars->fDevName));
     return true;
 }
@@ -836,7 +1293,7 @@ MlxPCIDriver::free()
 kern_return_t
 MlxPCIDriver::Start_Impl(IOService * provider)
 {
-    MLX_LOG("Start — ConnectX RDMA DEXT initializing (build p3-cq-arm-1)");
+    MLX_LOG("Start — ConnectX RDMA DEXT initializing (build p0-p1-dma-lifetime-runtime-1)");
 
     /* Establish the IOService/provider relationship before caching or using
      * the IOPCIDevice proxy.  Without SUPERDISPATCH the provider is valid only
@@ -866,6 +1323,14 @@ MlxPCIDriver::Start_Impl(IOService * provider)
         MLX_LOG("PCI Open failed: 0x%x (thread 734812 PCIDriverKit bug?)", kr);
         return failStart(kr);
     }
+    /* MSI-X is configured after the FLR below, not here. A Function Level
+     * Reset clears the device's MSI-X capability and table, so vectors
+     * configured before it are silently dead: ConfigureInterrupts reports
+     * success, dispatch sources exist, and no interrupt is ever raised. That
+     * also puts vector 1 out of the firmware's range, which is why CREATE_EQ
+     * accepted intr=0 and rejected intr=1 with the same syndrome regardless of
+     * ring size or UAR page. Nothing before FwInit needs interrupts: firmware
+     * commands poll the command queue and the EQs do not exist yet. */
 
     /* Query BAR0: type + size. Expected kPCIBARTypeM64 on ConnectX-4 Lx. */
     uint8_t barType = 0;
@@ -989,7 +1454,7 @@ MlxPCIDriver::Start_Impl(IOService * provider)
             ivars->fPci->Close(this, 0);
             return failStart(kIOReturnNoDevice);
         }
-        MlxReleaseQuarantinedPagesAfterReset();
+        MlxReleaseQuarantinedPagesAfterReset(ivars->fPci);
     } else {
         if (!PerformFlr()) {
             MLX_LOG("Start: FLR verification failed — initialization aborted");
@@ -1010,6 +1475,10 @@ MlxPCIDriver::Start_Impl(IOService * provider)
         /* Steps 4-6: ENABLE_HCA → QUERY/SET_ISSI */
         if (FwInit()) {
             MLX_LOG("Phase 1 COMPLETE: HCA enabled, ISSI set");
+            /* Now that the device has been reset and the firmware is up, claim
+             * the MSI-X vectors. Additive: if two vectors are unavailable the
+             * timer/direct-CQ polling path remains valid. */
+            (void)StartInterrupts();
             /* ---- Phase 2: PD + UAR + verbs objects ---- */
             const MlxHcaCaps &caps = ivars->fHCA->Caps();
             ivars->fDMA = new MlxDMA();
@@ -1040,11 +1509,14 @@ MlxPCIDriver::Start_Impl(IOService * provider)
                             MLX_LOG("Phase 2 WARN: CREATE_EQ failed — events unavailable");
                             ivars->fEQ->Free(); delete ivars->fEQ; ivars->fEQ = NULL;
                         } else {
-                            MLX_LOG("CREATE_EQ ok — eqn=%u (poll-mode)", eqn);
+                            (void)ivars->fEQ->Arm();
+                            MLX_LOG("CREATE_EQ ok — eqn=%u (MSI-X + poll fallback)", eqn);
                         }
                     } else {
                         if (ivars->fEQ) { delete ivars->fEQ; ivars->fEQ = NULL; }
                     }
+
+                    BringUpCompletionEq();
 
                     ivars->fRoCE = new MlxRoCE();
                     if (!ivars->fRoCE ||
@@ -1052,6 +1524,8 @@ MlxPCIDriver::Start_Impl(IOService * provider)
                         MLX_LOG("Phase 2 FAIL: MlxRoCE init");
                     } else {
                         if (ivars->fEQ) ivars->fEQ->AddNotifier(ivars->fRoCE);
+                        if (ivars->fCompletionEQ)
+                            ivars->fCompletionEQ->AddNotifier(ivars->fRoCE);
                         MLX_LOG("Phase 2 control objects ready: pd=%u uar[%u]",
                                 ivars->fPd, uarIdx);
 
@@ -1177,7 +1651,7 @@ MlxPCIDriver::Start_Impl(IOService * provider)
     bool pageAccountingOk = ivars->fFwPages ? ivars->fFwPages->ValidateAccounting() : true;
     if ((ivars->fRoCE && ivars->fRoCE->PageHealthFailed()) || !pageAccountingOk)
         ivars->fRuntimePagesOk = false;
-    MLX_LOG("Start complete (build p3-cq-arm-1) — device 0x%04x, HCA init done, phase2=%s fw_owned=%u ambiguous=%u host=%u returned=%u accounting=%s",
+    MLX_LOG("Start complete (build p0-p1-dma-lifetime-runtime-1) — device 0x%04x, HCA init done, phase2=%s fw_owned=%u ambiguous=%u host=%u returned=%u accounting=%s",
             ivars->fDeviceId, ivars->fRuntimePagesOk ? "ok" : "degraded",
             ivars->fFwPages ? ivars->fFwPages->GetFirmwareOwned() : 0,
             ivars->fFwPages ? ivars->fFwPages->GetAmbiguousOwned() : 0,
@@ -1193,6 +1667,7 @@ MlxPCIDriver::Stop_Impl(IOService * provider)
     MLX_LOG("Stop — graceful teardown");
     ivars->fStopping = true;
     StopEqPoller();
+    StopInterrupts();
 
     /* [FIX v0.36] Before graceful teardown, check whether the PCI BAR is alive
      * (MSE set). IOPCIFamily may clear MSE/BME BEFORE Stop, and then
@@ -1298,6 +1773,10 @@ MlxPCIDriver::Exec(uint32_t opcode, const void *in, uint32_t inSize,
     if (!ivars->fCmd)
         return kIOReturnNotReady;
     kern_return_t kr = ivars->fCmd->Exec(opcode, in, inSize, out, outSize, timeoutMs);
+    if (ivars->fCmd->IsQuarantined()) {
+        EnterDmaQuarantine(0x434d4400u | (opcode & 0xffu));
+        return kr; /* no EQ MMIO or nested page commands after fencing */
+    }
     /* Drain the async EQ after every command (poll-mode, MSI-X not wired yet).
      * PAGE_REQUEST is enqueued inside the EQ handler and serviced here, after
      * fully draining the ring — without a nested Poll. */
@@ -1316,6 +1795,7 @@ MlxPCIDriver::Exec(uint32_t opcode, const void *in, uint32_t inSize,
 IOPCIDevice *         MlxPCIDriver::GetPCI()           { return ivars->fPci; }
 MlxCmd *              MlxPCIDriver::GetCmd()           { return ivars->fCmd; }
 MlxEQ *               MlxPCIDriver::GetEQ()            { return ivars->fEQ; }
+MlxEQ *               MlxPCIDriver::GetCompletionEQ()  { return ivars->fCompletionEQ; }
 MlxUAR *              MlxPCIDriver::GetUAR()           { return ivars->fUAR; }
 MlxHCA *              MlxPCIDriver::GetHCA()           { return ivars->fHCA; }
 MlxHealth *           MlxPCIDriver::GetHealth()        { return ivars->fHealth; }
@@ -1329,6 +1809,52 @@ uint32_t              MlxPCIDriver::GetPd() const      { return ivars->fPd; }
 uint32_t              MlxPCIDriver::GetXrcd() const    { return ivars->fXrcd; }
 uint32_t              MlxPCIDriver::GetDevIdx() const  { return ivars->fDevIdx; }
 const char *          MlxPCIDriver::GetDevName() const { return ivars->fDevName; }
+bool MlxPCIDriver::CompletionInterruptReady() const
+{
+    /* EQ creation, a timer, or an async-vector interrupt is not proof that the
+     * completion vector delivers. Require the dedicated EQ/source and a
+     * completion EQE observed on that vector in this reset epoch. */
+    if (!CompletionEventReady() || !ivars->fCompletionEQ ||
+        !ivars->fCompletionInterrupt)
+        return false;
+    uint64_t last = __atomic_load_n(&ivars->fLastCompletionIrqNs, __ATOMIC_ACQUIRE);
+    uint64_t irq = __atomic_load_n(&ivars->fCompletionIrqCount, __ATOMIC_ACQUIRE);
+    return irq && last && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - last < 5000000000ULL;
+}
+
+bool MlxPCIDriver::CompletionEventReady() const
+{
+    return ivars && !ivars->fStopping && !DmaQuarantined() &&
+           ivars->fCompletionWaitQueue && ivars->fEQ && ivars->fEqTimer;
+}
+
+void MlxPCIDriver::GetRuntimeStatus(struct mlx_runtime_resp *r)
+{
+    memset(r, 0, sizeof(*r)); r->version = MLX_RUNTIME_VERSION; r->size = sizeof(*r);
+    r->deviceEpoch = __atomic_load_n(&ivars->fDeviceEpoch, __ATOMIC_ACQUIRE);
+    if (ivars->fDMA) ivars->fDMA->GetPinnedStats(&r->pinnedBytes, &r->peakPinnedBytes, &r->pinFailures);
+    r->clientPinnedLimit = MLX_UC_PINNED_BYTES_PER_CLIENT;
+    r->devicePinnedLimit = MLX_UC_PINNED_BYTES_PER_DEVICE;
+    r->quarantineBytes = __atomic_load_n(&ivars->fQuarantineBytes, __ATOMIC_RELAXED);
+    r->quarantineObjects = __atomic_load_n(&ivars->fQuarantineObjects, __ATOMIC_RELAXED);
+    r->irqCompletionEqes = __atomic_load_n(&ivars->fIrqCompletionEqes, __ATOMIC_RELAXED);
+    r->timerCompletionEqes = __atomic_load_n(&ivars->fTimerCompletionEqes, __ATOMIC_RELAXED);
+    r->lastCompletionIrqNs = __atomic_load_n(&ivars->fLastCompletionIrqNs, __ATOMIC_ACQUIRE);
+    r->quarantined = DmaQuarantined();
+    r->bmeFenced = __atomic_load_n(&ivars->fBmeFenced, __ATOMIC_ACQUIRE);
+    r->completionEqReady = CompletionEventReady();
+    r->completionIrqProven = CompletionInterruptReady();
+}
+
+uint64_t MlxPCIDriver::CompletionEventCount() const
+{
+    return ivars ? __atomic_load_n(&ivars->fCompletionEvents, __ATOMIC_RELAXED) : 0;
+}
+
+uint64_t MlxPCIDriver::CompletionWakeupCount() const
+{
+    return ivars ? __atomic_load_n(&ivars->fCompletionWakeups, __ATOMIC_RELAXED) : 0;
+}
 
 bool
 MlxPCIDriver::RoCEPublicationAllowed() const
@@ -1350,7 +1876,7 @@ MlxPCIDriver::Phase2Ready() const
 bool
 MlxPCIDriver::DmaQuarantined() const
 {
-    return ivars && ivars->fDmaQuarantined;
+    return ivars && __atomic_load_n(&ivars->fDmaQuarantined, __ATOMIC_ACQUIRE);
 }
 
 void
@@ -1360,14 +1886,30 @@ MlxPCIDriver::RetainDmaUntilReset(void *memPtr, void *dmaPtr, uint32_t reason)
     IODMACommand *dma = static_cast<IODMACommand *>(dmaPtr);
     if (!mem && !dma) return;
     EnterDmaQuarantine(reason);
-    MlxRetainQuarantinedDummy(mem, dma);
+    uint64_t bytes = 0;
+    if (mem) (void)mem->GetLength(&bytes);
+    __atomic_fetch_add(&ivars->fQuarantineBytes, bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ivars->fQuarantineObjects, 1, __ATOMIC_RELAXED);
+    MlxRetainQuarantinedDummy(mem, dma, ivars->fPci);
 }
 
 void
 MlxPCIDriver::EnterDmaQuarantine(uint32_t reason)
 {
-    ivars->fDmaQuarantined = true;
-    MLX_LOG("DMA quarantine entered: reason=0x%x — retaining mappings", reason);
+    if (!ivars) return;
+    bool first = !__atomic_exchange_n(&ivars->fDmaQuarantined, true, __ATOMIC_ACQ_REL);
+    if (first) {
+        bool fenced = DisableBusMasterAndVerify();
+        __atomic_store_n(&ivars->fBmeFenced, fenced, __ATOMIC_RELEASE);
+        MLX_LOG("DMA quarantine reason=0x%x BME_fenced=%u — mappings retained until reset",
+                reason, fenced ? 1u : 0u);
+        if (ivars->fCompletionWaitQueue)
+            ivars->fCompletionWaitQueue->DispatchSync(^{
+                ivars->fCompletionGeneration++;
+                ivars->fCompletionWaitQueue->WakeupWithOptions(
+                    &ivars->fCompletionGeneration, kIODispatchQueueWakeupAll);
+            });
+    }
 }
 
 /* PCIe Function Level Reset + wait for firmware load.
@@ -1491,9 +2033,18 @@ MlxPCIDriver::PerformFlr()
                 devIdVerified, fw);
         return false;
     }
-    MlxReleaseQuarantinedPagesAfterReset();
-    ivars->fDmaQuarantined = false;
+    MlxReleaseQuarantinedPagesAfterReset(ivars->fPci);
+    __atomic_store_n(&ivars->fDmaQuarantined, false, __ATOMIC_RELEASE);
     MLX_LOG("PerformFlr: verified DMA boundary");
+    __atomic_store_n(&ivars->fDeviceEpoch, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELEASE);
+    __atomic_store_n(&ivars->fLastCompletionIrqNs, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&ivars->fAsyncIrqCount, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ivars->fCompletionIrqCount, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ivars->fIrqCompletionEqes, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ivars->fTimerCompletionEqes, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ivars->fQuarantineBytes, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ivars->fQuarantineObjects, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ivars->fBmeFenced, false, __ATOMIC_RELEASE);
     return true;
 }
 
@@ -1525,6 +2076,7 @@ MlxPCIDriver::ReinitFw()
         RetainDmaUntilReset(dbMem, dbDma, 0x44425249u); /* 'DBRI' */
     }
     if (ivars->fUAR)     { ivars->fUAR->Free(); delete ivars->fUAR; ivars->fUAR = NULL; }
+    if (ivars->fCompletionEQ) { ivars->fCompletionEQ->Free(); delete ivars->fCompletionEQ; ivars->fCompletionEQ = NULL; }
     if (ivars->fEQ)      { ivars->fEQ->Free(); delete ivars->fEQ; ivars->fEQ = NULL; }
     if (ivars->fCmd)     { ivars->fCmd->Free(); delete ivars->fCmd; ivars->fCmd = NULL; }
 
@@ -1554,6 +2106,10 @@ MlxPCIDriver::ReinitFw()
         MLX_LOG("ReinitFw: FwInit failed (see log above)");
         return kIOReturnIOError;
     }
+    /* The FLR above cleared the device's MSI-X capability; re-arm it before
+     * Phase 2 recreates the EQs, or their intr indices refer to vectors the
+     * firmware no longer has. */
+    (void)StartInterrupts();
     if (!InitPhase2Runtime()) {
         MLX_LOG("ReinitFw: Phase 2 rebuild failed");
         return kIOReturnIOError;
@@ -1674,6 +2230,11 @@ MlxPCIDriver::StableInitCycle(struct mlx_stable_init_cycle_resp *report)
         if (ivars->fEQ) {
             ivars->fEQ->MarkDestroyedByTeardown();
             ivars->fEQ->Free(); delete ivars->fEQ; ivars->fEQ = NULL;
+        }
+        if (ivars->fCompletionEQ) {
+            ivars->fCompletionEQ->MarkDestroyedByTeardown();
+            ivars->fCompletionEQ->Free(); delete ivars->fCompletionEQ;
+            ivars->fCompletionEQ = NULL;
         }
         if (ivars->fUAR) {
             ivars->fUAR->MarkFirmwareResourcesDestroyedByTeardown();
@@ -1816,6 +2377,7 @@ MlxPCIDriver::Cleanup()
     /* Release in reverse dependency order. Ambiguous mappings are retained
      * (REMEDIATION_PLAN §3). */
     StopEqPoller();
+    StopInterrupts();
     if (ivars->fRoCE)    { ivars->fRoCE->Free(); delete ivars->fRoCE; ivars->fRoCE = NULL; }
 
     DestroyPhase2FirmwareResources();
@@ -1823,7 +2385,7 @@ MlxPCIDriver::Cleanup()
     if (ivars->fFwPages) {
         if (ivars->fFwPages->IsQuarantined()) {
             ivars->fFwPages->EnterQuarantine();
-            MlxRetainQuarantinedPages(ivars->fFwPages);
+            MlxRetainQuarantinedPages(ivars->fFwPages, ivars->fPci);
             ivars->fFwPages = NULL;
         } else {
             ivars->fFwPages->Free();
@@ -1840,6 +2402,7 @@ MlxPCIDriver::Cleanup()
         RetainDmaUntilReset(dbMem, dbDma, 0x4442434cu); /* 'DBCL' */
     }
     if (ivars->fUAR)     { ivars->fUAR->Free(); delete ivars->fUAR; ivars->fUAR = NULL; }
+    if (ivars->fCompletionEQ) { ivars->fCompletionEQ->Free(); delete ivars->fCompletionEQ; ivars->fCompletionEQ = NULL; }
     if (ivars->fEQ)      { ivars->fEQ->Free(); delete ivars->fEQ; ivars->fEQ = NULL; }
     if (ivars->fCmd)     { ivars->fCmd->Free(); delete ivars->fCmd; ivars->fCmd = NULL; }
     if (ivars->fHCA)     { delete ivars->fHCA; ivars->fHCA = NULL; }
@@ -2186,6 +2749,7 @@ MlxPCIDriver::QueryHcaCaps()
         caps.maxQp = mlxP1LogResourceSize(parsed.logMaxQp);
         caps.maxCq = mlxP1LogResourceSize(parsed.logMaxCq);
         caps.maxMr = mlxP1LogResourceSize(parsed.logMaxMkey);
+        caps.maxMttLogPageSize = parsed.maxMkeyLogEntitySizeMtt;
         caps.logMaxMsg = parsed.logMaxMsg;
         caps.roce = haveRoce;
         caps.uar4k = parsed.uar4k;
@@ -2203,11 +2767,12 @@ MlxPCIDriver::QueryHcaCaps()
         caps.ibMaxPkeys = static_cast<uint16_t>(
             mlxP1PkeyTableSize(parsed.pkeyTableEncoding));
     }
-    MLX_LOG("QUERY_HCA_CAP: logMaxQp=%u logMaxCq=%u logMaxMkey=%u logMaxMsg=%u logMaxSrqSz=%u logPgSz=%u portType=%u numPorts=%u roce=%u uar4k=%u cacheLine128=%u gidTable=%u roceVersions=0x%x udpDst=%u udpSrcMin=%u atomicOps=0x%x atomicSizeQp=0x%x atomicMode=%u",
+    MLX_LOG("QUERY_HCA_CAP: logMaxQp=%u logMaxCq=%u logMaxMkey=%u logMaxMsg=%u logMaxSrqSz=%u logPgSz=%u portType=%u numPorts=%u roce=%u uar4k=%u cacheLine128=%u bf=%u logBfRegSize=%u gidTable=%u roceVersions=0x%x udpDst=%u udpSrcMin=%u atomicOps=0x%x atomicSizeQp=0x%x atomicMode=%u",
             parsed.logMaxQp, parsed.logMaxCq, parsed.logMaxMkey,
             parsed.logMaxMsg, parsed.logMaxSrqSz, parsed.logPgSz,
             parsed.portType, parsed.numPorts, haveRoce ? 1 : 0,
             parsed.uar4k ? 1 : 0, parsed.cacheLine128 ? 1 : 0,
+            parsed.bf ? 1 : 0, parsed.logBfRegSize,
             parsedRoce.addressTableSize,
             mlxP1RoceVersionsForAbi(parsedRoce.versions),
             parsedRoce.destinationUdpPort, parsedRoce.minimumSourceUdpPort,
@@ -2272,7 +2837,17 @@ MlxPCIDriver::SetAtomicReqEndianness()
     MLX_LOG("SET_HCA_CAP ATOMIC req_8B_endianness_mode=1: 0x%x", kr);
     return kr == kIOReturnSuccess;
 }
-bool MlxPCIDriver::DisableBusMasterAndVerify() { return false; }
+bool MlxPCIDriver::DisableBusMasterAndVerify()
+{
+    if (!ivars || !ivars->fPci) return false;
+    uint16_t before = 0xffffu, after = 0xffffu;
+    ivars->fPci->ConfigurationRead16(4, &before);
+    if (before == 0xffffu) return false;
+    ivars->fPci->ConfigurationWrite16(4, mlxFencedPciCommand(before));
+    ivars->fPci->ConfigurationRead16(4, &after);
+    /* Readback verifies BME only; it is NOT proof of drained transactions. */
+    return mlxPciFenceVerified(before, after);
+}
 bool MlxPCIDriver::NegotiateRoceCap() { return false; }
 bool MlxPCIDriver::PublishNubs() { return false; }
 
@@ -2313,4 +2888,3 @@ MlxPCIDriver::AllocXrcd()
     MLX_LOG("ALLOC_XRCD ok — xrcd=%u", ivars->fXrcd);
     return true;
 }
-

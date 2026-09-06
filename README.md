@@ -56,9 +56,8 @@ requests and work completions, GID resolution, RC atomics, and QoS/service-level
   developed and exercised with **SIP disabled** (or `systemextensionsctl developer on`)
   and a locally signed driver.
 * These two facts — passing hardware gates and the outstanding entitlement grant —
-  are the real state of the project. See `docs/architecture.md` for the design and
-  `docs/inference-client-guide.md` for the client API; status and gate results
-  are in `CHANGELOG.md`.
+  are the real state of the project. See `docs/architecture.md` and the rest of
+  `docs/` for design, roadmap and status details.
 
 ---
 
@@ -76,7 +75,7 @@ requests and work completions, GID resolution, RC atomics, and QoS/service-level
 | `src/dext/loader/` | The `MlxRDMA.app` activation host |
 | `src/dext/kext-test/` | Standalone Phase-1a test kext (parallel to the DEXT) |
 | `src/tools/` | Thermal / 40G link / card reconnect helpers |
-| `docs/` | Architecture and the inference-client guide |
+| `docs/` | Architecture, roadmap, status, research notes |
 
 ---
 

@@ -171,6 +171,7 @@ kern_return_t MlxRoCE::PostSendInline(const struct mlx_post_send_inline_req *req
 kern_return_t MlxRoCE::PostSendAtomic(const struct mlx_post_send_atomic_req *req) { return s && s->qp && !PageHealthFailed() ? s->qp->PostSendAtomic(req) : kIOReturnNotReady; }
 kern_return_t MlxRoCE::QueryGidTable(const struct mlx_query_gid_table_req *req, struct mlx_query_gid_table_resp *resp) { return s && s->gid ? s->gid->QueryAll(req, resp) : kIOReturnNotReady; }
 kern_return_t MlxRoCE::ArmCQ(const struct mlx_arm_cq_req *req) { return s && s->cq && req ? s->cq->ArmCQ(req->cqHandle, req->solicitedOnly) : kIOReturnNotReady; }
+kern_return_t MlxRoCE::ModifyCqModeration(const struct mlx_modify_cq_moderation_req *req) { return s && s->cq && req ? s->cq->ModifyModeration(req->cqHandle, req->cqPeriod, req->cqMaxCount) : kIOReturnNotReady; }
 
 kern_return_t
 MlxRoCE::QueryDevice(struct mlx_query_device_resp *resp)

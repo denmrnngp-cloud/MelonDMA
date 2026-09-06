@@ -9,9 +9,8 @@
  * file for exactly what a real wire-in would touch.
  *
  * Companion to MlxP0Encoding.hpp's mlxEncodeCreateMkey(), which builds a
- * *direct* MTT mkey (one physical page list, capped at
- * MLX_CREATE_MKEY_MAX_PAGES = 480 pages / ~1.875 MiB by this driver's
- * single-mailbox-sized CREATE_MKEY command). This file builds the other
+ * *direct* MTT mkey (one physical page list; the PAS count is bounded only
+ * by the caller's mailbox buffer). This file builds the other
  * mlx5 mkey shape instead: an *indirect* KLM mkey, whose translation list
  * is not physical pages but {byte_count, mkey, address} triples pointing
  * at other, already-registered mkeys. Composing e.g. 24 direct 256 KiB
@@ -19,9 +18,7 @@
  * single rkey/lkey over the whole 6 MiB span — exactly llama.cpp's
  * ggml-rpc RDMA transport's RX-ring registration shape (transport.cpp,
  * RDMA_RX_DEPTH=24 x RDMA_CHUNK=256KiB) — without raising this driver's
- * command-mailbox size at all. The MTT cap is a property of one physical
- * page list; it says nothing about how many *mkeys* an indirect mkey can
- * reference, so this sidesteps notes/40's gap #1 instead of removing it.
+ * command-mailbox size at all.
  *
  * Offsets follow the same MLNX OFED 5.9 mlx5_ifc.h this driver already
  * cites in MlxP0Encoding.hpp. access_mode=2 (KLM) is

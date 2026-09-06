@@ -101,6 +101,15 @@ enum {
     MLX_CMD_OP_CREATE_CQ              = 0x400,
     MLX_CMD_OP_DESTROY_CQ             = 0x401,
     MLX_CMD_OP_QUERY_CQ               = 0x402,
+    MLX_CMD_OP_MODIFY_CQ              = 0x403,
+};
+
+/* MODIFY_CQ field select (include/linux/mlx5/cq.h). */
+enum {
+    MLX_CQ_MODIFY_PERIOD  = 1u << 0,
+    MLX_CQ_MODIFY_COUNT   = 1u << 1,
+    MLX_CQ_MODIFY_OVERRUN = 1u << 2,
+
     MLX_CMD_OP_CREATE_QP              = 0x500,
     MLX_CMD_OP_DESTROY_QP             = 0x501,
     MLX_CMD_OP_QUERY_QP               = 0x50B,

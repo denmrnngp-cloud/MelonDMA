@@ -63,6 +63,32 @@ capped by that Gen3 x4 link (~31.5 Gbit/s theoretical).
 - Narrowed `fMethodLock`; per-QP/per-CQ locks + O(1) QPN/CQN index.
 - CQ-depth validation; capability-driven QP/CQ/MR table sizing
   (`min(firmware caps, 4096)`); `MLX_UC_MAX_SGE` raised 4 → 16.
+- Blocking completion delivery: a client blocks in the DEXT until the
+  completion generation advances instead of scanning the mapped CQE ring on a
+  timer. An idle armed channel costs 0.190 % of a core against 2.950 %.
+  `MELONDMA_HW_CQ_EVENT=0` keeps the poller; `MELONDMA_HW_WAIT_MS` bounds what a
+  missed event costs (default 50 ms).
+- Hardware completion moderation (`MODIFY_CQ` with `cq_period` /
+  `cq_max_count`), as `ibv_mlx5_modify_cq_moderation` and as
+  `MELONDMA_CQ_MODERATION="<period_us>:<max_count>"`. Off by default.
+- EQ timer rate is three-tier — 100 ms with no CQ allocated, 10 ms with one,
+  50 ms once any interrupt vector proves itself. Idle DEXT cost fell from
+  0.750 % to 0.150 % of a core.
+- Four completion-path defects fixed: the CQ arm sequence number was advanced
+  per arm instead of per delivered event (only ~1/3 of re-arms produced one);
+  `MlxEQ::Poll` published the consumer index without the arm bit, so a timer
+  drain left the ring disarmed; the compat worker blocked on an already
+  disarmed CQ and consumed the next generation edge; and a wait timeout arrived
+  with a zeroed output struct, losing the client's generation snapshot.
+- `QueryPerf` fills the `doorbells` / `cqeConsumed` / `cqeErrors` fields it had
+  always declared and never written, plus device-wide completion-event and
+  wakeup counters. `QueryInterrupts` reports the whole interrupt path: granted
+  vectors, failing setup step, both EQ numbers, per-vector interrupt counts, the
+  EQ timer period, and the completion EQ's bring-up verdict with per-variant
+  firmware syndromes.
+- Gates added: `mlx_cq_idle_cpu` (idle cost of an armed channel on either
+  worker path) and `mlx_irq_probe` (rebind the completion EQ to a chosen
+  interrupt index).
 
 ---
 
@@ -88,7 +114,16 @@ capped by that Gen3 x4 link (~31.5 Gbit/s theoretical).
 - Negative `TAKE` during teardown/reinit — not exercised.
 - Repeated `INIT_HCA` within one firmware session (zeroed `sw_owner_id`) — not exercised.
 - Boot-time takeover `LaunchDaemon` — not re-validated across an actual cold reboot.
-- No **MSI-X** (the EQ polls ~10 ms), so event-driven completions have a ~10 ms floor.
+- **MSI-X is configured but never delivered.** Two vectors are granted, the
+  dispatch sources are created and enabled, the setup is ordered after the FLR
+  that used to wipe it, and firmware accepts `CREATE_EQ` on either interrupt
+  index — yet the driver's per-vector counters stay at zero through real traffic
+  (32 CQ arms, 64 CQEs), and rebinding the completion EQ to index 0 with
+  `mlx_irq_probe` leaves them at zero too, so it is not an index mismatch. The
+  EQ timer is the actual delivery path and its period is the latency floor.
+  Suspected cause is outside the driver: the card is claimed through IOCatalogue
+  injection rather than a normal match, so interrupt routing is probably never
+  established. Re-test on a clean-machine install once the entitlements land.
 - **Blue-flame** doorbell not used.
 - No userspace **MR cache** in the shim (large-buffer registration is 5–20 ms).
 - `MlxHealth` health monitor is a skeleton.

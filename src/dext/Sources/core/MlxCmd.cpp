@@ -68,7 +68,8 @@ struct MlxCmd::State {
     uint8_t                   lastFwStatus;
     IOLock                   *execLock;
 
-    /* In-flight mailbox chains for the current command (single-slot MVP). */
+    /* In-flight mailbox chains for the current command (single-slot MVP).
+     * Each block is a full DMA page; this is the proven DriverKit layout. */
     IOBufferMemoryDescriptor *inMailboxDesc[MLX_CMD_MAX_BLOCKS];
     IOBufferMemoryDescriptor *outMailboxDesc[MLX_CMD_MAX_BLOCKS];
     IODMACommand            *inMailboxDma[MLX_CMD_MAX_BLOCKS];
@@ -79,6 +80,12 @@ struct MlxCmd::State {
     uint64_t                 outMailboxIOVA[MLX_CMD_MAX_BLOCKS];
     uint32_t                 inNumBlocks;
     uint32_t                 outNumBlocks;
+    IOBufferMemoryDescriptor *inMailboxSingleDesc;
+    IOBufferMemoryDescriptor *outMailboxSingleDesc;
+    IODMACommand             *inMailboxSingleDma;
+    IODMACommand             *outMailboxSingleDma;
+    bool                      inMailboxSingle;
+    bool                      outMailboxSingle;
 };
 
 MlxCmd::MlxCmd() : s(NULL) {}
@@ -203,6 +210,10 @@ MlxCmd::Free()
     s->up = false;
     FreeMailbox(false);
     FreeMailbox(true);
+    if ((s->quarantined || s->core->DmaQuarantined()) && (s->cmdqDma || s->cmdqMem)) {
+        s->core->RetainDmaUntilReset(s->cmdqMem, s->cmdqDma, 0x434d4451u);
+        s->cmdqDma = NULL; s->cmdqMem = NULL;
+    }
     if (s->cmdqDma) { mlxCompleteDma(s->cmdqDma); s->cmdqDma = NULL; }
     if (s->cmdqMem) { s->cmdqMem->release(); s->cmdqMem = NULL; }
     if (s->execLock) { IOLockFree(s->execLock); s->execLock = NULL; }
@@ -223,19 +234,67 @@ MlxCmd::AllocMailbox(bool out, uint32_t size)
         return kIOReturnNoSpace;
     }
     if (out) s->outNumBlocks = numBlocks; else s->inNumBlocks = numBlocks;
+    if (numBlocks == 0)
+        return kIOReturnSuccess;
+
+    /* Fast path: one page-aligned buffer, blocks at 4096-byte stride. If
+     * DriverKit/DART cannot expose that buffer as one contiguous IOVA range,
+     * discard it and use the proven per-block layout below. */
+    {
+        IOBufferMemoryDescriptor **singleDesc = out ? &s->outMailboxSingleDesc : &s->inMailboxSingleDesc;
+        IODMACommand **singleDma = out ? &s->outMailboxSingleDma : &s->inMailboxSingleDma;
+        MlxCmdMailbox **boxes = out ? s->outMailbox : s->inMailbox;
+        uint64_t *iovas = out ? s->outMailboxIOVA : s->inMailboxIOVA;
+        uint32_t bytes = numBlocks * 4096;
+        kern_return_t singleKr = mlxAllocDmaBuffer(bytes, 4096,
+                                                   kIOMemoryDirectionOutIn,
+                                                   singleDesc);
+        IOAddressSegment *segments = NULL;
+        if (singleKr == kIOReturnSuccess && *singleDesc) {
+            segments = IONew(IOAddressSegment, MLX_CMD_MAX_BLOCKS + 2);
+            uint32_t segmentCount = MLX_CMD_MAX_BLOCKS + 2;
+            if (segments)
+                singleKr = mlxPrepareDma(s->pci, *singleDesc, segments,
+                                         &segmentCount, singleDma);
+            else
+                singleKr = kIOReturnNoMemory;
+            bool contiguous = singleKr == kIOReturnSuccess && segmentCount > 0;
+            uint64_t iovaBase = contiguous ? segments[0].address : 0;
+            uint64_t span = contiguous ? segments[0].length : 0;
+            for (uint32_t i = 1; contiguous && i < segmentCount; i++) {
+                if (segments[i].address != segments[i - 1].address +
+                                             segments[i - 1].length)
+                    contiguous = false;
+                else
+                    span += segments[i].length;
+            }
+            uint64_t addr = 0, mappedLength = 0;
+            if (contiguous && span >= bytes)
+                singleKr = (*singleDesc)->Map(0, 0, 0, 0, &addr, &mappedLength);
+            else
+                singleKr = kIOReturnNoSpace;
+            if (singleKr == kIOReturnSuccess && mappedLength >= bytes) {
+                memset((void *)(uintptr_t)addr, 0, bytes);
+                for (uint32_t i = 0; i < numBlocks; i++) {
+                    boxes[i] = (MlxCmdMailbox *)(uintptr_t)(addr + (uint64_t)i * 4096);
+                    iovas[i] = iovaBase + (uint64_t)i * 4096;
+                }
+                if (out) s->outMailboxSingle = true; else s->inMailboxSingle = true;
+                if (segments) IODelete(segments, IOAddressSegment, MLX_CMD_MAX_BLOCKS + 2);
+                return kIOReturnSuccess;
+            }
+            if (*singleDma) { mlxCompleteDma(*singleDma); *singleDma = NULL; }
+            if (*singleDesc) { (*singleDesc)->release(); *singleDesc = NULL; }
+        }
+        if (segments) IODelete(segments, IOAddressSegment, MLX_CMD_MAX_BLOCKS + 2);
+    }
 
     for (uint32_t i = 0; i < numBlocks; i++) {
         IOBufferMemoryDescriptor **descp = out ? &s->outMailboxDesc[i] : &s->inMailboxDesc[i];
         IODMACommand            **dmap   = out ? &s->outMailboxDma[i]   : &s->inMailboxDma[i];
-        MlxCmdMailbox           **boxp    = out ? &s->outMailbox[i]      : &s->inMailbox[i];
-        uint64_t                *iovap    = out ? &s->outMailboxIOVA[i] : &s->inMailboxIOVA[i];
+        MlxCmdMailbox           **boxp   = out ? &s->outMailbox[i]      : &s->inMailbox[i];
+        uint64_t                *iovap   = out ? &s->outMailboxIOVA[i] : &s->inMailboxIOVA[i];
 
-        /* [FIX v0.38] allocate the mailbox buffer as a WHOLE 4096 page with
-         * 4096 alignment (like AppleMCX: inTaskWithPhysicalMask with mask
-         * 0xFFFFFFF000). Previously it was 576 bytes with 1024 alignment — the
-         * DART segment came out as {iova, 576}, and fw, when DMA-reading the
-         * mailbox, ran past the end of the non-page segment →
-         * delivery_status=6 (FW_ERR). */
         kern_return_t kr = mlxAllocDmaBuffer(4096, 4096,
                                              kIOMemoryDirectionOutIn, descp);
         if (kr != kIOReturnSuccess || !*descp) {
@@ -252,17 +311,6 @@ MlxCmd::AllocMailbox(bool out, uint32_t size)
             (*descp)->release(); *descp = NULL;
             FreeMailbox(out);
             return kr ? kr : kIOReturnNoMemory;
-        }
-        /* DART segment diagnostics (notes/29): the mailbox must be a single
-         * contiguous segment ≥ 576 bytes — otherwise fw reads out of bounds. */
-        if (!out && i == 0) {
-            MLX_LOG("DBG mb DMA: segs=%u seg0={0x%llx, %llu}", segCount,
-                    (unsigned long long)segs[0].address,
-                    (unsigned long long)segs[0].length);
-        }
-        if (segCount != 1 || segs[0].length < sizeof(MlxCmdMailbox)) {
-            MLX_LOG("mailbox NOT a single segment/too short: segs=%u len=%llu — fw will not be able to read",
-                    segCount, (unsigned long long)segs[0].length);
         }
         *iovap = segs[0].address;
 
@@ -283,9 +331,30 @@ void
 MlxCmd::FreeMailbox(bool out)
 {
     uint32_t n = out ? s->outNumBlocks : s->inNumBlocks;
+    bool single = out ? s->outMailboxSingle : s->inMailboxSingle;
+    const bool keep = s->quarantined || s->core->DmaQuarantined();
+    if (single) {
+        IODMACommand **dmap = out ? &s->outMailboxSingleDma : &s->inMailboxSingleDma;
+        IOBufferMemoryDescriptor **descp = out ? &s->outMailboxSingleDesc : &s->inMailboxSingleDesc;
+        if (keep && (*dmap || *descp)) {
+            s->core->RetainDmaUntilReset(*descp, *dmap, 0x434d424fu);
+            *descp = NULL; *dmap = NULL;
+        }
+        if (*dmap) { mlxCompleteDma(*dmap); *dmap = NULL; }
+        if (*descp) { (*descp)->release(); *descp = NULL; }
+        for (uint32_t i = 0; i < n; i++)
+            if (out) s->outMailbox[i] = NULL; else s->inMailbox[i] = NULL;
+        if (out) { s->outMailboxSingle = false; s->outNumBlocks = 0; }
+        else { s->inMailboxSingle = false; s->inNumBlocks = 0; }
+        return;
+    }
     for (uint32_t i = 0; i < n; i++) {
-        IODMACommand **dmap  = out ? &s->outMailboxDma[i]   : &s->inMailboxDma[i];
+        IODMACommand **dmap = out ? &s->outMailboxDma[i] : &s->inMailboxDma[i];
         IOBufferMemoryDescriptor **descp = out ? &s->outMailboxDesc[i] : &s->inMailboxDesc[i];
+        if (keep && (*dmap || *descp)) {
+            s->core->RetainDmaUntilReset(*descp, *dmap, 0x434d424fu);
+            *descp = NULL; *dmap = NULL;
+        }
         if (*dmap) { mlxCompleteDma(*dmap); *dmap = NULL; }
         if (*descp) { (*descp)->release(); *descp = NULL; }
         if (out) s->outMailbox[i] = NULL; else s->inMailbox[i] = NULL;
@@ -323,12 +392,11 @@ MlxCmd::ExecLocked(uint32_t opcode, const void *in, uint32_t inSize,
     s->lastSyndrome = 0;
     s->lastDeliveryStatus = 0;
     s->lastFwStatus = 0;
-    if (!in || inSize == 0 || inSize > MLX_CMD_MAX_SIZE ||
+    if (!in || inSize == 0 || inSize > MLX_CMD_MAX_INPUT_SIZE ||
         !out || outSize < 8 || outSize > MLX_CMD_MAX_SIZE) {
         return kIOReturnBadArgument;
     }
-    if (s->quarantined && opcode != MLX_CMD_OP_TEARDOWN_HCA &&
-        opcode != MLX_CMD_OP_DISABLE_HCA)
+    if (s->quarantined || s->core->DmaQuarantined())
         return kIOReturnNotReady;
 
     /* Allocate mailbox chains for large commands. */
@@ -398,16 +466,26 @@ MlxCmd::ExecLocked(uint32_t opcode, const void *in, uint32_t inSize,
     uint32_t waited = 0;
     while (true) {
         mlxMemoryBarrier();
-        if (!(lay->status_own & MLX_CMD_OWNER_HW)) break;
+        if (!(*(volatile uint8_t *)&lay->status_own & MLX_CMD_OWNER_HW)) break;
         if (timeoutMs && waited++ >= timeoutMs) {
             s->quarantined = true;
             MLX_LOG("opcode 0x%x timed out; quarantined", opcode);
-            FreeMailbox(false); FreeMailbox(true);
+            /* The firmware may still own both mailboxes and the command
+             * slot. Do not free or reuse them, including for TEARDOWN_HCA. */
+            s->core->EnterDmaQuarantine(0x434d4454u);
             return kIOReturnTimeout;
         }
         IOSleep(1);
     }
 
+    mlxDmaReadBarrier();
+    s->lastDeliveryStatus = (lay->status_own >> 1) & 0x7f;
+    if (s->lastDeliveryStatus) {
+        /* A delivery failure is not a confirmed firmware outbox rejection. */
+        s->quarantined = true;
+        s->core->EnterDmaQuarantine(0x434d4445u);
+        return kIOReturnIOError;
+    }
     /* Command latency delta (notes/35): waited ~ the number of milliseconds of polling. */
     uint32_t latencyMs = waited;
 

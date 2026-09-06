@@ -43,16 +43,18 @@ static enum ibv_mtu mtu(uint32_t n) {
 }
 
 int main(int argc, char **argv) {
-    const char *dev = NULL; uint16_t port = 18515; int gid_index = 0, ib_port = 1, opt, write_mode = 0, normal_mode = 0;
+    const char *dev = NULL; uint16_t port = 18515; int gid_index = 0, ib_port = 1, opt, write_mode = 0, normal_mode = 0, iterations = 1;
     uint32_t mtu_bytes = 4096, expected_imm = 0x12345678;
-    while ((opt = getopt(argc, argv, "NWd:i:g:p:m:x:")) != -1) switch (opt) {
+    while ((opt = getopt(argc, argv, "NWd:i:g:p:m:x:n:")) != -1) switch (opt) {
     case 'N': normal_mode = 1; break;
     case 'W': write_mode = 1; break;
     case 'd': dev = optarg; break; case 'i': ib_port = atoi(optarg); break;
     case 'g': gid_index = atoi(optarg); break; case 'p': port = (uint16_t)strtoul(optarg, NULL, 0); break;
     case 'm': mtu_bytes = (uint32_t)strtoul(optarg, NULL, 0); break; case 'x': expected_imm = (uint32_t)strtoul(optarg, NULL, 0); break;
+    case 'n': iterations = atoi(optarg); break;
     default: return 2;
     }
+    if (iterations < 1 || iterations > 100000) iterations = 1;
     enum ibv_mtu path_mtu = mtu(mtu_bytes);
     if (!dev || !path_mtu) return 2;
     int rc = 1, count = 0, listen_fd = -1, control_fd = -1;
@@ -96,24 +98,29 @@ int main(int argc, char **argv) {
             .rkey_be = htonl(mr->rkey), .length_be = htonl(sizeof(buffer)) };
         if (full_write(control_fd, &memory, sizeof(memory))) goto out;
     }
-    struct ibv_wc wc = {}; for (;;) { int n = ibv_poll_cq(cq, 1, &wc); if (n < 0) goto out; if (n == 1) break; }
-    if (wc.status != IBV_WC_SUCCESS ||
-        (wc.opcode != IBV_WC_RECV && wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM) ||
-        (!normal_mode && (!(wc.wc_flags & IBV_WC_WITH_IMM) ||
-                          ntohl(wc.imm_data) != expected_imm))) {
-        fprintf(stderr, "IMM peer failure: status=%d opcode=%d flags=0x%x imm=0x%x\n", wc.status, wc.opcode, wc.wc_flags, ntohl(wc.imm_data)); goto out;
-    }
-    if (write_mode && buffer[0] != 0x7b) { fprintf(stderr, "WRITE_WITH_IMM payload mismatch\n"); goto out; }
     struct ibv_send_wr send = { .wr_id = 2, .sg_list = &sge, .num_sge = 1,
         .opcode = normal_mode ? IBV_WR_SEND : IBV_WR_SEND_WITH_IMM,
         .send_flags = IBV_SEND_SIGNALED, .imm_data = htonl(expected_imm) },
         *bad_send = NULL;
-    if (ibv_post_send(qp, &send, &bad_send)) goto out;
-    for (;;) { int n = ibv_poll_cq(cq, 1, &wc); if (n < 0) goto out; if (n == 1) break; }
-    if (wc.status != IBV_WC_SUCCESS || wc.wr_id != 2) goto out;
-    printf("MLX_IMM_PEER PASS: %s value=0x%08x\n",
+    for (int iter = 0; iter < iterations; iter++) {
+        struct ibv_wc wc = {};
+        for (;;) { int n = ibv_poll_cq(cq, 1, &wc); if (n < 0) goto out; if (n == 1) break; }
+        if (wc.status != IBV_WC_SUCCESS ||
+            (wc.opcode != IBV_WC_RECV && wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM) ||
+            (!normal_mode && (!(wc.wc_flags & IBV_WC_WITH_IMM) ||
+                              ntohl(wc.imm_data) != expected_imm))) {
+            fprintf(stderr, "IMM peer failure: status=%d opcode=%d flags=0x%x imm=0x%x\n", wc.status, wc.opcode, wc.wc_flags, ntohl(wc.imm_data)); goto out;
+        }
+        if (write_mode && buffer[0] != 0x7b) { fprintf(stderr, "WRITE_WITH_IMM payload mismatch\n"); goto out; }
+        /* Refill the RQ before replying so the next round's SEND has a slot. */
+        if (iter + 1 < iterations && ibv_post_recv(qp, &recv, &bad_recv)) goto out;
+        if (ibv_post_send(qp, &send, &bad_send)) goto out;
+        for (;;) { int n = ibv_poll_cq(cq, 1, &wc); if (n < 0) goto out; if (n == 1) break; }
+        if (wc.status != IBV_WC_SUCCESS || wc.wr_id != 2) goto out;
+    }
+    printf("MLX_IMM_PEER PASS: %s value=0x%08x iterations=%d\n",
            normal_mode ? "SEND/RECV" :
-           write_mode ? "RDMA_WRITE_WITH_IMM" : "bidirectional SEND_WITH_IMM", expected_imm); rc = 0;
+           write_mode ? "RDMA_WRITE_WITH_IMM" : "bidirectional SEND_WITH_IMM", expected_imm, iterations); rc = 0;
 out:
     if (control_fd >= 0) close(control_fd);
     if (listen_fd >= 0) close(listen_fd);

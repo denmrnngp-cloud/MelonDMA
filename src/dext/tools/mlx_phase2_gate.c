@@ -22,6 +22,19 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+/* Optional memory-provider hooks.  The ordinary gate has no provider linked
+ * and keeps its posix_memalign/free path.  mlx_metal_dma_gate links a Metal
+ * provider which returns MTLBuffer.contents(), lets a GPU kernel initialize
+ * the registered bytes before NIC reads, and verifies NIC writes from a GPU
+ * kernel after the RDMA completion/control acknowledgement. */
+#ifdef MLX_GATE_EXTERNAL_MEMORY_PROVIDER
+extern int mlx_gate_memory_allocate(size_t length, void **address);
+extern int mlx_gate_memory_gpu_fill(void *address, size_t length, uint8_t value);
+extern int mlx_gate_memory_gpu_verify(const void *address, size_t length,
+                                      uint8_t expected);
+extern void mlx_gate_memory_release(void *address);
+#endif
+
 #define DEFAULT_PORT 18515
 #define DEFAULT_ITERS 1000000u
 #define DEFAULT_SIZE 1024u
@@ -165,6 +178,33 @@ static double now_seconds(void)
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+static void print_fast_path_telemetry(const struct rdma_fast_path_stats *stats)
+{
+    printf("DIRECT_UAR_STATS mapped_qps=%llu direct_batches=%llu direct_wrs=%llu direct_doorbells=%llu direct_recv_wrs=%llu direct_cq_consumers=%llu fallback_send=%llu fallback_recv=%llu shadow_publications=%llu blue_flame_wqes=%llu\n",
+           (unsigned long long)stats->mapped_qps,
+           (unsigned long long)stats->direct_send_batches,
+           (unsigned long long)stats->direct_send_wrs,
+           (unsigned long long)stats->direct_doorbells,
+           (unsigned long long)stats->direct_recv_wrs,
+           (unsigned long long)stats->direct_cq_consumers,
+           (unsigned long long)stats->fallback_send_batches,
+           (unsigned long long)stats->fallback_recv_batches,
+           (unsigned long long)stats->shadow_publications,
+           (unsigned long long)stats->blue_flame_wqes);
+    printf("DIRECT_CQ_TELEMETRY polls=%llu empty=%llu cqes=%llu errors=%llu kernel_polls=%llu kernel_cqes=%llu fallbacks_disabled=%llu fallbacks_unmapped=%llu fallbacks_unknown_qp=%llu fallbacks_metadata=%llu fallbacks_dext_owned=%llu\n",
+           (unsigned long long)stats->direct_poll_calls,
+           (unsigned long long)stats->direct_poll_empty,
+           (unsigned long long)stats->direct_cqes,
+           (unsigned long long)stats->direct_cqe_errors,
+           (unsigned long long)stats->kernel_poll_calls,
+           (unsigned long long)stats->kernel_cqes,
+           (unsigned long long)stats->fallback_direct_disabled,
+           (unsigned long long)stats->fallback_cq_unmapped,
+           (unsigned long long)stats->fallback_unknown_qp,
+           (unsigned long long)stats->fallback_missing_metadata,
+           (unsigned long long)stats->fallback_dext_owned);
 }
 
 static int connect_until(int fd, const struct sockaddr *address,
@@ -425,6 +465,16 @@ int main(int argc, char **argv)
             rdma_close_device(probe);
             return 14;
         }
+#ifdef MLX_GATE_EXTERNAL_MEMORY_PROVIDER
+        if (!(abiAttr.features & RDMA_FEATURE_COHERENT_UMA_MR)) {
+            fprintf(stderr, "PHASE2_PREFLIGHT FAIL: active DEXT does not "
+                    "advertise coherent Apple UMA MR support "
+                    "(features=0x%x) - activate the fresh build\n",
+                    abiAttr.features);
+            rdma_close_device(probe);
+            return 16;
+        }
+#endif
         int deviceRc = rdma_query_device(probe, &deviceAttr);
         if (deviceRc) {
             rdma_close_device(probe);
@@ -479,6 +529,9 @@ int main(int argc, char **argv)
     struct rdma_mr *indirectChildren[MLX_INDIRECT_MR_CHILDREN] = {NULL};
     uint32_t indirectChildCount = 0;
     void *allocation = NULL; uint8_t *buffer = NULL;
+#ifdef MLX_GATE_EXTERNAL_MEMORY_PROVIDER
+    int externalMemory = 0;
+#endif
     uint32_t gidIndex = 0;
     int gidProgrammed = 0;
     int fastPathEnabled = 0;
@@ -534,7 +587,18 @@ int main(int argc, char **argv)
             goto out;
         }
     }
-    if (posix_memalign(&allocation, 4096, (size_t)mrCapacity + 128)) allocation = NULL;
+#ifdef MLX_GATE_EXTERNAL_MEMORY_PROVIDER
+    {
+        if (mlx_gate_memory_allocate((size_t)mrCapacity + 128, &allocation))
+            allocation = NULL;
+        else
+            externalMemory = 1;
+    }
+#else
+    if (posix_memalign(&allocation, 4096, (size_t)mrCapacity + 128)) {
+        allocation = NULL;
+    }
+#endif
     if (!allocation) { fprintf(stderr, "buffer allocation failed\n"); goto out; }
     memset(allocation, 0xa5, (size_t)mrCapacity + 128);
     uint32_t bufferOffset = getenv("MLX_GATE_PAGE_ALIGNED_MR") ? 0u : 64u;
@@ -542,6 +606,19 @@ int main(int argc, char **argv)
     /* Stock rc_pingpong initializes its buffer to 0x7b.  Using the same
      * value on both ends lets every receive validate payload corruption. */
     memset(buffer, reverseMode ? 0xa7 : 0x7b, size);
+#ifdef MLX_GATE_EXTERNAL_MEMORY_PROVIDER
+    if (externalMemory) {
+        /* Reverse WRITE starts from a different value so the Spark→Mac gate
+         * proves that the NIC changed the Metal pages.  In the other direction
+         * the GPU produces the exact bytes the NIC sends to the peer. */
+        const uint8_t gpuValue = reverseMode ? 0x00 : 0x7b;
+        if (mlx_gate_memory_gpu_fill(buffer, size, gpuValue) ||
+            mlx_gate_memory_gpu_verify(buffer, size, gpuValue)) {
+            fprintf(stderr, "Metal GPU initialization/visibility failed\n");
+            goto out;
+        }
+    }
+#endif
     struct rdma_mr_attr_resp mrInfo = {};
     if (indirectMr) {
         if (size % MLX_INDIRECT_MR_CHILDREN != 0) {
@@ -563,9 +640,12 @@ int main(int argc, char **argv)
             printf("Indirect child MR[%u] registered: addr=%p bytes=%u lkey=0x%x\n",
                    i, (void *)(buffer + i * chunk), chunk, childInfo.lkey);
         }
+        uint32_t indirectAccess = RDMA_ACCESS_LOCAL_WRITE |
+            ((writeMode || reverseMode) ? RDMA_ACCESS_REMOTE_WRITE : 0) |
+            (readFromPeer ? RDMA_ACCESS_REMOTE_READ : 0);
         mr = rdma_reg_mr_indirect(pd, indirectChildren, MLX_INDIRECT_MR_CHILDREN,
                                   (uint64_t)(uintptr_t)buffer, size,
-                                  RDMA_ACCESS_LOCAL_WRITE, &mrInfo);
+                                  indirectAccess, &mrInfo);
         if (!mr) { fprintf(stderr, "indirect MR composition failed\n"); goto out; }
         printf("Indirect MR composed: lkey=0x%x rkey=0x%x bytes=%u children=%d\n",
                mrInfo.lkey, mrInfo.rkey, size, MLX_INDIRECT_MR_CHILDREN);
@@ -931,15 +1011,7 @@ int main(int argc, char **argv)
             if (rdma_fast_path_get_stats(dev, &stats)) {
                 fprintf(stderr, "direct-UAR stats unavailable\n"); goto out;
             }
-            printf("DIRECT_UAR_STATS mapped_qps=%llu direct_batches=%llu direct_wrs=%llu direct_doorbells=%llu direct_recv_wrs=%llu direct_cq_consumers=%llu fallback_send=%llu fallback_recv=%llu\n",
-                   (unsigned long long)stats.mapped_qps,
-                   (unsigned long long)stats.direct_send_batches,
-                   (unsigned long long)stats.direct_send_wrs,
-                   (unsigned long long)stats.direct_doorbells,
-                   (unsigned long long)stats.direct_recv_wrs,
-                   (unsigned long long)stats.direct_cq_consumers,
-                   (unsigned long long)stats.fallback_send_batches,
-                   (unsigned long long)stats.fallback_recv_batches);
+            print_fast_path_telemetry(&stats);
         }
         result = 0;
         goto out;
@@ -1059,6 +1131,13 @@ int main(int argc, char **argv)
         char reply[sizeof("verify")] = {};
         if (read_full(controlFd, reply, sizeof(reply)) ||
             memcmp(reply, "verify", sizeof(reply))) goto out;
+#ifdef MLX_GATE_EXTERNAL_MEMORY_PROVIDER
+        if (externalMemory &&
+            mlx_gate_memory_gpu_verify(buffer, size, 0xa7)) {
+            fprintf(stderr, "Spark RDMA WRITE is not visible to Metal GPU\n");
+            goto out;
+        }
+#endif
         for (uint32_t byte = 0; byte < size; byte++) {
             if (buffer[byte] != 0xa7) {
                 fprintf(stderr, "reverse WRITE mismatch at byte=%u got=0x%02x\n",
@@ -1297,15 +1376,7 @@ int main(int argc, char **argv)
             if (rdma_fast_path_get_stats(dev, &stats)) {
                 fprintf(stderr, "direct-UAR stats unavailable\n"); goto out;
             }
-            printf("DIRECT_UAR_STATS mapped_qps=%llu direct_batches=%llu direct_wrs=%llu direct_doorbells=%llu direct_recv_wrs=%llu direct_cq_consumers=%llu fallback_send=%llu fallback_recv=%llu\n",
-                   (unsigned long long)stats.mapped_qps,
-                   (unsigned long long)stats.direct_send_batches,
-                   (unsigned long long)stats.direct_send_wrs,
-                   (unsigned long long)stats.direct_doorbells,
-                   (unsigned long long)stats.direct_recv_wrs,
-                   (unsigned long long)stats.direct_cq_consumers,
-                   (unsigned long long)stats.fallback_send_batches,
-                   (unsigned long long)stats.fallback_recv_batches);
+            print_fast_path_telemetry(&stats);
         }
         result = 0;
         goto out;
@@ -1335,15 +1406,7 @@ int main(int argc, char **argv)
         if (rdma_fast_path_get_stats(dev, &stats)) {
             fprintf(stderr, "direct-UAR stats unavailable\n"); goto out;
         }
-        printf("DIRECT_UAR_STATS mapped_qps=%llu direct_batches=%llu direct_wrs=%llu direct_doorbells=%llu direct_recv_wrs=%llu direct_cq_consumers=%llu fallback_send=%llu fallback_recv=%llu\n",
-               (unsigned long long)stats.mapped_qps,
-               (unsigned long long)stats.direct_send_batches,
-               (unsigned long long)stats.direct_send_wrs,
-               (unsigned long long)stats.direct_doorbells,
-               (unsigned long long)stats.direct_recv_wrs,
-               (unsigned long long)stats.direct_cq_consumers,
-               (unsigned long long)stats.fallback_send_batches,
-               (unsigned long long)stats.fallback_recv_batches);
+        print_fast_path_telemetry(&stats);
         if (!stats.mapped_qps || !stats.direct_send_wrs ||
             !stats.direct_doorbells || !stats.direct_recv_wrs ||
             !stats.direct_cq_consumers) {
@@ -1374,7 +1437,16 @@ out: ;
             teardownFailed = 1;
         }
     }
-    if (allocation) free(allocation);
+    if (allocation) {
+#ifdef MLX_GATE_EXTERNAL_MEMORY_PROVIDER
+        if (externalMemory)
+            mlx_gate_memory_release(allocation);
+        else
+            free(allocation);
+#else
+        free(allocation);
+#endif
+    }
     if (recvCq && recvCq != sendCq) {
         int rc = rdma_destroy_cq(recvCq);
         if (rc) { fprintf(stderr, "teardown: destroy_recv_cq rc=%d\n", rc); teardownFailed = 1; }

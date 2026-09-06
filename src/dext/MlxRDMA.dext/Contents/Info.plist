@@ -15,13 +15,13 @@
 	<key>CFBundlePackageType</key>
 	<string>DEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.308</string>
+	<string>0.396</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>DriverKit</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>0.308</string>
+	<string>0.396</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>MlxPCIDriver</key>
@@ -45,7 +45,7 @@
 			<key>IOUserServerName</key>
 			<string>com.mlx5.rdma.dext</string>
 			<key>MlxBuildTag</key>
-			<string>p3-cq-arm-1</string>
+			<string>p0-p1-dma-lifetime-runtime-1</string>
 			<key>MlxRDMAUserClient</key>
 			<dict>
 				<key>IOClass</key>

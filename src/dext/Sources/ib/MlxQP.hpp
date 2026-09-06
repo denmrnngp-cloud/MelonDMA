@@ -90,6 +90,7 @@ struct MlxQPContext {
     uint64_t    cqeRetryExc;
     uint64_t    cqeRnrRetry;
     MlxClientDoorbellBundle *clientBundle;
+    bool        trustedFastPath;
 };
 
 class MlxQP {
@@ -121,6 +122,7 @@ public:
                                      uint32_t count);
     kern_return_t   SyncSendSge(const struct mlx_sync_send_sge_req *req);
     kern_return_t   SyncRecvSge(const struct mlx_sync_recv_sge_req *req);
+    kern_return_t   SyncQpTails(uint32_t qpn, uint64_t sqTail, uint64_t rqTail);
     kern_return_t   PostLocalInv(const struct mlx_post_local_inv_req *req);
     kern_return_t   PostSendInline(const struct mlx_post_send_inline_req *req);
     kern_return_t   PostSendAtomic(const struct mlx_post_send_atomic_req *req);
@@ -135,6 +137,9 @@ public:
 
     void            HandleQPEvent(uint32_t qpn, uint32_t event);
     MlxQPContext *  Lookup(uint32_t qpn);
+    /* Refresh producer/consumer counters from the trusted client's seqlock
+     * shadow page. No WQE metadata is imported on the steady path. */
+    kern_return_t   RefreshFastPathState(uint32_t qpn);
     IOMemoryDescriptor *GetSqMemDesc(uint32_t qpn);
     IOMemoryDescriptor *GetRqMemDesc(uint32_t qpn);
 
@@ -142,6 +147,7 @@ private:
     struct State;
     State *s;
     MlxQPContext *CtxForQpn(uint32_t qpn);
+    bool          RefreshFastPathStateLocked(MlxQPContext *ctx);
     MlxQPContext *LockQp(uint32_t qpn);
     MlxQPContext *LockQpByCq(uint32_t cqHandle, bool send);
     void          UnlockQp(MlxQPContext *ctx);

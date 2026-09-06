@@ -10,6 +10,7 @@
 #include "MlxRoCE.hpp"
 #include "MlxQP.hpp"
 #include "MlxPCIDriver.h"
+#include "MlxEQ.hpp"
 #include "MlxCmd.hpp"
 #include "MlxDMA.hpp"
 #include "MlxDriverKitCompat.h"
@@ -249,6 +250,7 @@ MlxCQ::CreateCQ(uint32_t entries, struct mlx_create_cq_resp *resp,
     uint32_t segCount = 32;
     uint32_t pageCount = 0;
     uint64_t mappedAddr = 0, mappedLen = 0;
+    MlxEQ *completionEq = NULL;
     kern_return_t kr = kIOReturnSuccess;
 
     kr = mlxAllocDmaBuffer(cqBytes, 4096, kIOMemoryDirectionOutIn, &desc);
@@ -290,8 +292,15 @@ MlxCQ::CreateCQ(uint32_t entries, struct mlx_create_cq_resp *resp,
         goto fail;
     }
 
-    kr = CmdCreateCQ(cq, s->core->GetEQ() ? s->core->GetEQ()->EqNumber() : 0);
+    completionEq = s->core->GetCompletionEQ();
+    kr = CmdCreateCQ(cq, completionEq ? completionEq->EqNumber() :
+                                      (s->core->GetEQ() ?
+                                       s->core->GetEQ()->EqNumber() : 0));
     if (kr != kIOReturnSuccess) {
+        if (s->core->DmaQuarantined()) {
+            s->core->RetainDmaUntilReset(cq->cqeBufDesc, cq->cqeDmaMap, 0x43514352u);
+            cq->cqeBufDesc = NULL; cq->cqeDmaMap = NULL;
+        }
         mlxCompleteDma(cq->cqeDmaMap); cq->cqeDmaMap = NULL;
         if (cq->cqeBufDesc) { cq->cqeBufDesc->release(); cq->cqeBufDesc = NULL; }
         /* CmdCreateCQ already returned its DB slot on command failure. */
@@ -356,6 +365,18 @@ MlxCQ::DestroyCQ(uint32_t cqHandle)
     return kIOReturnSuccess;
 }
 
+uint32_t
+MlxCQ::LiveCount()
+{
+    if (!s) return 0;
+    uint32_t live = 0;
+    IOLockLock(s->tableLock);
+    for (uint32_t i = 0; i < s->tableCap; i++)
+        if (s->used[i]) live++;
+    IOLockUnlock(s->tableLock);
+    return live;
+}
+
 MlxCQContext *
 MlxCQ::Lookup(uint32_t cqHandle)
 {
@@ -378,6 +399,10 @@ MlxCQ::HandleCompletion(uint32_t cqn)
     MlxCQContext *cq = LockCq(cqn);
     if (!cq) return;
     cq->completions++;
+    /* Hardware delivered the event this arm asked for: advance the arm
+     * sequence number and drop the pending-arm flag (mlx5_cq_event). */
+    cq->armSn++;
+    cq->armed = false;
     MLX_DBG("completion event cq=%u total=%llu", cqn,
             (unsigned long long)cq->completions);
     if (cq->completionHandler) cq->completionHandler(cqn, cq->completionContext);
@@ -408,6 +433,44 @@ MlxCQ::GetCompletions(uint32_t cqHandle)
     return total;
 }
 
+/* MODIFY_CQ moderation (mlx5_core_modify_cq_moderation). Hardware then holds a
+ * completion event back until `period` microseconds have passed or `maxCount`
+ * CQEs have accumulated, so a streaming transfer raises one event per batch
+ * instead of one per arm. Coalescing in hardware costs nothing on either side;
+ * doing it in the client costs a wakeup to decide not to wake. */
+kern_return_t
+MlxCQ::ModifyModeration(uint32_t cqHandle, uint32_t period, uint32_t maxCount)
+{
+    if (!s || period > 0xfffu || maxCount > 0xffffu) return kIOReturnBadArgument;
+    MlxCQContext *cq = LockCq(cqHandle);
+    if (!cq) return kIOReturnNotFound;
+    uint32_t cqn = cq->cqNumber;
+    UnlockCq(cq);
+
+    /* mlx5_ifc modify_cq_in: cqn@0x48, field select@0x60, CQC@0x80.
+     * In the CQC, cq_period is 12 bits at 0x84 and cq_max_count 16 at 0x90. */
+    uint8_t in[272] = {};
+    uint8_t out[64] = {};
+    mlxSetBits(in, 0x00, 16, MLX_CMD_OP_MODIFY_CQ);
+    mlxSetBits(in, 0x48, 24, cqn);
+    mlxSetBits(in, 0x60, 32, MLX_CQ_MODIFY_PERIOD | MLX_CQ_MODIFY_COUNT);
+    uint8_t *cqc = in + (0x80 / 8);
+    mlxSetBits(cqc, 0x84, 12, period);
+    mlxSetBits(cqc, 0x90, 16, maxCount);
+
+    kern_return_t kr = s->core->Exec(MLX_CMD_OP_MODIFY_CQ, in, sizeof(in),
+                                     out, sizeof(out), 5000);
+    if (kr != kIOReturnSuccess) {
+        MLX_LOG("MODIFY_CQ moderation failed cq=%u period=%u count=%u: 0x%x",
+                cqn, period, maxCount, kr);
+        return kr;
+    }
+    cq = LockCq(cqHandle);
+    if (cq) { cq->modPeriod = period; cq->modMaxCount = maxCount; UnlockCq(cq); }
+    MLX_DBG("CQ[%u] moderation period=%u us max_count=%u", cqn, period, maxCount);
+    return kIOReturnSuccess;
+}
+
 kern_return_t
 MlxCQ::UpdateCqConsumer(uint32_t cqHandle, uint32_t consumerIndex)
 {
@@ -417,7 +480,15 @@ MlxCQ::UpdateCqConsumer(uint32_t cqHandle, uint32_t consumerIndex)
     uint32_t requested = consumerIndex & 0xffffffu;
     uint32_t forward = (requested - current) & 0xffffffu;
     uint32_t depth = 1u << cq->logSize;
-    if (forward > depth) { UnlockCq(cq); return kIOReturnBadArgument; }
+    /* An isolated client bundle may consume many complete ring revolutions
+     * through its mapped CQ before an exceptional kernel-mediated operation
+     * needs reconciliation.  It can only move its own CQ consumer and cannot
+     * address another client's DB record, so accept the full 24-bit forward
+     * value.  The legacy shared path keeps the one-ring validation bound. */
+    if (!cq->clientBundle && forward > depth) {
+        UnlockCq(cq);
+        return kIOReturnBadArgument;
+    }
     cq->consumerIndex = requested;
     volatile uint32_t *db = s->core->GetUAR() ?
         (cq->clientBundle ? s->core->GetUAR()->GetClientDbRecord(
@@ -492,9 +563,16 @@ MlxCQ::ArmCQ(uint32_t cqHandle, uint32_t solicitedOnly)
             cq->clientBundle, cq->dbRecordOffset) :
          s->core->GetUAR()->GetDbRecord(cq->dbRecordOffset)) : NULL;
     if (!db) { UnlockCq(cq); return kIOReturnNotReady; }
-    /* mlx5 CQ arm: dbrec[1] = ci | (sn<<28) | request mode. */
+    /* mlx5 CQ arm: dbrec[1] = ci | (sn<<28) | request mode.
+     *
+     * The sequence number belongs to the *event*, not to the arm. rdma-core
+     * reads arm_sn here and bumps it only in mlx5_cq_event, when hardware has
+     * actually delivered a completion event. Incrementing it on every arm put
+     * this CQ out of step with the hardware's own sn, and re-arms were then
+     * ignored until the counter happened to realign modulo four -- which is
+     * why only about a third of the arms produced an event. */
     uint32_t ci = (uint32_t)cq->consumerIndex & 0xffffffu;
-    uint32_t sn = (cq->armSn++) & 3u;
+    uint32_t sn = cq->armSn & 3u;
     uint32_t val = ci | (sn << 28) |
                    (solicitedOnly ? MLX_CQ_DB_REQ_NOT_SOL : MLX_CQ_DB_REQ_NOT);
     db[1] = OSSwapHostToBigInt32(val);

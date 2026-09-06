@@ -29,7 +29,7 @@ enum {
     ((uint64_t)((kind) & 0xffu) | ((uint64_t)(handle) << 8))
 #define MLX_UC_MEM_KIND(type) ((uint32_t)((type) & 0xffu))
 #define MLX_UC_MEM_HANDLE(type) ((uint32_t)((type) >> 8))
-#define MLX_FAST_PATH_ABI_VERSION 1u
+#define MLX_FAST_PATH_ABI_VERSION 2u
 /* ABI v2: resource handles (PD/CQ/QP/MR/MW) and completion qpNum are opaque
  * per-UserClient tokens with an embedded generation; raw firmware IDs never
  * cross this boundary. Clients must reject a mismatched major version. */
@@ -50,11 +50,107 @@ enum {
     MLX_UC_FEATURE_STATS           = 1u << 9,
     MLX_UC_FEATURE_INLINE          = 1u << 10,
     MLX_UC_FEATURE_ATOMIC          = 1u << 11,
+    MLX_UC_FEATURE_TRUSTED_FAST_PATH = 1u << 12,   /* shared-page shadow state */
+    MLX_UC_FEATURE_BLUE_FLAME      = 1u << 13,   /* WC-mapped full-WQE MMIO */
+    MLX_UC_FEATURE_CQ_INTERRUPT    = 1u << 14,   /* MSI-X completion wakeup */
+    /* Client shared/UMA pages are pinned through the NIC's IODMACommand and
+     * remain coherent with CPU/GPU users for the MR lifetime.  On Apple
+     * Silicon this is the zero-copy Metal-buffer path: register contents(),
+     * then order GPU work after the RDMA CQE (and RDMA after GPU completion). */
+    MLX_UC_FEATURE_COHERENT_UMA_MR = 1u << 15,
+    MLX_UC_FEATURE_CQ_EVENT_WAIT = 1u << 16, /* may be serviced by timer */
+    MLX_UC_FEATURE_RUNTIME_STATUS = 1u << 17,
+};
+
+/* Conservative, explicit policy for small-memory Macs, not firmware limits. */
+#define MLX_UC_PINNED_BYTES_PER_CLIENT (512ULL * 1024 * 1024)
+#define MLX_UC_PINNED_BYTES_PER_DEVICE (1024ULL * 1024 * 1024)
+#define MLX_RUNTIME_VERSION 1u
+struct mlx_runtime_resp {
+    uint32_t version, size;
+    uint64_t deviceEpoch;
+    uint64_t pinnedBytes, peakPinnedBytes, pinFailures;
+    uint64_t clientPinnedBytes, clientPinnedLimit, devicePinnedLimit;
+    uint64_t quarantineBytes, quarantineObjects;
+    uint64_t irqCompletionEqes, timerCompletionEqes, lastCompletionIrqNs;
+    uint32_t quarantined, bmeFenced;
+    uint32_t completionEqReady, completionIrqProven;
 };
 
 struct mlx_query_abi_resp {
     uint32_t version;
     uint32_t features;
+};
+
+/* Shared-page fast path (docs/shared-page-fast-path.md): the per-QP DB-record
+ * slot is 128 bytes; hardware doorbell records use offsets 0..7.  The software
+ * producer/consumer shadow state lives at offset 8 so a trusted client can
+ * publish sq/rq heads and tails without a DriverKit crossing.  All indices are
+ * WQE-slot indices (sq_head/sq_tail already include the WQE span). */
+#define MLX_QP_SHADOW_OFFSET 8u
+struct mlx_qp_shadow {
+    /* Userspace seqlock: odd while updating, even when the snapshot is
+     * stable.  DEXT consumes this only on control/diagnostic paths. */
+    uint64_t sequence;
+    uint64_t sq_head;
+    uint64_t sq_tail;
+    uint64_t rq_head;
+    uint64_t rq_tail;
+};
+
+/* Which step of the MSI-X bring-up failed. NONE means the vectors are live. */
+enum {
+    MLX_IRQ_STAGE_NONE          = 0,
+    MLX_IRQ_STAGE_CONFIGURE     = 1,  /* IOPCIDevice::ConfigureInterrupts */
+    MLX_IRQ_STAGE_QUEUE         = 2,  /* IODispatchQueue::Create */
+    MLX_IRQ_STAGE_SOURCE        = 3,  /* IOInterruptDispatchSource::Create */
+    MLX_IRQ_STAGE_ACTION        = 4,  /* CreateAction*InterruptOccurred */
+    MLX_IRQ_STAGE_HANDLER       = 5,  /* SetHandler */
+    MLX_IRQ_STAGE_ENABLE        = 6,  /* SetEnableWithCompletion */
+    MLX_IRQ_STAGE_NOT_ATTEMPTED = 7,  /* Start never reached the setup */
+};
+
+/* Which step of the completion-EQ bring-up failed. The MSI-X vectors can be
+ * live while this EQ is missing, and then blocking completion delivery is
+ * unavailable even though the interrupt path itself is fine. */
+enum {
+    MLX_CQEQ_STAGE_NOT_ATTEMPTED = 0,  /* no completion interrupt to bind to */
+    MLX_CQEQ_STAGE_ALLOC         = 1,
+    MLX_CQEQ_STAGE_INIT          = 2,  /* ring/DMA setup */
+    MLX_CQEQ_STAGE_CREATE        = 3,  /* firmware CREATE_EQ */
+    MLX_CQEQ_STAGE_OK            = 4,
+};
+
+/* Interrupt-path diagnosis. Device-wide, read-only; no firmware payload or
+ * DMA address crosses this ABI. eqn fields are firmware EQ numbers, which the
+ * DEXT already publishes to clients through CreateCQ. */
+struct mlx_interrupts_resp {
+    uint32_t vectors;           /* MSI-X vectors granted; 0 when none */
+    uint32_t setupStatus;       /* kern_return_t of the failing step, 0 = ok */
+    uint32_t setupStage;        /* MLX_IRQ_STAGE_* */
+    uint32_t asyncEqn;          /* async EQ number, 0 when absent */
+    uint32_t completionEqn;     /* completion EQ number, 0 when absent */
+    uint32_t completionReady;   /* 1 when MLX_UC_FEATURE_CQ_INTERRUPT is set */
+    uint64_t completionEvents;  /* same counter as mlx_perf_resp.cqEvents */
+    uint32_t completionEqStatus;    /* kern_return_t of the failing step */
+    uint32_t completionEqStage;     /* MLX_CQEQ_STAGE_* */
+    uint32_t completionEqSyndrome;  /* firmware syndrome when CREATE_EQ failed */
+    uint32_t completionEqFwStatus;  /* firmware status byte for that command */
+    /* Which CreateEQ variant firmware accepted, 1-based, 0 = none. Variant 4
+     * is diagnostic only: it asks for the async interrupt index, so accepting
+     * only that one means firmware objects to the vector, not to the ring. */
+    uint32_t completionEqVariant;
+    uint32_t completionEqVariantTried;      /* bitmask of attempted variants */
+    uint32_t completionEqVariantSyndrome[4];
+    /* Async MSI-X interrupts serviced, EQ timer ticks, and the period the
+     * timer is currently rearming with. Together they say whether vector 0
+     * actually delivers and whether the timer has stepped down from delivery
+     * duty to insurance. */
+    uint64_t asyncInterrupts;
+    uint64_t completionInterrupts;
+    uint64_t eqTimerTicks;
+    uint32_t eqTimerPeriodMs;
+    uint32_t rsvd0;
 };
 
 /* Read-only per-client diagnostic snapshot; no firmware command payloads or
@@ -159,8 +255,21 @@ static_assert(sizeof(struct mlx_stats_resp) == 152,
               "mlx_stats_resp ABI mismatch");
 #endif
 
+struct mlx_probe_completion_vector_req {
+    uint32_t intr;      /* 0 = async vector, 1 = completion vector */
+};
+struct mlx_probe_completion_vector_resp {
+    uint32_t eqn;
+};
+
 struct mlx_create_cq_req {
     uint32_t entries;
+};
+
+struct mlx_modify_cq_moderation_req {
+    uint32_t cqHandle;
+    uint16_t cqPeriod;      /* microseconds, 0..4095 */
+    uint16_t cqMaxCount;    /* CQEs, 0..65535 */
 };
 
 /* createCQ response; the CQ buffer is mapped through clientMemoryForType. */
@@ -171,9 +280,53 @@ struct mlx_create_cq_resp {
     uint32_t  dbRecordOffset;
 };
 
+/* P0 performance counters. Read-only, per UserClient; values are monotonic
+ * until that client closes. Time fields are CLOCK_UPTIME_RAW nanoseconds.
+ *
+ * doorbells    — MMIO doorbells the DEXT rang for this client. Only the
+ *     kernel-mediated post/arm selectors ring one here; a direct-UAR client
+ *     rings its own from userspace and counts them itself, so the two
+ *     together separate the direct path from the kernel path.
+ * cqeConsumed / cqeErrors — CQEs the kernel-mediated PollCQ returned to this
+ *     client, and how many of them carried a non-success status. A direct-CQ
+ *     client decodes the mapped ring itself and these stay flat.
+ * cqEvents     — completion MSI-X interrupts the DEXT serviced that advanced
+ *     the device completion generation. Device-wide, not per client: it is
+ *     the only in-driver view of interrupt delivery, so comparing it with a
+ *     client's own wakeup count shows whether wakeups are being missed.
+ * cqEventWakeups — WaitCqEvent calls that returned a fresh generation instead
+ *     of timing out. Device-wide like cqEvents: the shim blocks on its own
+ *     UserClient connection, so a per-client count would always read zero from
+ *     the connection that queries the counters. */
+struct mlx_perf_resp {
+    uint64_t externalMethods;
+    uint64_t externalMethodNs;
+    uint64_t postSendCalls;
+    uint64_t postRecvCalls;
+    uint64_t pollCqCalls;
+    uint64_t syncFastPathCalls;
+    uint64_t syncQpTailsCalls;
+    uint64_t armCqCalls;
+    uint64_t doorbells;
+    uint64_t cqeConsumed;
+    uint64_t cqeErrors;
+    uint64_t mrRegisters;
+    uint64_t mrDeregisters;
+    uint64_t mrBytes;
+    uint64_t copiedBytes;
+    uint64_t cqEvents;
+    uint64_t cqEventWakeups;
+};
+
 #if defined(__cplusplus)
+static_assert(sizeof(struct mlx_interrupts_resp) == 104,
+              "mlx_interrupts_resp ABI mismatch");
+static_assert(sizeof(struct mlx_perf_resp) == 136,
+              "mlx_perf_resp ABI mismatch");
 static_assert(sizeof(struct mlx_query_abi_resp) == 8,
               "mlx_query_abi_resp ABI mismatch");
+static_assert(sizeof(struct mlx_modify_cq_moderation_req) == 8,
+              "mlx_modify_cq_moderation_req ABI mismatch");
 static_assert(sizeof(struct mlx_create_cq_req) == 4,
               "mlx_create_cq_req ABI mismatch");
 static_assert(sizeof(struct mlx_create_cq_resp) == 16,
@@ -204,6 +357,11 @@ enum {
     /* CQ */
     kMlxUCMethodCreateCQ      = 0x1030,
     kMlxUCMethodDestroyCQ     = 0x1031,
+    /* Hardware completion moderation (MODIFY_CQ). Holds a completion event
+     * back until cqPeriod microseconds pass or cqMaxCount CQEs accumulate, so
+     * a streaming transfer raises one event per batch instead of one per arm.
+     * Zero in a field disables that half; both zero restores no moderation. */
+    kMlxUCMethodModifyCqModeration = 0x1032,
 
     /* MR */
     kMlxUCMethodRegMR         = 0x1040,
@@ -260,6 +418,18 @@ enum {
     kMlxUCMethodDbgDumpState      = 0x10A5,  /* snapshot: fw_rev/cmdq/pages */
     kMlxUCMethodStableInitCycle   = 0x10A6,  /* TEARDOWN -> INIT, same fw session */
 
+    /* MSI-X setup diagnosis. The DEXT logs the failing step, but a dev box
+     * with the kernel log channel disabled sees nothing, and a client that
+     * finds MLX_UC_FEATURE_CQ_INTERRUPT missing otherwise cannot tell a
+     * vector shortage from a dispatch-source failure. */
+    kMlxUCMethodQueryInterrupts = 0x1087,
+
+    /* Diagnostic: rebind the completion EQ to a chosen MSI-X index and report
+     * the new EQ number. Refused while any CQ is live. Separates "MSI-X is
+     * never delivered to this dext" from "the firmware intr index does not
+     * match the dispatch-source index". */
+    kMlxUCMethodProbeCompletionVector = 0x1088,
+
     /* async events */
     kMlxUCMethodGetAsyncEvent = 0x1093,  /* get an async event (non-blocking) */
 
@@ -293,12 +463,26 @@ enum {
     kMlxUCMethodDeallocMW        = 0x10ac,
     kMlxUCMethodBindMW           = 0x10ad,
     kMlxUCMethodQueryStats       = 0x10ae,
+    kMlxUCMethodQueryPerf        = 0x10b4,  /* P0 performance counters */
+    kMlxUCMethodWaitCqEvent      = 0x10b5,  /* blocking wait on MSI-X generation */
+    kMlxUCMethodQueryRuntime     = 0x10b6,  /* fixed v1 size; additive selector */
 
     /* ===== P3: inline / atomics / GID enumeration / CQ arming ===== */
     kMlxUCMethodPostSendInline   = 0x10af,
     kMlxUCMethodPostSendAtomic   = 0x10b0,
     kMlxUCMethodQueryGidTable    = 0x10b1,
     kMlxUCMethodArmCQ            = 0x10b2,
+    kMlxUCMethodSyncQpTails      = 0x10b3,
+};
+
+struct mlx_wait_cq_event_req {
+    uint64_t generation;
+    uint32_t timeoutMs;
+    uint32_t rsvd;
+};
+
+struct mlx_wait_cq_event_resp {
+    uint64_t generation;
 };
 
 struct mlx_fast_path_resp {
@@ -508,6 +692,16 @@ struct mlx_arm_cq_req {
     uint32_t solicitedOnly;
 };
 
+/* Advance a QP's completion tails after a userspace direct-CQ decode consumed
+ * CQEs without the kernel-mediated PollCQ.  Keeps DestroyQP's in-flight check
+ * (sqHead==sqTail && rqHead==rqTail) and the stats consistent. */
+struct mlx_sync_qp_tails_req {
+    uint32_t  qpn;              /* opaque QP token */
+    uint32_t  rsvd;
+    uint64_t  sqTail;
+    uint64_t  rqTail;
+};
+
 /* Full GID-table enumeration, chunked: a single IOConnectCallStructMethod
  * struct output is bounded by the DriverKit struct-method limit, so the full
  * 256-slot table is walked in MLX_UC_MAX_GID_CHUNK-slot windows. */
@@ -593,6 +787,12 @@ static_assert(sizeof(struct mlx_post_send_atomic_req) == 64,
               "mlx_post_send_atomic_req ABI mismatch");
 static_assert(sizeof(struct mlx_arm_cq_req) == 8,
               "mlx_arm_cq_req ABI mismatch");
+static_assert(sizeof(struct mlx_sync_qp_tails_req) == 24,
+              "mlx_sync_qp_tails_req ABI mismatch");
+static_assert(sizeof(struct mlx_qp_shadow) == 40,
+              "mlx_qp_shadow ABI mismatch");
+static_assert(MLX_QP_SHADOW_OFFSET + sizeof(struct mlx_qp_shadow) <= 128,
+              "mlx_qp_shadow must fit in the 128-byte DB-record slot");
 static_assert(sizeof(struct mlx_gid_table_entry) == 36,
               "mlx_gid_table_entry ABI mismatch");
 static_assert(sizeof(struct mlx_query_gid_table_resp) ==
@@ -724,6 +924,12 @@ struct mlx_query_port_resp {
 };
 
 /* createQP request/response */
+/* Per-QP flags in mlx_create_qp_req::rsvd.  The trusted flag is the client's
+ * explicit opt-in: the DEXT consults the shared-page shadow only when the
+ * client set it, so a shim that predates the shared page (or that maps the SQ
+ * but keeps the validated path) can never make DestroyQP/SyncQpTails read a
+ * stale shadow. */
+#define MLX_UC_QP_TRUSTED 1u
 struct mlx_create_qp_req {
     uint32_t  pd;
     uint32_t  sendCq;
@@ -736,7 +942,7 @@ struct mlx_create_qp_req {
     uint32_t  dbRecordOffset;   /* DB record user offset */
     uint32_t  bfOffset;         /* BF doorbell user offset */
     uint32_t  maxInlineData;    /* must be <= MLX_UC_MAX_INLINE_DATA */
-    uint32_t  rsvd;                 /* bit0: native RQ (no shared dummy SRQ) */
+    uint32_t  rsvd;             /* MLX_UC_QP_* flags (bit0: trusted fast path) */
 };
 struct mlx_create_qp_resp {
     uint32_t  qpn;              /* opaque client token (ABI v2) */
@@ -747,7 +953,7 @@ struct mlx_create_qp_resp {
     uint32_t  bfOffset;         /* BF register offset in mapped UAR */
     uint32_t  mappingVersion;
     uint32_t  uarPage;
-    uint32_t  rsvd;
+    uint32_t  bfBufSize;        /* bytes in one of the two BF ping-pong buffers */
 };
 
 #if defined(__cplusplus)
@@ -825,9 +1031,9 @@ struct mlx_reg_mr_resp {
 /* regMRIndirect request — composes already-registered direct MRs (their
  * handles from a prior RegMR) under one new mkey/rkey/lkey. Response reuses
  * mlx_reg_mr_resp (iova = the caller-supplied logical startAddr below).
- * childCount is bounded by MLX_MR_TABLE_CAP (MlxMR.cpp) since no more
- * distinct MRs than that can exist to reference in the first place. */
-#define MLX_UC_MAX_INDIRECT_CHILDREN   32
+ * childCount is bounded by the 4112-byte single-mailbox CREATE_MKEY budget:
+ * (4112 - 272) / 16-byte-KLM-entry = 240 (MlxP0EncodingIndirect.hpp). */
+#define MLX_UC_MAX_INDIRECT_CHILDREN   240
 struct mlx_reg_mr_indirect_req {
     uint64_t  startAddr;              /* logical base presented to the app */
     uint64_t  length;                 /* logical span (normally the sum of children) */
@@ -883,7 +1089,7 @@ struct mlx_bind_mw_resp {
 };
 
 #if defined(__cplusplus)
-static_assert(sizeof(struct mlx_post_umr_klm_req) == 152,
+static_assert(sizeof(struct mlx_post_umr_klm_req) == 984,
               "mlx_post_umr_klm_req ABI mismatch");
 #endif
 

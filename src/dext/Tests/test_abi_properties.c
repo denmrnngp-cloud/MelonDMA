@@ -26,7 +26,7 @@ static void check(int cond, const char *msg)
 static const uint32_t sSelectors[] = {
     kMlxUCMethodOpen, kMlxUCMethodClose, kMlxUCMethodQueryDevice,
     kMlxUCMethodQueryPort, kMlxUCMethodQueryAbi, kMlxUCMethodQueryLimits,
-    kMlxUCMethodQueryStats, kMlxUCMethodAllocPD, kMlxUCMethodDeallocPD,
+    kMlxUCMethodQueryStats, kMlxUCMethodQueryPerf, kMlxUCMethodAllocPD, kMlxUCMethodDeallocPD,
     kMlxUCMethodAllocUAR, kMlxUCMethodCreateQP, kMlxUCMethodModifyQP,
     kMlxUCMethodDestroyQP, kMlxUCMethodQueryQP, kMlxUCMethodCreateCQ,
     kMlxUCMethodDestroyCQ, kMlxUCMethodRegMR, kMlxUCMethodDeregMR,
@@ -47,15 +47,19 @@ static const uint32_t sSelectors[] = {
     kMlxUCMethodDbgFlr, kMlxUCMethodDbgExec, kMlxUCMethodDbgQueryPages,
     kMlxUCMethodDbgProvidePages, kMlxUCMethodDbgDumpState,
     kMlxUCMethodStableInitCycle,
+    kMlxUCMethodWaitCqEvent, kMlxUCMethodQueryRuntime,
 };
 #define SELECTOR_COUNT (sizeof(sSelectors) / sizeof(sSelectors[0]))
 
 static void test_struct_sizes(void)
 {
+    check(sizeof(struct mlx_runtime_resp) == 120, "mlx_runtime_resp v1 == 120");
     check(sizeof(struct mlx_query_abi_resp) == 8, "mlx_query_abi_resp == 8");
     check(sizeof(struct mlx_health_resp) == 32, "mlx_health_resp == 32");
     check(sizeof(struct mlx_query_limits_resp) == 48, "mlx_query_limits_resp == 48");
     check(sizeof(struct mlx_stats_resp) == 152, "mlx_stats_resp == 152");
+    check(sizeof(struct mlx_perf_resp) == 136, "mlx_perf_resp == 136");
+    check(sizeof(struct mlx_interrupts_resp) == 104, "mlx_interrupts_resp == 104");
     check(sizeof(struct mlx_create_cq_req) == 4, "mlx_create_cq_req == 4");
     check(sizeof(struct mlx_create_cq_resp) == 16, "mlx_create_cq_resp == 16");
     check(sizeof(struct mlx_datapath_sge) == 16, "mlx_datapath_sge == 16");
@@ -71,7 +75,8 @@ static void test_struct_sizes(void)
     check(sizeof(struct mlx_sync_recv_fast_path_req) == 2056, "mlx_sync_recv_fast_path_req == 2056");
     check(sizeof(struct mlx_sync_send_sge_req) == 296, "mlx_sync_send_sge_req == 296");
     check(sizeof(struct mlx_sync_recv_sge_req) == 280, "mlx_sync_recv_sge_req == 280");
-    check(sizeof(struct mlx_post_umr_klm_req) == 152, "mlx_post_umr_klm_req == 152");
+    check(sizeof(struct mlx_qp_shadow) == 40, "mlx_qp_shadow == 40");
+    check(sizeof(struct mlx_post_umr_klm_req) == 984, "mlx_post_umr_klm_req == 984");
     check(sizeof(struct mlx_stable_init_cycle_resp) == 136, "mlx_stable_init_cycle_resp == 136");
 }
 
@@ -82,7 +87,10 @@ static void test_feature_bits(void)
         MLX_UC_FEATURE_ASYNC_EVENTS, MLX_UC_FEATURE_INDIRECT_MR,
         MLX_UC_FEATURE_QP_RECOVERY, MLX_UC_FEATURE_MULTI_SGE,
         MLX_UC_FEATURE_IMMEDIATE_DATA, MLX_UC_FEATURE_HEALTH_QUERY,
-        MLX_UC_FEATURE_STATS,
+        MLX_UC_FEATURE_STATS, MLX_UC_FEATURE_INLINE, MLX_UC_FEATURE_ATOMIC,
+        MLX_UC_FEATURE_TRUSTED_FAST_PATH, MLX_UC_FEATURE_BLUE_FLAME,
+        MLX_UC_FEATURE_CQ_INTERRUPT, MLX_UC_FEATURE_COHERENT_UMA_MR,
+        MLX_UC_FEATURE_CQ_EVENT_WAIT, MLX_UC_FEATURE_RUNTIME_STATUS,
     };
     uint32_t seen = 0;
     int unique = 1;
@@ -113,7 +121,7 @@ static void test_bounds(void)
     check(MLX_UC_MAX_SQ_DEPTH == 4096 && MLX_UC_MAX_RQ_DEPTH == 4096,
           "SQ/RQ depth ceilings are 4096");
     check(MLX_UC_MAX_INDIRECT_CHILDREN >= 1 &&
-          MLX_UC_MAX_INDIRECT_CHILDREN <= 64,
+          MLX_UC_MAX_INDIRECT_CHILDREN <= 240,
           "indirect-child bound sane");
 }
 

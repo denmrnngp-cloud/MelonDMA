@@ -2,6 +2,12 @@
 # Production packaging/deployment for MlxRDMA.  Unlike mlx_dev.sh this script
 # never changes SIP, boot-args, System Extension developer mode, or the system
 # extension database.
+#
+# RELEASE-REQUIRED (2026-09-02): the boot-time startup improvement is not yet
+# wired here — see docs/production-release-notes.md. The package/install must
+# place the flat .dext at /Library/DriverExtensions/com.mlx5.rdma.dext.dext/
+# (Info.plist + executable at bundle root, NOT a Contents/ bundle) so the DEXT
+# captures the card automatically at cold boot via kernelmanagerd's guess-scan.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

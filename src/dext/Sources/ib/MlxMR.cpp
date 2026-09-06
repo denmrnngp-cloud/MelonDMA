@@ -12,6 +12,7 @@
 #include "MlxCmd.hpp"
 #include "MlxDMA.hpp"
 #include "MlxDriverKitCompat.h"
+#include "MlxSafety.hpp"
 #include "MlxP0Encoding.hpp"
 #include "MlxUCIO.h"
 
@@ -130,7 +131,6 @@ MlxMR::RegMR(const struct mlx_reg_mr_req *req, IOMemoryDescriptor *clientMemory,
 {
     if (!s || !req || !resp || !clientMemory) return kIOReturnBadArgument;
     if (!req->startAddr || !req->length ||
-        req->length > (uint64_t)MLX_MAX_DMA_PAGES * 4096 ||
         req->startAddr + req->length < req->startAddr)
         return kIOReturnBadArgument;
 
@@ -139,24 +139,88 @@ MlxMR::RegMR(const struct mlx_reg_mr_req *req, IOMemoryDescriptor *clientMemory,
     if (kr != kIOReturnSuccess) return kr;
     dmaReq.va = req->startAddr;
     dmaReq.len = req->length;
+    if ((dmaReq.iovaBase & 4095u) != (req->startAddr & 4095u)) {
+        s->core->GetDMA()->Unpin(&dmaReq);
+        return kIOReturnBadArgument;
+    }
+
+    /* Small MRs (<= 480 x 4 KiB = 1.875 MiB) reuse dmaReq.pageDMA from the
+     * 4 KiB split in Pin. Large MRs need a contiguous IOVA and carry the
+     * full PAS list inline in a large command mailbox — the mlx5 reg_create
+     * populate path: one IODMACommand + one CREATE_MKEY, no chunking/UMR. */
+    uint32_t pageShift = MLX_MTT_PAGE_SHIFT;
+    uint32_t pageCount = dmaReq.numPages;
+    uint64_t *pas      = dmaReq.pageDMA;
+    uint8_t  *in       = NULL;
+    uint32_t capacity  = 0;
+    uint8_t   smallIn[MLX_CMD_MAX_SIZE] = {};
+    uint8_t   out[16] = {};
+
+    if (req->length > (uint64_t)MLX_MAX_DMA_PAGES * 4096) {
+        pageShift = dmaReq.contiguous ? mlxPickMttPageShift(req->startAddr, dmaReq.iovaBase,
+                                        s->core->GetHCA() &&
+                                        s->core->GetHCA()->Caps().maxMttLogPageSize
+                                        ? s->core->GetHCA()->Caps().maxMttLogPageSize
+                                        : MLX_MTT_MAX_PAGE_SHIFT) : MLX_MTT_PAGE_SHIFT;
+        pageCount = (uint32_t)mlxMttPageCountShift(req->startAddr, req->length,
+                                                   pageShift);
+        capacity  = mlxCreateMkeyInputSize(pageCount);
+        if (!pageShift || !pageCount || capacity > MLX_CMD_MAX_INPUT_SIZE) {
+            s->core->GetDMA()->Unpin(&dmaReq);
+            return kIOReturnNoSpace;
+        }
+        in  = IONewZero(uint8_t, capacity);
+        pas = IONewZero(uint64_t, pageCount);
+        if (!in || !pas) {
+            if (in)  IODelete(in, uint8_t, capacity);
+            if (pas) IODelete(pas, uint64_t, pageCount);
+            s->core->GetDMA()->Unpin(&dmaReq);
+            return kIOReturnNoMemory;
+        }
+        bool built = false;
+        if (dmaReq.contiguous) {
+            built = mlxBuildContiguousPas(dmaReq.iovaBase, req->startAddr, req->length,
+                                          pageShift, pas, pageCount, &pageCount);
+        } else {
+            uint32_t produced = 0;
+            built = mlxBuildSegmentPas(dmaReq.segments, dmaReq.segmentCount,
+                req->startAddr, req->length, pas, pageCount, &produced) && produced == pageCount;
+        }
+        if (!built) {
+            IODelete(in, uint8_t, capacity);
+            IODelete(pas, uint64_t, pageCount);
+            s->core->GetDMA()->Unpin(&dmaReq);
+            return kIOReturnNoSpace;
+        }
+    } else {
+        in       = smallIn;
+        capacity = sizeof(smallIn);
+    }
 
     uint32_t inputSize = 0;
-    uint8_t in[MLX_CMD_MAX_SIZE] = {};
-    uint8_t out[16] = {};
     IOLockLock(s->lock);
     uint8_t variant = s->variant++;
     if (!s->variant) s->variant = 1; /* zero is reserved; wrap deliberately */
     IOLockUnlock(s->lock);
-    if (!mlxEncodeCreateMkey(in, sizeof(in), dmaReq.pageDMA, dmaReq.numPages,
+    if (!mlxEncodeCreateMkey(in, capacity, pas, pageCount,
                              req->startAddr, req->length, req->accessFlags & MLX_MR_ACCESS_SUPPORTED,
-                             req->pd, variant, &inputSize)) {
+                             req->pd, variant, pageShift, &inputSize)) {
+        if (in != smallIn) {
+            IODelete(in, uint8_t, capacity);
+            IODelete(pas, uint64_t, pageCount);
+        }
         s->core->GetDMA()->Unpin(&dmaReq);
         return kIOReturnBadArgument;
     }
     mlxSetBits(in, 0x00, 16, MLX_CMD_OP_CREATE_MKEY);
 
+    uint64_t pas0 = pas[0];
     kr = s->core->Exec(MLX_CMD_OP_CREATE_MKEY, in, inputSize,
                        out, sizeof(out), 5000);
+    if (in != smallIn) {
+        IODelete(in, uint8_t, capacity);
+        IODelete(pas, uint64_t, pageCount);
+    }
     if (kr != kIOReturnSuccess) {
         s->core->GetDMA()->Unpin(&dmaReq);
         return kr;
@@ -173,8 +237,9 @@ MlxMR::RegMR(const struct mlx_reg_mr_req *req, IOMemoryDescriptor *clientMemory,
         uint8_t din[16] = {}, dout[16] = {};
         mlxSetBits(din, 0x00, 16, MLX_CMD_OP_DESTROY_MKEY);
         mlxSetBits(din, 0x48, 24, mkeyIndex);
-        s->core->Exec(MLX_CMD_OP_DESTROY_MKEY, din, sizeof(din),
-                      dout, sizeof(dout), 5000);
+        if (s->core->Exec(MLX_CMD_OP_DESTROY_MKEY, din, sizeof(din),
+                         dout, sizeof(dout), 5000) != kIOReturnSuccess)
+            s->core->EnterDmaQuarantine(0x4d524655u);
         s->core->GetDMA()->Unpin(&dmaReq);
         return kIOReturnNoMemory;
     }
@@ -201,9 +266,9 @@ MlxMR::RegMR(const struct mlx_reg_mr_req *req, IOMemoryDescriptor *clientMemory,
     resp->lkey = composedLkey;
     resp->rkey = composedLkey;
     resp->iova = req->startAddr;
-    MLX_LOG("MR[%u] registered va=0x%llx len=%llu pages=%u pas0=0x%llx lkey=0x%x",
-            mkeyIndex, req->startAddr, req->length, dmaReq.numPages,
-            dmaReq.pageDMA[0], composedLkey);
+    MLX_DBG("MR[%u] registered va=0x%llx len=%llu pages=%u shift=%u pas0=0x%llx lkey=0x%x",
+            mkeyIndex, req->startAddr, req->length, pageCount, pageShift,
+            pas0, composedLkey);
     return kIOReturnSuccess;
 }
 
@@ -291,7 +356,7 @@ MlxMR::RegMRIndirect(const struct mlx_reg_mr_indirect_req *req,
     resp->lkey = composedLkey;
     resp->rkey = composedLkey;
     resp->iova = req->startAddr;
-    MLX_LOG("MR[%u] indirect registered children=%u va=0x%llx len=%llu lkey=0x%x",
+    MLX_DBG("MR[%u] indirect registered children=%u va=0x%llx len=%llu lkey=0x%x",
             mkeyIndex, req->childCount, req->startAddr, req->length, composedLkey);
     return kIOReturnSuccess;
 }
@@ -350,7 +415,7 @@ MlxMR::DeregMR(uint32_t mrHandle)
         }
     }
     IOLockUnlock(s->lock);
-    MLX_LOG("MR[%u] deregistered", mrHandle);
+    MLX_DBG("MR[%u] deregistered", mrHandle);
     return kIOReturnSuccess;
 }
 

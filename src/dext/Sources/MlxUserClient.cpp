@@ -23,17 +23,21 @@
 #include "../ib/MlxCC.hpp"
 #include "core/MlxCmd.hpp"
 #include "core/MlxFwPages.hpp"
+#include "core/MlxEQ.hpp"
 #include "core/MlxHealth.hpp"
 #include "core/MlxUAR.hpp"
 #include "hw/MlxHCA.hpp"
 #include "hw/MlxIfcHelpers.hpp"
 #include "MlxUCIO.h"
+#include "MlxSafety.hpp"
 #include "MlxPCIDriver.h"
 
 #include <DriverKit/IOLib.h>
 #include <DriverKit/IOService.h>
 #include <DriverKit/OSArray.h>
+#include <DriverKit/OSBoolean.h>
 #include <DriverKit/OSData.h>
+#include <DriverKit/OSDictionary.h>
 #include <DriverKit/IOMemoryDescriptor.h>
 #include <string.h>
 #include <time.h>
@@ -42,20 +46,25 @@
 
 /* Opaque client-token registry (P0.3). Raw firmware IDs are resolved only at
  * this ABI boundary; MlxQP/MlxCQ/MlxMR keep working with raw IDs. A token is
- * (type << 28) | (generation << 9) | slot. Generation comes from ONE global
- * counter shared by every UserClient in this DEXT process, so two clients can
- * never mint the same token (cross-client isolation) and a stale token never
- * aliases a recycled raw ID within a 19-bit generation epoch (524288 mints). */
+ * (type << 21) | (generation << 9) | slot — 24 bits total, so it fits the
+ * 24-bit handle field of IOConnectMapMemory64's uint32_t memoryType (kind byte
+ * + 24-bit handle); a 32-bit token's top 8 bits were truncated there, which
+ * broke the CQE/SQ/RQ memory mapping with kIOReturnNotPermitted. Generation
+ * comes from ONE global counter shared by every UserClient in this DEXT
+ * process, so two clients can never mint the same token (cross-client
+ * isolation) and a stale token never aliases a recycled raw ID within a
+ * 12-bit generation epoch (4096 mints per slot). */
 enum { MLX_T_PD = 0, MLX_T_QP, MLX_T_CQ, MLX_T_MR, MLX_T_MW, MLX_T_COUNT };
 #define MLX_T_SLOT_BITS 9u
 #define MLX_T_SLOTS     (1u << MLX_T_SLOT_BITS)          /* 512 */
-#define MLX_T_GEN_BITS  19u
-#define MLX_T_GEN_MASK  ((1u << MLX_T_GEN_BITS) - 1u)    /* 0x7ffff */
+#define MLX_T_GEN_BITS  12u
+#define MLX_T_GEN_MASK  ((1u << MLX_T_GEN_BITS) - 1u)    /* 0xfff */
 #define MLX_T_GEN_SHIFT MLX_T_SLOT_BITS
+#define MLX_T_TYPE_SHIFT (MLX_T_SLOT_BITS + MLX_T_GEN_BITS) /* 21 */
 
 /* Global generation counter: shared by all UserClients of one DEXT
- * process (DriverKit keeps all clients in one process). 19 bits =>
- * 524288 tokens before wrap — (type, slot, gen) collisions between clients
+ * process (DriverKit keeps all clients in one process). 12 bits =>
+ * 4096 mints before wrap — (type, slot, gen) collisions between clients
  * are impossible until the generation wraps (unreachable in a live session). */
 static uint32_t sTokenGen = 0;
 
@@ -82,6 +91,7 @@ struct MlxUserClient_IVars {
      * Cleanup starts. Both are guarded by fOwnedLock. */
     uint32_t        fDataInflight;
     bool            fDataTeardown;
+    bool            fPrivilegedDiagnostics;
     /* P1.1 per-client quota counters (see MLX_UC_MAX_*_PER_CLIENT). */
     uint32_t        fQuotaPd;
     uint32_t        fQuotaQp;
@@ -92,8 +102,87 @@ struct MlxUserClient_IVars {
     uint32_t        fQuotaAh;
     uint32_t        fQuotaGid;
     uint32_t        fQuotaDbRecords;
+    uint64_t        fPinnedBytes;
     uint64_t        fFwCmdWindowStart;
     uint32_t        fFwCmdBurstUsed;
+
+    /* P0 performance counters. Atomic increments keep data-path calls
+     * independent while QueryPerf snapshots this client. */
+    uint64_t        fPerfExternalMethods;
+    uint64_t        fPerfExternalMethodNs;
+    uint64_t        fPerfPostSendCalls;
+    uint64_t        fPerfPostRecvCalls;
+    uint64_t        fPerfPollCqCalls;
+    uint64_t        fPerfSyncFastPathCalls;
+    uint64_t        fPerfSyncQpTailsCalls;
+    uint64_t        fPerfArmCqCalls;
+    uint64_t        fPerfMrRegisters;
+    uint64_t        fPerfMrDeregisters;
+    uint64_t        fPerfMrBytes;
+    uint64_t        fPerfCopiedBytes;
+    /* Kernel-mediated MMIO doorbells rung for this client. A direct-UAR
+     * client rings its own from userspace, so this stays flat there and the
+     * two counters separate the direct path from the kernel path. */
+    uint64_t        fPerfDoorbells;
+    uint64_t        fPerfCqeConsumed;
+    uint64_t        fPerfCqeErrors;
+};
+
+static inline void
+MlxPerfAdd(uint64_t *counter, uint64_t value = 1)
+{
+    __atomic_fetch_add(counter, value, __ATOMIC_RELAXED);
+}
+
+/* Wraps a call that rings exactly one MMIO doorbell when it succeeds. Failed
+ * posts unwind the producer index before returning, so they ring none. */
+static inline kern_return_t
+MlxPerfDoorbell(MlxUserClient_IVars *v, kern_return_t r)
+{
+    if (v && r == kIOReturnSuccess) MlxPerfAdd(&v->fPerfDoorbells);
+    return r;
+}
+
+static void
+MlxPerfCountSelector(MlxUserClient_IVars *v, uint64_t selector)
+{
+    if (!v) return;
+    switch (selector) {
+    case kMlxUCMethodPostSend:
+    case kMlxUCMethodPostSendBatch:
+    case kMlxUCMethodPostSendSge:
+    case kMlxUCMethodPostSendInline:
+    case kMlxUCMethodPostSendAtomic:
+        MlxPerfAdd(&v->fPerfPostSendCalls); break;
+    case kMlxUCMethodPostRecv:
+    case kMlxUCMethodPostRecvBatch:
+    case kMlxUCMethodPostRecvSge:
+        MlxPerfAdd(&v->fPerfPostRecvCalls); break;
+    case kMlxUCMethodPollCQ:
+        MlxPerfAdd(&v->fPerfPollCqCalls); break;
+    case kMlxUCMethodSyncFastPath:
+    case kMlxUCMethodSyncRecvFastPath:
+    case kMlxUCMethodSyncSendSge:
+    case kMlxUCMethodSyncRecvSge:
+        MlxPerfAdd(&v->fPerfSyncFastPathCalls); break;
+    case kMlxUCMethodSyncQpTails:
+        MlxPerfAdd(&v->fPerfSyncQpTailsCalls); break;
+    case kMlxUCMethodArmCQ:
+        MlxPerfAdd(&v->fPerfArmCqCalls); break;
+    default: break;
+    }
+}
+
+struct MlxPerfTimer {
+    MlxUserClient_IVars *v;
+    uint64_t start;
+    MlxPerfTimer(MlxUserClient_IVars *value) : v(value),
+        start(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) {}
+    ~MlxPerfTimer()
+    {
+        if (v) MlxPerfAdd(&v->fPerfExternalMethodNs,
+                         clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start);
+    }
 };
 
 #define MlxUserClient_DECLARE_IVARS  struct MlxUserClient_IVars * ivars;
@@ -160,7 +249,7 @@ struct MlxDataPathGuard {
 
 static uint32_t TokenMake(uint32_t type, uint32_t slot, uint32_t gen)
 {
-    return (type << 28) |
+    return (type << MLX_T_TYPE_SHIFT) |
            ((gen & MLX_T_GEN_MASK) << MLX_T_GEN_SHIFT) |
            (slot & (MLX_T_SLOTS - 1u));
 }
@@ -193,7 +282,7 @@ static uint32_t TokenCreate(MlxUserClient_IVars *v, uint32_t type, uint32_t raw)
 static uint32_t TokenResolve(MlxUserClient_IVars *v, uint32_t token, uint32_t type)
 {
     if (!v || !v->fOwnedLock || type >= MLX_T_COUNT ||
-        (token >> 28) != type) return 0;
+        (token >> MLX_T_TYPE_SHIFT) != type) return 0;
     uint32_t slot = token & (MLX_T_SLOTS - 1u);
     uint32_t gen = (token >> MLX_T_GEN_SHIFT) & MLX_T_GEN_MASK;
     IOLockLock(v->fOwnedLock);
@@ -207,7 +296,7 @@ static bool TokenDrop(MlxUserClient_IVars *v, uint32_t token, uint32_t type,
                       uint32_t *raw)
 {
     if (!v || !v->fOwnedLock || type >= MLX_T_COUNT ||
-        (token >> 28) != type) return false;
+        (token >> MLX_T_TYPE_SHIFT) != type) return false;
     uint32_t slot = token & (MLX_T_SLOTS - 1u);
     uint32_t gen = (token >> MLX_T_GEN_SHIFT) & MLX_T_GEN_MASK;
     if (slot >= MLX_T_SLOTS) return false;
@@ -241,6 +330,27 @@ static uint32_t TokenForRaw(MlxUserClient_IVars *v, uint32_t type, uint32_t raw)
  * Reserving BEFORE the firmware command is the guarantee that a refused
  * request never leaves a partially-created resource. Counters are protected
  * by the same fOwnedLock that serializes ownership-table mutation. */
+class MlxClientPinReservation {
+    MlxUserClient_IVars *v;
+    uint64_t bytes;
+    bool reserved;
+public:
+    MlxClientPinReservation(MlxUserClient_IVars *client, uint64_t size)
+        : v(client), bytes(size), reserved(false) {
+        IOLockLock(v->fOwnedLock);
+        reserved = mlxBytesCanReserve(v->fPinnedBytes, bytes, MLX_UC_PINNED_BYTES_PER_CLIENT);
+        if (reserved) v->fPinnedBytes += bytes;
+        IOLockUnlock(v->fOwnedLock);
+    }
+    bool ok() const { return reserved; }
+    void commit() { reserved = false; }
+    ~MlxClientPinReservation() {
+        if (reserved) {
+            IOLockLock(v->fOwnedLock); v->fPinnedBytes -= bytes; IOLockUnlock(v->fOwnedLock);
+        }
+    }
+};
+
 static bool QuotaReserve(MlxUserClient_IVars *v, uint32_t *counter, uint32_t limit)
 {
     if (!v || !counter || !v->fOwnedLock) return false;
@@ -375,6 +485,15 @@ MlxUserClient::Start_Impl(IOService * provider)
         return kIOReturnNoDevice;
     }
     ivars->fCore = core;
+
+    /* Only a separately signed diagnostic client may use recovery/raw-FW
+     * selectors. Never infer privilege from uid, process name, or env. */
+    OSDictionary *entitlements = NULL;
+    if (CopyClientEntitlements(&entitlements) == kIOReturnSuccess && entitlements) {
+        ivars->fPrivilegedDiagnostics =
+            entitlements->getObject("com.mlx5.rdma.diagnostic") == kOSBooleanTrue;
+        entitlements->release();
+    }
     /* RoCE may not be up yet (FwInit stopped at boot pages) —
     * UserClient still starts: kMlxUCMethodFwReinit works without RoCE
     * and is exactly what brings it up (notes/31). Verbs methods are gated on
@@ -579,12 +698,23 @@ static const MlxMethodSpec sMlxMethods[] = {
                   sizeof(struct mlx_query_port_resp)),
     MLX_UC_METHOD(kMlxUCMethodQueryHealth, 0,
                   sizeof(struct mlx_health_resp)),
+    MLX_UC_METHOD(kMlxUCMethodQueryInterrupts, 0,
+                  sizeof(struct mlx_interrupts_resp)),
+    MLX_UC_METHOD(kMlxUCMethodProbeCompletionVector,
+                  sizeof(struct mlx_probe_completion_vector_req),
+                  sizeof(struct mlx_probe_completion_vector_resp)),
     MLX_UC_METHOD(kMlxUCMethodQueryAbi, 0,
                   sizeof(struct mlx_query_abi_resp)),
     MLX_UC_METHOD(kMlxUCMethodQueryLimits, 0,
                   sizeof(struct mlx_query_limits_resp)),
     MLX_UC_METHOD(kMlxUCMethodQueryStats, 0,
                   sizeof(struct mlx_stats_resp)),
+    MLX_UC_METHOD(kMlxUCMethodQueryPerf, 0,
+                  sizeof(struct mlx_perf_resp)),
+    MLX_UC_METHOD(kMlxUCMethodQueryRuntime, 0, sizeof(struct mlx_runtime_resp)),
+    MLX_UC_METHOD(kMlxUCMethodWaitCqEvent,
+                  sizeof(struct mlx_wait_cq_event_req),
+                  sizeof(struct mlx_wait_cq_event_resp)),
     MLX_UC_METHOD(kMlxUCMethodAllocPD, 0, sizeof(uint32_t)),
     MLX_UC_METHOD(kMlxUCMethodDeallocPD, sizeof(uint32_t), 0),
     MLX_UC_METHOD(kMlxUCMethodCreateQP, sizeof(struct mlx_create_qp_req),
@@ -669,6 +799,9 @@ static const MlxMethodSpec sMlxMethods[] = {
                   sizeof(struct mlx_query_gid_table_req),
                   sizeof(struct mlx_query_gid_table_resp)),
     MLX_UC_METHOD(kMlxUCMethodArmCQ, sizeof(struct mlx_arm_cq_req), 0),
+    MLX_UC_METHOD(kMlxUCMethodModifyCqModeration,
+                  sizeof(struct mlx_modify_cq_moderation_req), 0),
+    MLX_UC_METHOD(kMlxUCMethodSyncQpTails, sizeof(struct mlx_sync_qp_tails_req), 0),
 };
 
 #undef MLX_UC_METHOD
@@ -681,6 +814,10 @@ MlxUserClient::ExternalMethod(uint64_t selector,
 {
     if (!ivars || !arguments)
         return kIOReturnBadArgument;
+
+    MlxPerfTimer perfTimer(ivars);
+    MlxPerfAdd(&ivars->fPerfExternalMethods);
+    MlxPerfCountSelector(ivars, selector);
 
     /* P1.1: data-path selectors skip fMethodLock (refcounted under
      * fOwnedLock instead) so concurrent post/poll are not serialized. */
@@ -697,12 +834,59 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             break;
         }
     }
+    /* Firmware administration is not part of the public verbs UserClient.
+     * Recovery is performed by the driver lifecycle, never by a peer client. */
+    if (!ivars->fPrivilegedDiagnostics &&
+        (selector == kMlxUCMethodFwReinit || selector == kMlxUCMethodStableInitCycle ||
+         selector == kMlxUCMethodProbeCompletionVector ||
+         selector == kMlxUCMethodDbgFlr || selector == kMlxUCMethodDbgExec ||
+         selector == kMlxUCMethodDbgProvidePages || selector == kMlxUCMethodFwReset ||
+         selector == kMlxUCMethodFwCmd || selector == kMlxUCMethodAccessReg))
+        return kIOReturnNotPermitted;
     if (!spec)
         return kIOReturnUnsupported;
 
-    /* All published selectors intentionally use the bounded inline-structure
-     * IOConnectCallStructMethod ABI.  Descriptor-backed calls need a separate
-     * copy path and are rejected instead of being treated as a NULL buffer. */
+    /* ABI negotiation is valid while fRoce is still being initialized. It
+     * also must bypass the normal inline-structure validation: DriverKit has
+     * already populated structureOutput for IOConnectCallStructMethod. */
+    if (selector == kMlxUCMethodQueryAbi) {
+        void *zero = IOMallocZero(sizeof(struct mlx_query_abi_resp));
+        if (!zero) return kIOReturnNoMemory;
+        OSData *output = OSData::withBytes(zero, sizeof(struct mlx_query_abi_resp));
+        IOFree(zero, sizeof(struct mlx_query_abi_resp));
+        if (!output) return kIOReturnNoMemory;
+        struct mlx_query_abi_resp *resp =
+            (struct mlx_query_abi_resp *)output->getBytesNoCopy();
+        if (!resp) { output->release(); return kIOReturnNoMemory; }
+        resp->version = MLX_UC_ABI_VERSION;
+        resp->features = MLX_UC_FEATURE_RC | MLX_UC_FEATURE_ROCE_V2 |
+                         MLX_UC_FEATURE_DIRECT_PATH |
+                         MLX_UC_FEATURE_ASYNC_EVENTS |
+                         MLX_UC_FEATURE_INDIRECT_MR |
+                         MLX_UC_FEATURE_QP_RECOVERY |
+                         MLX_UC_FEATURE_MULTI_SGE |
+                         MLX_UC_FEATURE_IMMEDIATE_DATA |
+                         MLX_UC_FEATURE_HEALTH_QUERY |
+                         MLX_UC_FEATURE_STATS |
+                         MLX_UC_FEATURE_INLINE |
+                         MLX_UC_FEATURE_ATOMIC |
+                         MLX_UC_FEATURE_TRUSTED_FAST_PATH |
+                         MLX_UC_FEATURE_COHERENT_UMA_MR |
+                         MLX_UC_FEATURE_RUNTIME_STATUS;
+        if (ivars->fCore && ivars->fCore->CompletionEventReady())
+            resp->features |= MLX_UC_FEATURE_CQ_EVENT_WAIT;
+        if (ivars->fCore && ivars->fCore->GetHCA() &&
+            ivars->fCore->GetHCA()->Caps().logBfRegSize)
+            resp->features |= MLX_UC_FEATURE_BLUE_FLAME;
+        if (ivars->fCore && ivars->fCore->CompletionInterruptReady())
+            resp->features |= MLX_UC_FEATURE_CQ_INTERRUPT;
+        arguments->structureOutput = output;
+        return kIOReturnSuccess;
+    }
+
+    /* All other published selectors intentionally use the bounded
+     * inline-structure IOConnectCallStructMethod ABI. Descriptor-backed calls
+     * need a separate copy path and are rejected. */
     if (arguments->structureInputDescriptor ||
         arguments->structureOutputDescriptor || arguments->structureOutput)
         return kIOReturnUnsupported;
@@ -826,20 +1010,37 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         resp->ownedAh = ivars->fOwnedAh ? ivars->fOwnedAh->getCount() : 0;
         return kIOReturnSuccess;
     }
-    case kMlxUCMethodQueryAbi: {
-        struct mlx_query_abi_resp *resp = (struct mlx_query_abi_resp *)out;
-        resp->version = MLX_UC_ABI_VERSION;
-        resp->features = MLX_UC_FEATURE_RC | MLX_UC_FEATURE_ROCE_V2 |
-                         MLX_UC_FEATURE_DIRECT_PATH |
-                         MLX_UC_FEATURE_ASYNC_EVENTS |
-                         MLX_UC_FEATURE_INDIRECT_MR |
-                         MLX_UC_FEATURE_QP_RECOVERY |
-                         MLX_UC_FEATURE_MULTI_SGE |
-                         MLX_UC_FEATURE_IMMEDIATE_DATA |
-                         MLX_UC_FEATURE_HEALTH_QUERY |
-                         MLX_UC_FEATURE_STATS |
-                         MLX_UC_FEATURE_INLINE |
-                         MLX_UC_FEATURE_ATOMIC;
+    case kMlxUCMethodProbeCompletionVector: {
+        const struct mlx_probe_completion_vector_req *req =
+            (const struct mlx_probe_completion_vector_req *)in;
+        struct mlx_probe_completion_vector_resp *resp =
+            (struct mlx_probe_completion_vector_resp *)out;
+        if (!ivars->fCore) return kIOReturnNotAttached;
+        return ivars->fCore->ProbeCompletionVector(req->intr, &resp->eqn);
+    }
+    case kMlxUCMethodQueryInterrupts: {
+        struct mlx_interrupts_resp *resp = (struct mlx_interrupts_resp *)out;
+        memset(resp, 0, sizeof(*resp));
+        if (!ivars->fCore) return kIOReturnNotAttached;
+        ivars->fCore->GetInterruptStatus(&resp->vectors, &resp->setupStatus,
+                                         &resp->setupStage);
+        MlxEQ *asyncEq = ivars->fCore->GetEQ();
+        MlxEQ *compEq = ivars->fCore->GetCompletionEQ();
+        resp->asyncEqn = asyncEq ? asyncEq->EqNumber() : 0;
+        resp->completionEqn = compEq ? compEq->EqNumber() : 0;
+        resp->completionReady = ivars->fCore->CompletionInterruptReady() ? 1 : 0;
+        resp->completionEvents = ivars->fCore->CompletionEventCount();
+        ivars->fCore->GetCompletionEqStatus(&resp->completionEqStatus,
+                                            &resp->completionEqStage,
+                                            &resp->completionEqSyndrome,
+                                            &resp->completionEqFwStatus);
+        ivars->fCore->GetCompletionEqVariants(&resp->completionEqVariant,
+                                              &resp->completionEqVariantTried,
+                                              resp->completionEqVariantSyndrome);
+        ivars->fCore->GetEqServiceStats(&resp->asyncInterrupts,
+                                        &resp->completionInterrupts,
+                                        &resp->eqTimerTicks,
+                                        &resp->eqTimerPeriodMs);
         return kIOReturnSuccess;
     }
     case kMlxUCMethodQueryLimits: {
@@ -860,6 +1061,37 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         resp->maxDbRecords = DbRecordLimit(ivars);
         return kIOReturnSuccess;
     }
+    case kMlxUCMethodQueryRuntime: {
+        if (!ivars->fCore) return kIOReturnNotAttached;
+        struct mlx_runtime_resp *r = (struct mlx_runtime_resp *)out;
+        ivars->fCore->GetRuntimeStatus(r);
+        IOLockLock(ivars->fOwnedLock); r->clientPinnedBytes = ivars->fPinnedBytes;
+        IOLockUnlock(ivars->fOwnedLock);
+        return kIOReturnSuccess;
+    }
+    case kMlxUCMethodQueryPerf: {
+        struct mlx_perf_resp *resp = (struct mlx_perf_resp *)out;
+        memset(resp, 0, sizeof(*resp));
+        resp->externalMethods = __atomic_load_n(&ivars->fPerfExternalMethods, __ATOMIC_RELAXED);
+        resp->externalMethodNs = __atomic_load_n(&ivars->fPerfExternalMethodNs, __ATOMIC_RELAXED);
+        resp->postSendCalls = __atomic_load_n(&ivars->fPerfPostSendCalls, __ATOMIC_RELAXED);
+        resp->postRecvCalls = __atomic_load_n(&ivars->fPerfPostRecvCalls, __ATOMIC_RELAXED);
+        resp->pollCqCalls = __atomic_load_n(&ivars->fPerfPollCqCalls, __ATOMIC_RELAXED);
+        resp->syncFastPathCalls = __atomic_load_n(&ivars->fPerfSyncFastPathCalls, __ATOMIC_RELAXED);
+        resp->syncQpTailsCalls = __atomic_load_n(&ivars->fPerfSyncQpTailsCalls, __ATOMIC_RELAXED);
+        resp->armCqCalls = __atomic_load_n(&ivars->fPerfArmCqCalls, __ATOMIC_RELAXED);
+        resp->mrRegisters = __atomic_load_n(&ivars->fPerfMrRegisters, __ATOMIC_RELAXED);
+        resp->mrDeregisters = __atomic_load_n(&ivars->fPerfMrDeregisters, __ATOMIC_RELAXED);
+        resp->mrBytes = __atomic_load_n(&ivars->fPerfMrBytes, __ATOMIC_RELAXED);
+        resp->copiedBytes = __atomic_load_n(&ivars->fPerfCopiedBytes, __ATOMIC_RELAXED);
+        resp->doorbells = __atomic_load_n(&ivars->fPerfDoorbells, __ATOMIC_RELAXED);
+        resp->cqeConsumed = __atomic_load_n(&ivars->fPerfCqeConsumed, __ATOMIC_RELAXED);
+        resp->cqeErrors = __atomic_load_n(&ivars->fPerfCqeErrors, __ATOMIC_RELAXED);
+        resp->cqEvents = ivars->fCore ? ivars->fCore->CompletionEventCount() : 0;
+        resp->cqEventWakeups = ivars->fCore ?
+            ivars->fCore->CompletionWakeupCount() : 0;
+        return kIOReturnSuccess;
+    }
     case kMlxUCMethodQueryStats: {
         struct mlx_stats_resp *resp = (struct mlx_stats_resp *)out;
         memset(resp, 0, sizeof(*resp));
@@ -871,6 +1103,7 @@ MlxUserClient::ExternalMethod(uint64_t selector,
                 MlxQPContext *qp = qpTable->Lookup(
                     *(const uint32_t *)record->getBytesNoCopy());
                 if (!qp) continue;
+                (void)qpTable->RefreshFastPathState(qp->qpNum);
                 resp->postedSend       += qp->postedSend;
                 resp->postedRead       += qp->postedRead;
                 resp->postedWrite      += qp->postedWrite;
@@ -1126,6 +1359,9 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         if (!raw.pd || !Owns(ivars->fOwnedPd, raw.pd) || !req->startAddr ||
             !req->length || req->startAddr + req->length < req->startAddr)
             return kIOReturnBadArgument;
+        MlxClientPinReservation pinBudget(ivars,
+            mlxPinnedCharge(req->length, IOVMPageSize));
+        if (!pinBudget.ok()) return kIOReturnNoResources;
         if (!QuotaReserve(ivars, &ivars->fQuotaMr, ClientMrLimit(ivars)))
             return kIOReturnNoResources;
         if (!QuotaReserveMkey(ivars)) {
@@ -1151,13 +1387,20 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             uint32_t rawMr = resp->mrHandle;
             uint32_t token = TokenCreate(ivars, MLX_T_MR, rawMr);
             if (!token || !AddOwned(ivars->fOwnedMr, rawMr)) {
-                ivars->fRoce->DeregMR(rawMr);
+                if (ivars->fRoce->DeregMR(rawMr) != kIOReturnSuccess) {
+                    ivars->fCore->EnterDmaQuarantine(0x4d52544fu);
+                    pinBudget.commit();
+                }
                 QuotaReleaseMkey(ivars);
                 QuotaRelease(ivars, &ivars->fQuotaMr);
                 return kIOReturnNoMemory;
             }
             resp->mrHandle = token;
+            pinBudget.commit();
+            MlxPerfAdd(&ivars->fPerfMrRegisters);
+            MlxPerfAdd(&ivars->fPerfMrBytes, req->length);
         } else {
+            if (ivars->fCore->DmaQuarantined()) pinBudget.commit();
             QuotaReleaseMkey(ivars);
             QuotaRelease(ivars, &ivars->fQuotaMr);
         }
@@ -1259,17 +1502,24 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             !Owns(ivars->fOwnedMr, raw.mrHandle) ||
             !Owns(ivars->fOwnedQp, raw.qpn))
             return kIOReturnNotPermitted;
-        return ivars->fRoce->BindMW(&raw, (struct mlx_bind_mw_resp *)out);
+        return MlxPerfDoorbell(ivars,
+            ivars->fRoce->BindMW(&raw, (struct mlx_bind_mw_resp *)out));
     }
     case kMlxUCMethodDeregMR: {
         uint32_t token = *(const uint32_t *)in;
         uint32_t h = TokenResolve(ivars, token, MLX_T_MR);
         if (!h || !RemoveOwned(ivars->fOwnedMr, h))
             return kIOReturnNotPermitted;
+        MlxMRContext *pinned = ivars->fRoce->GetMR()->Lookup(h);
+        uint64_t charge = pinned ? pinned->dma.chargedBytes : 0;
         kern_return_t r = ivars->fRoce->DeregMR(h);
         if (r != kIOReturnSuccess) AddOwned(ivars->fOwnedMr, h);
         else {
             (void)TokenDrop(ivars, token, MLX_T_MR, NULL);
+            MlxPerfAdd(&ivars->fPerfMrDeregisters);
+            IOLockLock(ivars->fOwnedLock);
+            ivars->fPinnedBytes -= charge;
+            IOLockUnlock(ivars->fOwnedLock);
             QuotaReleaseMkey(ivars);
             QuotaRelease(ivars, &ivars->fQuotaMr);
         }
@@ -1384,16 +1634,65 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         *(uint64_t *)out = ivars->fRoce->GetCQ()->GetCompletions(h);
         return kIOReturnSuccess;
     }
+    case kMlxUCMethodWaitCqEvent: {
+        const struct mlx_wait_cq_event_req *req =
+            (const struct mlx_wait_cq_event_req *)in;
+        struct mlx_wait_cq_event_resp *resp =
+            (struct mlx_wait_cq_event_resp *)out;
+        kern_return_t r = ivars->fCore->WaitCompletionEvent(
+            req->generation, req->timeoutMs, &resp->generation);
+        /* A timeout is not an error here. Returning non-success makes
+         * DriverKit drop the output struct, and the client then loses its
+         * generation snapshot and re-enters the wait with a stale value, so
+         * every other wait becomes a wasted immediate return. The generation
+         * itself carries the answer: unchanged means nothing happened. */
+        return r == kIOReturnTimeout ? kIOReturnSuccess : r;
+    }
+    case kMlxUCMethodModifyCqModeration: {
+        const struct mlx_modify_cq_moderation_req *req =
+            (const struct mlx_modify_cq_moderation_req *)in;
+        struct mlx_modify_cq_moderation_req raw = *req;
+        raw.cqHandle = TokenResolve(ivars, req->cqHandle, MLX_T_CQ);
+        if (!raw.cqHandle || !Owns(ivars->fOwnedCq, raw.cqHandle))
+            return kIOReturnNotPermitted;
+        if (req->cqPeriod > 0xfffu) return kIOReturnBadArgument;
+        return ivars->fRoce->ModifyCqModeration(&raw);
+    }
     case kMlxUCMethodArmCQ: {
         const struct mlx_arm_cq_req *req = (const struct mlx_arm_cq_req *)in;
         struct mlx_arm_cq_req raw = *req;
         raw.cqHandle = TokenResolve(ivars, req->cqHandle, MLX_T_CQ);
         if (!raw.cqHandle || !Owns(ivars->fOwnedCq, raw.cqHandle))
             return kIOReturnNotPermitted;
-        return ivars->fRoce->ArmCQ(&raw);
+        return MlxPerfDoorbell(ivars, ivars->fRoce->ArmCQ(&raw));
     }
-    case kMlxUCMethodGetAsyncEvent:
-        return ivars->fRoce->GetAsyncEvent((struct mlx_async_event *)out);
+    case kMlxUCMethodSyncQpTails: {
+        const struct mlx_sync_qp_tails_req *req =
+            (const struct mlx_sync_qp_tails_req *)in;
+        struct mlx_sync_qp_tails_req raw = *req;
+        raw.qpn = TokenResolve(ivars, req->qpn, MLX_T_QP);
+        if (!raw.qpn || !Owns(ivars->fOwnedQp, raw.qpn))
+            return kIOReturnNotPermitted;
+        return ivars->fRoce->GetQP()->SyncQpTails(raw.qpn, raw.sqTail, raw.rqTail);
+    }
+    case kMlxUCMethodGetAsyncEvent: {
+        struct mlx_async_event *event = (struct mlx_async_event *)out;
+        kern_return_t r = ivars->fRoce->GetAsyncEvent(event);
+        if (r != kIOReturnSuccess) return r;
+        /* DEXT events carry raw firmware handles. Publish only this client's
+         * generation token; an unowned or stale object must never cross the
+         * UserClient boundary as if it were a valid ibverbs object. */
+        if (event->elementType == MLX_ASYNC_ELEMENT_CQ) {
+            uint32_t token = TokenForRaw(ivars, MLX_T_CQ, event->elementHandle);
+            if (!token) return kIOReturnNotPermitted;
+            event->elementHandle = token;
+        } else if (event->elementType == MLX_ASYNC_ELEMENT_QP) {
+            uint32_t token = TokenForRaw(ivars, MLX_T_QP, event->elementHandle);
+            if (!token) return kIOReturnNotPermitted;
+            event->elementHandle = token;
+        }
+        return kIOReturnSuccess;
+    }
     case kMlxUCMethodUpdateCqConsumer: {
         const struct mlx_update_cq_consumer_req *req =
             (const struct mlx_update_cq_consumer_req *)in;
@@ -1413,11 +1712,16 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnNotPermitted;
         struct mlx_poll_cq_resp *resp = (struct mlx_poll_cq_resp *)out;
         kern_return_t r = ivars->fRoce->GetCQ()->PollCQ(&raw, resp);
-        if (r == kIOReturnSuccess)
+        if (r == kIOReturnSuccess) {
+            uint32_t errors = 0;
             for (uint32_t i = 0; i < resp->count; i++) {
                 uint32_t t = TokenForRaw(ivars, MLX_T_QP, resp->wc[i].qpNum);
                 if (t) resp->wc[i].qpNum = t;
+                if (resp->wc[i].status != MLX_UC_WC_SUCCESS) errors++;
             }
+            if (resp->count) MlxPerfAdd(&ivars->fPerfCqeConsumed, resp->count);
+            if (errors) MlxPerfAdd(&ivars->fPerfCqeErrors, errors);
+        }
         return r;
     }
     case kMlxUCMethodPostSend: {
@@ -1430,7 +1734,7 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         MlxMRContext *mr = ivars->fRoce->GetMR()->LookupByLkey(req->sge.lkey);
         if (!mr || !Owns(ivars->fOwnedMr, mr->mrHandle))
             return kIOReturnNotPermitted;
-        return ivars->fRoce->GetQP()->PostSend(&raw);
+        return MlxPerfDoorbell(ivars, ivars->fRoce->GetQP()->PostSend(&raw));
     }
     case kMlxUCMethodPostRecv: {
         const struct mlx_post_recv_req *req =
@@ -1462,7 +1766,8 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             if (!mr || !Owns(ivars->fOwnedMr, mr->mrHandle))
                 return kIOReturnNotPermitted;
         }
-        return ivars->fRoce->GetQP()->PostSendBatch(raw.wr, batch->count);
+        return MlxPerfDoorbell(ivars,
+            ivars->fRoce->GetQP()->PostSendBatch(raw.wr, batch->count));
     }
     case kMlxUCMethodSyncRecvFastPath: {
         const struct mlx_sync_recv_fast_path_req *batch =
@@ -1513,7 +1818,10 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             (const struct mlx_sync_send_sge_req *)in;
         struct mlx_sync_send_sge_req raw = *req;
         raw.qpn = TokenResolve(ivars, req->qpn, MLX_T_QP);
-        if (!ivars->fFastBundle || !req->numSge || req->numSge > MLX_UC_MAX_SGE ||
+        bool zeroWriteImm = req->opcode == MLX_UC_WR_RDMA_WRITE_IMM &&
+                            req->numSge == 0;
+        if (!ivars->fFastBundle || (!zeroWriteImm && !req->numSge) ||
+            req->numSge > MLX_UC_MAX_SGE ||
             !raw.qpn || !Owns(ivars->fOwnedQp, raw.qpn))
             return kIOReturnNotPermitted;
         for (uint32_t i = 0; i < req->numSge; i++) {
@@ -1543,7 +1851,9 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             (const struct mlx_post_send_sge_req *)in;
         struct mlx_post_send_sge_req raw = *req;
         raw.qpn = TokenResolve(ivars, req->qpn, MLX_T_QP);
-        if (!req->numSge || req->numSge > MLX_UC_MAX_SGE ||
+        bool zeroWriteImm = req->opcode == MLX_UC_WR_RDMA_WRITE_IMM &&
+                            req->numSge == 0;
+        if ((!zeroWriteImm && !req->numSge) || req->numSge > MLX_UC_MAX_SGE ||
             !raw.qpn || !Owns(ivars->fOwnedQp, raw.qpn))
             return kIOReturnBadArgument;
         for (uint32_t i = 0; i < req->numSge; i++) {
@@ -1551,7 +1861,7 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             if (!mr || !Owns(ivars->fOwnedMr, mr->mrHandle))
                 return kIOReturnNotPermitted;
         }
-        return ivars->fRoce->GetQP()->PostSendSge(&raw);
+        return MlxPerfDoorbell(ivars, ivars->fRoce->GetQP()->PostSendSge(&raw));
     }
     case kMlxUCMethodPostSendInline: {
         const struct mlx_post_send_inline_req *req =
@@ -1565,7 +1875,7 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         raw.qpn = TokenResolve(ivars, req->qpn, MLX_T_QP);
         if (!raw.qpn || !Owns(ivars->fOwnedQp, raw.qpn))
             return kIOReturnNotPermitted;
-        return ivars->fRoce->PostSendInline(&raw);
+        return MlxPerfDoorbell(ivars, ivars->fRoce->PostSendInline(&raw));
     }
     case kMlxUCMethodPostSendAtomic: {
         const struct mlx_post_send_atomic_req *req =
@@ -1579,7 +1889,7 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         raw.qpn = TokenResolve(ivars, req->qpn, MLX_T_QP);
         if (!raw.qpn || !Owns(ivars->fOwnedQp, raw.qpn))
             return kIOReturnNotPermitted;
-        return ivars->fRoce->PostSendAtomic(&raw);
+        return MlxPerfDoorbell(ivars, ivars->fRoce->PostSendAtomic(&raw));
     }
     case kMlxUCMethodPostLocalInv: {
         const struct mlx_post_local_inv_req *req =
@@ -1589,7 +1899,8 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         MlxMRContext *mr = ivars->fRoce->GetMR()->LookupByRkey(req->invalidateRkey);
         if (!raw.qpn || !Owns(ivars->fOwnedQp, raw.qpn) || !mr ||
             !Owns(ivars->fOwnedMr, mr->mrHandle)) return kIOReturnNotPermitted;
-        kern_return_t r = ivars->fRoce->GetQP()->PostLocalInv(&raw);
+        kern_return_t r = MlxPerfDoorbell(ivars,
+            ivars->fRoce->GetQP()->PostLocalInv(&raw));
         if (r == kIOReturnSuccess)
             r = ivars->fRoce->GetMR()->InvalidateKey(req->invalidateRkey);
         return r;
@@ -1626,9 +1937,9 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             if (!raw.childHandles[i] || !Owns(ivars->fOwnedMr, raw.childHandles[i]))
                 return kIOReturnNotPermitted;
         }
-        return ivars->fRoce->GetQP()->PostUmrKlm(
+        return MlxPerfDoorbell(ivars, ivars->fRoce->GetQP()->PostUmrKlm(
             raw.qpn, raw.mrHandle, raw.childHandles, raw.childCount,
-            raw.wrId);
+            raw.wrId));
     }
     case kMlxUCMethodPostRecvBatch: {
         const struct mlx_post_recv_batch_req *batch =

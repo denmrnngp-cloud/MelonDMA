@@ -344,6 +344,9 @@ run_case() {
         *) echo "Invalid PHASE3_CQ_MODE: $cq_mode" >&2; return 2 ;;
     esac
     if [[ "$signal_all" == "1" ]]; then gate_args+=(--signal-all); fi
+    if [[ "${PHASE2_INDIRECT_MR:-0}" == "1" ]]; then
+        gate_args+=(--indirect-mr)
+    fi
     if [[ "$WARMUP_ITERS" != "0" ]]; then
         gate_args+=(--warmup-size "$WARMUP_SIZE" --warmup-iters "$WARMUP_ITERS")
     fi

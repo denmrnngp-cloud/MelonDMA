@@ -30,8 +30,10 @@ int main(int argc, char **argv) {
     /* ABI feature negotiation. */
     struct rdma_abi_attr abi = {};
     check(rdma_query_abi(dev, &abi) == 0 &&
-          (abi.features & RDMA_FEATURE_INLINE) && (abi.features & RDMA_FEATURE_ATOMIC),
-          "ABI advertises INLINE and ATOMIC feature bits");
+          (abi.features & RDMA_FEATURE_INLINE) &&
+          (abi.features & RDMA_FEATURE_ATOMIC) &&
+          (abi.features & RDMA_FEATURE_TRUSTED_FAST_PATH),
+          "ABI advertises INLINE, ATOMIC and TRUSTED_FAST_PATH feature bits");
 
     /* Device capabilities. */
     struct rdma_device_attr devattr = {};

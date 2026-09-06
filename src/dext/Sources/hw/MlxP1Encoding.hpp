@@ -54,6 +54,7 @@ struct MlxP1GeneralCaps {
     bool bf;
     uint8_t logMaxSrqSz;
     uint8_t logPgSz;      /* adapter min page size (MKC log_page_size lower bound) */
+    uint8_t maxMkeyLogEntitySizeMtt; /* HCA max log_page_size for MTT mkeys (0x3aa, 6b) */
     bool nicFlowTable;
     bool ethNetOffloads;
     uint8_t numVhcaPorts;
@@ -177,6 +178,7 @@ static inline bool mlxP1ParseGeneralCaps(const uint8_t *cap, size_t length,
     out->bf = mlxGetBits(cap, 0x260, 1) != 0;
     out->logMaxSrqSz = static_cast<uint8_t>(mlxGetBits(cap, 0x80, 8));
     out->logPgSz = static_cast<uint8_t>(mlxGetBits(cap, 0x258, 8));
+    out->maxMkeyLogEntitySizeMtt = static_cast<uint8_t>(mlxGetBits(cap, 0x3aa, 6));
     out->logBfRegSize = static_cast<uint8_t>(mlxGetBits(cap, 0x26b, 5));
     out->roceRwSupported = mlxGetBits(cap, 0x3a1, 1) != 0;
     out->numVhcaPorts = static_cast<uint8_t>(mlxGetBits(cap, 0x610, 8));

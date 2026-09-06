@@ -31,6 +31,11 @@ struct MlxDMAReq {
     IODMACommand      *dmaCmd;      /* retained IOMMU mapping */
     uint64_t            pageDMA[MLX_MAX_DMA_PAGES]; /* 4 KiB HCA PAS entries */
     uint32_t            numPages;
+    uint64_t            iovaBase;   /* first IOVA of the mapped range */
+    bool                contiguous; /* all segments form one IOVA range */
+    IOAddressSegment    segments[32];
+    uint32_t            segmentCount;
+    uint64_t            chargedBytes;
 };
 
 class MlxDMA {
@@ -44,9 +49,7 @@ public:
     /* Pin client memory for DMA (See mlx5_ib_reg_user_mr → ib_umem_get). */
     kern_return_t   Pin(IOMemoryDescriptor *mem, MlxDMAReq *req);
     void            Unpin(MlxDMAReq *req);
-
-    /* Look up the IOVA of a client VA (for post_send data segment). */
-    uint64_t        LookupPhys(MlxDMAReq *req, uint64_t va);
+    void            GetPinnedStats(uint64_t *bytes, uint64_t *peak, uint64_t *failures);
 
     /* DMA quarantine: when firmware teardown cannot be trusted, retain the
      * mappings rather than freeing them (REMEDIATION_PLAN §3). */

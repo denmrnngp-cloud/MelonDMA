@@ -35,6 +35,8 @@ int main(void)
     check(rdma_query_abi(NULL, NULL) < 0, "query_abi(NULL) guarded");
     check(rdma_query_device(NULL, NULL) < 0, "query_device(NULL) guarded");
     check(rdma_query_health(NULL, NULL) < 0, "query_health(NULL) guarded");
+    check(rdma_fast_path_get_stats(NULL, NULL) < 0,
+          "fast_path_get_stats(NULL) guarded");
     if (dev) {
         struct rdma_health_attr health = {};
         check(rdma_query_health(dev, &health) == 0 && health.healthy == 1,

@@ -62,12 +62,12 @@ SHIM_HDR   := usermode/librdma_shim/librdma_shim.h
 VERBS_SRC  := usermode/libibverbs_compat/verbs_compat.c
 VERBS_HDR  := usermode/libibverbs_compat/include/infiniband/verbs.h
 
-.PHONY: all check-host check-dext check-plist check-iig dext sign app shim verbs-compat clean probe phase2-gate phase3-gate phase3-direct-uar-gate immediate-gate write-immediate-gate cq-event-gate r5-gate p0-gate stable-driver-gate production-preflight production-package p2-2-gate p3-gate p3-local-gate
+.PHONY: all check-host check-dext check-plist check-iig dext sign app shim verbs-compat clean probe phase2-gate phase3-gate phase3-direct-uar-gate immediate-gate write-immediate-gate cq-event-gate r5-gate p0-gate stable-driver-gate production-preflight production-package p2-2-gate p3-gate p3-local-gate datapath-bench metal-dma-gate
 
 all: check-host check-dext shim probe
 
 # ---- host self-test: portable IFC encoders + bit helpers ----
-check-host: build/mlx_host_tests build/mlx_shim_tests build/mlx_service_match_tests build/mlx_ibverbs_tests build/mlx_mkey_indirect_tests build/mlx_abi_properties_tests build/mlx_mkey_index_tests
+check-host: build/mlx_host_tests build/mlx_shim_tests build/mlx_service_match_tests build/mlx_ibverbs_tests build/mlx_mkey_indirect_tests build/mlx_abi_properties_tests build/mlx_mkey_index_tests build/mlx_safety_tests
 	@echo "=== running host encoder tests ==="
 	./build/mlx_host_tests
 	@echo "=== running shim smoke tests ==="
@@ -80,6 +80,41 @@ check-host: build/mlx_host_tests build/mlx_shim_tests build/mlx_service_match_te
 	./build/mlx_abi_properties_tests
 	@echo "=== running mkey hash-index tests ==="
 	./build/mlx_mkey_index_tests
+	./build/mlx_mkey_indirect_tests
+	./build/mlx_safety_tests
+
+build/mlx_safety_tests: Tests/test_safety.cpp Sources/core/MlxSafety.hpp usermode/metal/MlxMetalSlotState.hpp | build
+	$(HOST_CXX) $(HOST_CFLAGS) $(HOST_INCS) $< -o $@
+
+.PHONY: metal-contract check-metal-contract
+metal-contract: build/libmlx_metal.dylib
+build/libmlx_metal.dylib: usermode/metal/MlxRegisteredMetalBuffer.mm usermode/metal/MlxRegisteredMetalBuffer.h usermode/metal/MlxMetalSlotState.hpp build/libibverbs.dylib
+	clang++ -std=c++17 -fobjc-arc -Wall -Wextra -Werror -O2 -dynamiclib \
+	    -I usermode/libibverbs_compat/include -framework Metal -framework Foundation \
+	    -L build -libverbs -Wl,-rpath,@loader_path \
+	    -install_name @rpath/libmlx_metal.dylib $< -o $@
+
+build/mlx_metal_contract_tests: Tests/test_metal_contract.mm usermode/metal/MlxRegisteredMetalBuffer.mm usermode/metal/MlxRegisteredMetalBuffer.h usermode/metal/MlxMetalSlotState.hpp | build
+	clang++ -std=c++17 -fobjc-arc -Wall -Wextra -Werror -g \
+	    -fsanitize=address,undefined -fno-omit-frame-pointer \
+	    -I usermode/libibverbs_compat/include -framework Metal -framework Foundation \
+	    Tests/test_metal_contract.mm usermode/metal/MlxRegisteredMetalBuffer.mm -o $@
+
+check-metal-contract: build/mlx_metal_contract_tests
+	./build/mlx_metal_contract_tests
+
+build/mlx_runtime_gate: tools/mlx_runtime_gate.c Sources/userclient/MlxUCIO.h Sources/userclient/MlxServiceMatch.h | build
+	clang -std=c11 -Wall -Wextra -Werror -O2 -I Sources/userclient \
+	    -framework IOKit -framework CoreFoundation $< -o $@
+	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
+	    --entitlements tools/reinit.entitlements $@
+
+build/mlx_metal_contract_live: tools/mlx_metal_contract_live.mm build/libmlx_metal.dylib
+	clang++ -std=c++17 -fobjc-arc -Wall -Wextra -Werror -O2 \
+	    -I usermode/libibverbs_compat/include -framework Metal -framework Foundation \
+	    -L build -lmlx_metal -libverbs -Wl,-rpath,@loader_path $< -o $@
+	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
+	    --entitlements tools/reinit.entitlements $@
 
 build/mlx_host_tests: Tests/test_all.cpp $(PORTABLE_HDR) | build
 	$(HOST_CXX) $(HOST_CFLAGS) $(HOST_INCS) Tests/test_all.cpp -o $@
@@ -89,7 +124,7 @@ build/mlx_shim_tests: Tests/test_shim.c build/librdma_shim.dylib | build
 	clang -std=c11 -Wall -Wextra -Werror -g \
 	    -isysroot $(shell xcrun --sdk macosx --show-sdk-path) -arch arm64 \
 	    -I usermode/librdma_shim -I Sources/userclient -I Sources/hw \
-	    -L build -lrdma_shim -rpath $(CURDIR)/build \
+	    -L build -lrdma_shim -Wl,-rpath,@loader_path -rpath $(CURDIR)/build \
 	    Tests/test_shim.c -o $@
 
 build/mlx_service_match_tests: Tests/test_service_match.c Sources/userclient/MlxServiceMatch.h | build
@@ -128,24 +163,24 @@ build/mlx_ibverbs_tests: Tests/test_ibverbs_compat.c build/libibverbs.dylib | bu
 # kernel rejects the com.apple.developer.* entitlement without a trusted
 # Team ID, so IOServiceOpen returns kIOReturnNotPermitted (0xe00002e2).
 build/mlx_probe: tools/mlx_probe.c Sources/userclient/MlxUCIO.h \
-                 Sources/userclient/MlxServiceMatch.h tools/reinit.entitlements | build
+                 Sources/userclient/MlxServiceMatch.h tools/diagnostic.entitlements | build
 	clang -std=c11 -Wall -Wextra -Werror -g -O0 \
 	    -isysroot $(shell xcrun --sdk macosx --show-sdk-path) -arch arm64 \
 	    -I Sources/userclient -I Sources/hw \
 	    -framework IOKit -framework CoreFoundation \
 	    tools/mlx_probe.c -o $@
 	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
-	    --entitlements tools/reinit.entitlements $@
-	@echo "=== built mlx_probe: $@ (signed with $(SIGN_ID)) ==="
+	    --entitlements tools/diagnostic.entitlements $@
+	@echo "=== built mlx_probe: $@ (diagnostic entitlement, signed with $(SIGN_ID)) ==="
 
 build/mlx_stable_gate: tools/mlx_stable_gate.c Sources/userclient/MlxUCIO.h \
-                       Sources/userclient/MlxServiceMatch.h tools/reinit.entitlements | build
+                       Sources/userclient/MlxServiceMatch.h tools/diagnostic.entitlements | build
 	clang -std=c11 -Wall -Wextra -Werror -g -O2 \
 	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
 	    -I Sources/userclient -framework IOKit -framework CoreFoundation \
 	    tools/mlx_stable_gate.c -o $@
 	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
-	    --entitlements tools/reinit.entitlements $@
+	    --entitlements tools/diagnostic.entitlements $@
 
 stable-driver-gate: build/mlx_stable_gate
 	@chmod +x tools/run_stable_driver_gate.sh
@@ -298,7 +333,7 @@ build/mlx_phase2_gate: tools/mlx_phase2_gate.c build/librdma_shim.dylib \
 	clang -std=c11 -Wall -Wextra -Werror -g -O2 \
 	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
 	    -I usermode/librdma_shim -I Sources/userclient -I Sources/hw \
-	    -L build -lrdma_shim -rpath $(CURDIR)/build \
+	    -L build -lrdma_shim -Wl,-rpath,@loader_path -rpath $(CURDIR)/build \
 	    -framework IOKit -framework CoreFoundation \
 	    tools/mlx_phase2_gate.c -o $@
 	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
@@ -306,6 +341,36 @@ build/mlx_phase2_gate: tools/mlx_phase2_gate.c build/librdma_shim.dylib \
 
 phase2-gate: build/mlx_phase2_gate
 	@echo "=== built Phase 2 hardware gate: $< ==="
+
+# Apple-Silicon UMA/Metal variant of the Phase 2 peer gate.  It uses the same
+# wire protocol and RDMA implementation, but supplies a shared+untracked
+# MTLBuffer as the registered MR and orders GPU producer/consumer kernels
+# around the RDMA completion boundary.
+build/mlx_metal_phase2.o: tools/mlx_phase2_gate.c build/librdma_shim.dylib \
+                         usermode/librdma_shim/librdma_shim_diag.h | build
+	clang -std=c11 -Wall -Wextra -Werror -g -O2 \
+	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
+	    -DMLX_GATE_EXTERNAL_MEMORY_PROVIDER=1 \
+	    -I usermode/librdma_shim -I Sources/userclient -I Sources/hw \
+	    -c tools/mlx_phase2_gate.c -o $@
+
+build/mlx_metal_memory.o: tools/mlx_metal_memory.m | build
+	clang -fobjc-arc -Wall -Wextra -Werror -g -O2 \
+	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
+	    -c tools/mlx_metal_memory.m -o $@
+
+build/mlx_metal_dma_gate: build/mlx_metal_phase2.o build/mlx_metal_memory.o \
+                          build/librdma_shim.dylib tools/reinit.entitlements | build
+	clang -arch arm64 build/mlx_metal_phase2.o build/mlx_metal_memory.o \
+	    -L build -lrdma_shim -Wl,-rpath,@loader_path -rpath $(CURDIR)/build \
+	    -framework IOKit -framework CoreFoundation -framework Foundation \
+	    -framework Metal -o $@
+	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
+	    --entitlements tools/reinit.entitlements $@
+
+metal-dma-gate: build/mlx_metal_dma_gate
+	@chmod +x tools/run_metal_dma_gate.sh
+	@echo "=== built Metal shared-UMA RDMA gate: $< ==="
 
 # P0.2/P0.3 gates are self-contained (no librdma_shim) but still need the
 # userclient-access entitlement to open the DEXT — an unsigned binary gets
@@ -416,11 +481,78 @@ build/mlx_p3_gate: tools/mlx_p3_gate.c build/libibverbs.dylib tools/reinit.entit
 	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
 	    --entitlements tools/reinit.entitlements $@
 
+# Large-MR diagnostic: measures ibv_reg_mr split+indirect cost vs size.
+# Findings (2026-09-03): ~1 ms per 480-page child; hard-fails at 128 children
+# (240 MiB) with kIOReturnNoSpace — DART/IOVA resource limit, not the
+# 240-child KLM cap. One-shot large-MR registration is therefore ~30x the
+# memcpy it would save in a KV handoff -> one-sided KV is a net loss.
+build/mlx_large_mr_test: tools/mlx_large_mr_test.c build/libibverbs.dylib tools/reinit.entitlements | build
+	clang -std=c11 -Wall -Wextra -Werror -g -O2 \
+	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
+	    -I usermode/libibverbs_compat/include -L build -libverbs \
+	    -rpath $(CURDIR)/build -framework IOKit -framework CoreFoundation \
+	    tools/mlx_large_mr_test.c -o $@
+	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
+	    --entitlements tools/reinit.entitlements $@
+
+# P0 telemetry smoke: QueryPerf counters before/after one MR lifecycle.
+build/mlx_irq_probe: tools/mlx_irq_probe.c build/librdma_shim.dylib tools/reinit.entitlements | build
+	clang -std=c11 -Wall -Wextra -Werror -g -O2 \
+	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
+	    -I usermode/librdma_shim -L build -lrdma_shim \
+	    -rpath $(CURDIR)/build -framework IOKit -framework CoreFoundation \
+	    tools/mlx_irq_probe.c -o $@
+	codesign --force --options runtime --timestamp=none --sign "Apple Development" \
+	    --entitlements tools/reinit.entitlements $@
+
+build/mlx_cq_idle_cpu: tools/mlx_cq_idle_cpu.c build/libibverbs.dylib tools/reinit.entitlements | build
+	clang -std=c11 -Wall -Wextra -Werror -g -O2 \
+	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
+	    -I usermode/libibverbs_compat/include -L build -libverbs \
+	    -rpath $(CURDIR)/build -framework IOKit -framework CoreFoundation \
+	    tools/mlx_cq_idle_cpu.c -o $@
+	codesign --force --options runtime --timestamp=none --sign "Apple Development" \
+	    --entitlements tools/reinit.entitlements $@
+
+build/mlx_perf_test: tools/mlx_perf_test.c build/libibverbs.dylib tools/reinit.entitlements | build
+	clang -std=c11 -Wall -Wextra -Werror -g -O2 \
+	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
+	    -I usermode/libibverbs_compat/include -L build -libverbs \
+	    -rpath $(CURDIR)/build -framework IOKit -framework CoreFoundation \
+	    tools/mlx_perf_test.c -o $@
+	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
+	    --entitlements tools/reinit.entitlements $@
+
+# P0 datapath baseline: per-message telemetry over a loopback RDMA WRITE
+# (post one, poll one).  Env: MELONDMA_DIRECT_UAR / MELONDMA_DIRECT_CQ.
+build/mlx_datapath_bench: tools/mlx_datapath_bench.c build/libibverbs.dylib tools/reinit.entitlements | build
+	clang -std=c11 -Wall -Wextra -Werror -g -O2 \
+	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
+	    -I usermode/libibverbs_compat/include -L build -libverbs \
+	    -rpath $(CURDIR)/build -framework IOKit -framework CoreFoundation \
+	    tools/mlx_datapath_bench.c -o $@
+	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
+	    --entitlements tools/reinit.entitlements $@
+
+datapath-bench: build/mlx_datapath_bench
+	@echo "=== built P0 datapath baseline bench: $< ==="
+
+# Large-MR loopback: proves the coalesced MTT translates VA->IOVA correctly,
+# not just that CREATE_MKEY was firmware-accepted (self RDMA_WRITE + memcmp).
+build/mlx_large_mr_dma: tools/mlx_large_mr_dma.c build/libibverbs.dylib tools/reinit.entitlements | build
+	clang -std=c11 -Wall -Wextra -Werror -g -O2 \
+	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
+	    -I usermode/libibverbs_compat/include -L build -libverbs \
+	    -rpath $(CURDIR)/build -framework IOKit -framework CoreFoundation \
+	    tools/mlx_large_mr_dma.c -o $@
+	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \
+	    --entitlements tools/reinit.entitlements $@
+
 build/mlx_p3_local_gate: tools/mlx_p3_local_gate.c build/librdma_shim.dylib \
                          tools/reinit.entitlements | build
 	clang -std=c11 -Wall -Wextra -Werror -g -O2 \
 	    -isysroot $$(xcrun --sdk macosx --show-sdk-path) -arch arm64 \
-	    -I usermode/librdma_shim -L build -lrdma_shim \
+	    -I usermode/librdma_shim -L build -lrdma_shim -Wl,-rpath,@loader_path \
 	    -rpath $(CURDIR)/build -framework IOKit -framework CoreFoundation \
 	    tools/mlx_p3_local_gate.c -o $@
 	codesign --force --options runtime --timestamp=none --sign "$(SIGN_ID)" \

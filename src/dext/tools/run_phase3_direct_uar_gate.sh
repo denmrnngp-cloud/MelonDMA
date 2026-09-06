@@ -18,6 +18,7 @@ rm -f "$LOG_FILE"
 set +e
 MELONDMA_FAST_PATH=1 \
 MELONDMA_DIRECT_UAR=1 \
+MELONDMA_DEBUG_POST=1 \
 PHASE2_MULTI_SGE_GATE=1 \
 PHASE2_MULTI_SGE_COUNT="${PHASE2_MULTI_SGE_COUNT:-4}" \
 PHASE2_SMOKE_ONLY=1 \
@@ -31,7 +32,9 @@ if [[ "$status" != "0" ]]; then
 fi
 
 # Userspace evidence proves the mapping and direct publication path selected.
-for marker in "direct SQ mapped" "direct SQ synchronized SGE count=" "DIRECT_UAR_STATS"; do
+# The SGE sync diagnostic is emitted only for the kernel-mediated path; trusted
+# fast-path QPs publish metadata in the mapped shadow page instead.
+for marker in "direct SQ mapped" "DIRECT_UAR_STATS"; do
     if ! grep -F "$marker" "$LOG_FILE" >/dev/null; then
         echo "P3_DIRECT_UAR FAIL: missing userspace evidence: $marker" >&2
         exit 20
@@ -40,7 +43,7 @@ done
 
 stats_line="$(grep -F 'DIRECT_UAR_STATS' "$LOG_FILE" | tail -1)"
 for field in 'mapped_qps=[1-9]' 'direct_wrs=[1-9]' 'direct_doorbells=[1-9]' \
-             'direct_recv_wrs=[1-9]' 'direct_cq_consumers=[1-9]'; do
+             'direct_recv_wrs=[1-9]' 'fallback_send=0' 'fallback_recv=0'; do
     if ! printf '%s\n' "$stats_line" | grep -E "$field" >/dev/null; then
         echo "P3_DIRECT_UAR FAIL: counter check failed: $field" >&2
         exit 21

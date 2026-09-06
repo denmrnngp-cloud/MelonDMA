@@ -37,6 +37,8 @@ struct MlxCQContext {
     uint32_t    eqNumber;
     uint32_t    compVector;
     uint32_t    armSn;
+    uint32_t    modPeriod;      /* applied MODIFY_CQ moderation, microseconds */
+    uint32_t    modMaxCount;    /* applied MODIFY_CQ moderation, CQEs */
     void       (*completionHandler)(uint32_t cqn, void *context);
     void       *completionContext;
     uint64_t    completions;
@@ -59,11 +61,19 @@ public:
                               MlxClientDoorbellBundle *bundle = NULL);
     kern_return_t   DestroyCQ(uint32_t cqHandle);
 
+    /* Allocated CQ slots across every client. The completion-vector probe
+     * needs this: rebinding the completion EQ changes its EQ number, and a
+     * live CQ still carries the old one in its c_eqn. */
+    uint32_t        LiveCount();
     MlxCQContext *  Lookup(uint32_t cqHandle);
     IOMemoryDescriptor *GetCqMemDesc(uint32_t cqHandle);
     void            HandleCompletion(uint32_t cqn);
     uint64_t        GetCompletions(uint32_t cqHandle);
     kern_return_t   UpdateCqConsumer(uint32_t cqHandle, uint32_t consumerIndex);
+    /* Hardware completion moderation (MODIFY_CQ). period is in microseconds,
+     * maxCount in CQEs; either zero disables that half. */
+    kern_return_t   ModifyModeration(uint32_t cqHandle, uint32_t period,
+                                     uint32_t maxCount);
     kern_return_t   ArmCQ(uint32_t cqHandle, uint32_t solicitedOnly);
     kern_return_t   PollCQ(const struct mlx_poll_cq_req *req,
                            struct mlx_poll_cq_resp *resp);

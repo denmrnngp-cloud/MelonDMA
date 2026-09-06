@@ -5,8 +5,9 @@
  * without rewriting its verbs calls (notes/09 §2.3: chunks 256 KiB,
  * RX depth 24, 1 SGE). The control plane goes through IOConnectCallMethod
  * → MlxUserClient::ExternalMethod (selector table in MlxUCIO.h). The CQ
- * Phase 2 uses a fully kernel-mediated data path: the DEXT owns WQ/CQ/DB
- * memory, validates one-SGE WRs, rings the UAR and returns bounded CQ polls.
+ * The DEXT owns and validates WQ/CQ resources.  Trusted clients map isolated
+ * queue/UAR pages and use direct SQ/RQ/CQ by default; unsupported operations
+ * fall back to bounded, validated ExternalMethods.
  *
  * This is a host (macOS userspace) library — compiles against the macOS SDK,
  * not DriverKit. It needs the com.apple.developer.driverkit.userclient-access
@@ -50,6 +51,19 @@ struct rdma_fast_path_stats {
     uint64_t direct_cq_consumers;
     uint64_t fallback_send_batches;
     uint64_t fallback_recv_batches;
+    uint64_t shadow_publications;
+    uint64_t blue_flame_wqes;
+    uint64_t direct_poll_calls;
+    uint64_t direct_poll_empty;
+    uint64_t direct_cqes;
+    uint64_t direct_cqe_errors;
+    uint64_t kernel_poll_calls;
+    uint64_t kernel_cqes;
+    uint64_t fallback_direct_disabled;
+    uint64_t fallback_cq_unmapped;
+    uint64_t fallback_unknown_qp;
+    uint64_t fallback_missing_metadata;
+    uint64_t fallback_dext_owned;
 };
 
 /* ---- device enumeration / open ---- */
@@ -59,15 +73,16 @@ rdma_device *rdma_open_device(void);
 rdma_device *rdma_open_device_by_name(const char *name);
 void         rdma_close_device(rdma_device *dev);
 
-/* Per-client UAR/DB mappings. Direct SQ posting is opt-in with
- * MELONDMA_DIRECT_UAR=1. Direct SQ/RQ publication and CQ consumer
- * publication use the isolated per-client bundle. */
+/* Per-client UAR/DB mappings. Direct SQ/RQ/CQ is capability-driven and on by
+ * default; MELONDMA_DIRECT_UAR=0 or MELONDMA_DIRECT_CQ=0 is the diagnostic
+ * opt-out. Publication uses the isolated per-client bundle. */
 int  rdma_enable_fast_path(rdma_device *dev, struct rdma_fast_path *path);
 int  rdma_map_fast_path(rdma_device *dev, struct rdma_fast_path *path);
 void rdma_unmap_fast_path(rdma_device *dev);
 int  rdma_fast_path_get_stats(const rdma_device *dev,
                               struct rdma_fast_path_stats *stats);
 int  rdma_qp_direct_enabled(const rdma_qp *qp);
+int  rdma_qp_trusted_fast_path(const rdma_qp *qp);
 
 /* ibv_devinfo-style: list device names (caller frees with rdma_free_names). */
 int  rdma_list_devices(char ***names, int *count);
@@ -87,9 +102,17 @@ enum {
     RDMA_FEATURE_HEALTH_QUERY = 1u << 8,
     RDMA_FEATURE_INLINE       = 1u << 10,
     RDMA_FEATURE_ATOMIC       = 1u << 11,
+    RDMA_FEATURE_TRUSTED_FAST_PATH = 1u << 12,
+    RDMA_FEATURE_BLUE_FLAME = 1u << 13,
+    RDMA_FEATURE_CQ_INTERRUPT = 1u << 14,
+    RDMA_FEATURE_CQ_EVENT_WAIT = 1u << 16,
+    RDMA_FEATURE_RUNTIME_STATUS = 1u << 17,
+    RDMA_FEATURE_COHERENT_UMA_MR = 1u << 15,
 };
 struct rdma_abi_attr { uint32_t version; uint32_t features; };
 int  rdma_query_abi(rdma_device *dev, struct rdma_abi_attr *attr);
+int  rdma_wait_cq_event(rdma_device *dev, uint64_t *generation,
+                        uint32_t timeout_ms);
 
 struct rdma_device_attr {
     uint64_t fw_version;
@@ -130,6 +153,90 @@ struct rdma_health_attr {
 };
 int  rdma_query_health(rdma_device *dev, struct rdma_health_attr *attr);
 
+/* MSI-X bring-up diagnosis. setup_stage is RDMA_IRQ_STAGE_*; NONE with
+ * completion_ready set means the blocking completion path is live. Returns
+ * -ENOTSUP on a DEXT that predates the query. */
+enum {
+    RDMA_IRQ_STAGE_NONE          = 0,
+    RDMA_IRQ_STAGE_CONFIGURE     = 1,
+    RDMA_IRQ_STAGE_QUEUE         = 2,
+    RDMA_IRQ_STAGE_SOURCE        = 3,
+    RDMA_IRQ_STAGE_ACTION        = 4,
+    RDMA_IRQ_STAGE_HANDLER       = 5,
+    RDMA_IRQ_STAGE_ENABLE        = 6,
+    RDMA_IRQ_STAGE_NOT_ATTEMPTED = 7,
+};
+enum {
+    RDMA_CQEQ_STAGE_NOT_ATTEMPTED = 0,
+    RDMA_CQEQ_STAGE_ALLOC         = 1,
+    RDMA_CQEQ_STAGE_INIT          = 2,
+    RDMA_CQEQ_STAGE_CREATE        = 3,
+    RDMA_CQEQ_STAGE_OK            = 4,
+};
+struct rdma_interrupt_attr {
+    uint32_t vectors;
+    uint32_t setup_status;
+    uint32_t setup_stage;
+    uint32_t async_eqn;
+    uint32_t completion_eqn;
+    uint32_t completion_ready;
+    uint64_t completion_events;
+    uint32_t completion_eq_status;
+    uint32_t completion_eq_stage;
+    uint32_t completion_eq_syndrome;
+    uint32_t completion_eq_fw_status;
+    uint32_t completion_eq_variant;
+    uint32_t completion_eq_variant_tried;
+    uint32_t completion_eq_variant_syndrome[4];
+    uint64_t async_interrupts;
+    uint64_t completion_interrupts;
+    uint64_t eq_timer_ticks;
+    uint32_t eq_timer_period_ms;
+};
+int  rdma_query_interrupts(rdma_device *dev, struct rdma_interrupt_attr *attr);
+
+/* Hardware completion moderation. period is microseconds (0..4095), max_count
+ * is CQEs (0..65535); zero in a field disables that half. Both zero restores
+ * unmoderated behaviour. Returns -ENOTSUP on a DEXT that predates it. */
+int  rdma_modify_cq_moderation(rdma_cq *cq, uint32_t period, uint32_t max_count);
+
+/* Diagnostic: rebind the completion EQ to MSI-X index `intr` (0 or 1) and
+ * return its new EQ number. Refused with -EBUSY while any CQ is live. */
+int  rdma_probe_completion_vector(rdma_device *dev, uint32_t intr, uint32_t *eqn);
+
+struct rdma_perf {
+    uint64_t external_methods;
+    uint64_t external_method_ns;
+    uint64_t post_send_calls;
+    uint64_t post_recv_calls;
+    uint64_t poll_cq_calls;
+    uint64_t sync_fast_path_calls;
+    uint64_t sync_qp_tails_calls;
+    uint64_t arm_cq_calls;
+    uint64_t doorbells;
+    uint64_t cqe_consumed;
+    uint64_t cqe_errors;
+    uint64_t mr_registers;
+    uint64_t mr_deregisters;
+    uint64_t mr_bytes;
+    uint64_t copied_bytes;
+    /* Device-wide completion MSI-X interrupts the DEXT serviced, and this
+     * client's WaitCqEvent calls that returned a fresh generation. */
+    uint64_t cq_events;
+    uint64_t cq_event_wakeups;
+};
+int  rdma_query_perf(rdma_device *dev, struct rdma_perf *perf);
+struct rdma_runtime_status {
+    uint32_t version, size;
+    uint64_t device_epoch;
+    uint64_t pinned_bytes, peak_pinned_bytes, pin_failures;
+    uint64_t client_pinned_bytes, client_pinned_limit, device_pinned_limit;
+    uint64_t quarantine_bytes, quarantine_objects;
+    uint64_t irq_completion_eqes, timer_completion_eqes, last_completion_irq_ns;
+    uint32_t quarantined, bme_fenced, completion_eq_ready, completion_irq_proven;
+};
+int rdma_query_runtime(rdma_device *dev, struct rdma_runtime_status *status);
+
 /* DCQCN reaction-point parameters (QUERY/MODIFY_CONG_PARAMS 0x824/0x825). */
 struct rdma_cong_params {
     uint32_t rpg_min_dec_fac;
@@ -152,6 +259,10 @@ int      rdma_dealloc_pd(rdma_pd *pd);
 rdma_cq *rdma_create_cq(rdma_device *dev, uint32_t cqe_depth);
 int      rdma_destroy_cq(rdma_cq *cq);
 int      rdma_query_cq_completions(rdma_cq *cq, uint64_t *completions);
+/* Fast userspace read of the mapped CQE ring (no kernel call).  Returns the
+ * number of pending completions in the ring; -EAGAIN when the ring is not
+ * mapped (caller must fall back to rdma_query_cq_completions). */
+int      rdma_cq_pending_local(rdma_cq *cq, uint64_t *count);
 
 
 /* work completion (ibv_wc-shaped) */
@@ -194,7 +305,8 @@ struct rdma_wc {
     uint64_t atomic_result; /* RDMA_WC_WITH_ATOMIC: pre-op remote word */
 };
 
-/* poll_cq is kernel-mediated and returns at most 16 completions per call. */
+/* poll_cq returns at most 16 completions.  A mapped trusted CQ is consumed
+ * directly; unsupported or explicitly disabled cases use the kernel method. */
 int  rdma_poll_cq(rdma_cq *cq, struct rdma_wc *wc, int num);
 
 
@@ -284,7 +396,12 @@ struct rdma_mr *rdma_reg_mr(rdma_pd *pd, void *addr, uint64_t length,
  * (from rdma_reg_mr, same pd) under one new lkey/rkey, without a bigger
  * single MR — see notes/43/44. `addr`/`length` are the logical span this
  * new MR presents to callers (normally the union of the children). */
-#define RDMA_MAX_INDIRECT_MR_CHILDREN 32
+#define RDMA_MAX_INDIRECT_MR_CHILDREN 240
+/* Chunk boundary for the *fallback* indirect composition in verbs_compat.c.
+ * The DEXT itself now coalesces a contiguous IOVA onto coarse MTT pages
+ * (2 MiB), so a single rdma_reg_mr handles large buffers directly; this
+ * 480 x 4 KiB bound only still matters when the IOVA is not contiguous. */
+#define RDMA_MAX_DIRECT_MR_BYTES (480u * 4096u)
 struct rdma_mr *rdma_reg_mr_indirect(rdma_pd *pd, struct rdma_mr *const *children,
                                      uint32_t child_count, uint64_t addr,
                                      uint64_t length, uint32_t access_flags,
@@ -355,7 +472,10 @@ struct rdma_send_wr {
 #define RDMA_MAX_INLINE_DATA 512u
 #define RDMA_MAX_POST_BATCH 256u
 #define RDMA_POST_CHUNK 64u
+#define RDMA_MAX_POLL_BATCH 16u
 #define RDMA_MAX_SGE 16u
+/* RQ WQEBBs are 64 bytes, hence at most four 16-byte data segments. */
+#define RDMA_MAX_RECV_SGE 4u
 
 struct rdma_recv_wr {
     uint64_t wr_id;
@@ -407,6 +527,9 @@ int  rdma_query_gid_table(rdma_device *dev,
                           uint32_t *table_size);
 int  rdma_arm_cq(rdma_cq *cq, int solicited_only);
 
+/* Advance a QP's completion tails after a userspace direct-CQ decode. */
+int  rdma_sync_qp_tails(rdma_qp *qp, uint64_t sq_tail, uint64_t rq_tail);
+
 /* Kernel-mediated CQ consumer update (Option B doorbell fallback). */
 int  rdma_update_cq_consumer(rdma_cq *cq, uint32_t consumer_index);
 
@@ -417,6 +540,10 @@ struct rdma_async_event {
     uint32_t element_handle;
 };
 int  rdma_get_async_event(rdma_device *dev, struct rdma_async_event *event);
+/* Resolve an async-event token in the same device object that owns the
+ * context. Returned pointers remain valid until the matching destroy call. */
+rdma_cq *rdma_find_cq(rdma_device *dev, uint32_t token);
+rdma_qp *rdma_find_qp(rdma_device *dev, uint32_t token);
 
 #ifdef __cplusplus
 }

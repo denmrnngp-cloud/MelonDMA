@@ -31,12 +31,22 @@ wait_for_owner() {
     return 1
 }
 
+# Success: refresh the flat .dext in /Library/DriverExtensions so a future
+# boot (or DextRecordTable loss) recovers the persona automatically.
+finalize() {
+    sudo ./scripts/install-to-libde.sh || true
+    ./scripts/mlx_dev.sh status
+}
+
 prepare() {
     [ "$(id -u)" -ne 0 ] || fail "run as the login user, not root"
     [ -n "$TEAM" ] || fail "MLX_TEAM_ID is not set (Apple Developer Team ID, 10 chars)"
     ./scripts/mlx_dev.sh build
     sudo systemextensionsctl uninstall "$TEAM" "$BUNDLE" || true
     sudo systemextensionsctl reset
+    # Stage a flat .dext so kernelmanagerd's boot guess-scan registers our
+    # persona before card matching (otherwise Apple wins the first match).
+    sudo ./scripts/install-to-libde.sh build/MlxRDMA.dext || true
     echo "Clean state prepared. Rebooting now; after login run:"
     echo "  cd $ROOT && ./scripts/mlx_cold_takeover.sh resume"
     sudo reboot
@@ -63,15 +73,15 @@ resume() {
     [ "${m:-0}" -ge 2 ] 2>/dev/null || fail "our PCI personality is absent (IODEXTMatchCount=${m:-0})"
 
     for _ in $(seq 1 4); do
-        [ "$(owner)" = ours ] && { ./scripts/mlx_dev.sh status; return; }
+        [ "$(owner)" = ours ] && { finalize; return; }
         pid=$(pgrep -f "$APPLE" | head -1 || true)
         if [ -z "$pid" ]; then
             for _ in $(seq 1 30); do
-                [ "$(owner)" = ours ] && { ./scripts/mlx_dev.sh status; return; }
+                [ "$(owner)" = ours ] && { finalize; return; }
                 pgrep -f "$APPLE" >/dev/null 2>&1 && break
                 sleep 1
             done
-            [ "$(owner)" = ours ] && { ./scripts/mlx_dev.sh status; return; }
+            [ "$(owner)" = ours ] && { finalize; return; }
             pid=$(pgrep -f "$APPLE" | head -1 || true)
             [ -n "$pid" ] || fail "Apple did not relaunch and MlxPCIDriver did not claim the orphaned card"
         fi
@@ -80,7 +90,7 @@ resume() {
         sleep 8
     done
     [ "$(owner)" = ours ] || fail "takeover did not complete"
-    ./scripts/mlx_dev.sh status
+    finalize
 }
 
 case "${1:-}" in

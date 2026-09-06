@@ -18,6 +18,7 @@
 
 #include <DriverKit/IOService.iig>
 #include <DriverKit/IOTimerDispatchSource.iig>
+#include <DriverKit/IOInterruptDispatchSource.iig>
 #include <PCIDriverKit/IOPCIDevice.iig>
 
 class MlxUserClient;
@@ -30,6 +31,7 @@ class MlxDMA;
 class MlxFwPages;
 class MlxRoCE;
 struct mlx_stable_init_cycle_resp;
+struct mlx_runtime_resp;
 
 class MlxPCIDriver : public IOService
 {
@@ -53,6 +55,7 @@ public:
     IOPCIDevice *   GetPCI()   LOCALONLY { return fPci; }
     MlxCmd *        GetCmd()   LOCALONLY { return fCmd; }
     MlxEQ *         GetEQ()    LOCALONLY { return fEQ; }
+    MlxEQ *         GetCompletionEQ() LOCALONLY { return fCompletionEQ; }
     MlxUAR *        GetUAR()   LOCALONLY { return fUAR; }
     MlxHCA *        GetHCA()   LOCALONLY { return fHCA; }
     MlxHealth *     GetHealth()LOCALONLY { return fHealth; }
@@ -77,16 +80,47 @@ public:
     bool            RoCEPublicationAllowed() const LOCALONLY;
     bool            Phase2Ready() const LOCALONLY;
     bool            DmaQuarantined() const LOCALONLY;
+    bool            CompletionEventReady() const LOCALONLY;
+    void            GetRuntimeStatus(struct mlx_runtime_resp *status) LOCALONLY;
     void            RetainDmaUntilReset(void *mem,
                                         void *dma,
                                         uint32_t reason) LOCALONLY;
     void            EnterDmaQuarantine(uint32_t reason) LOCALONLY;
+    kern_return_t   WaitCompletionEvent(uint64_t generation,
+                                        uint32_t timeoutMs,
+                                        uint64_t *newGeneration) LOCALONLY;
+    bool            CompletionInterruptReady() const LOCALONLY;
+    /* Completion events that advanced fCompletionGeneration (IRQ or timer).
+     * Device-wide; surfaced through the per-client QueryPerf snapshot so a
+     * client can tell a missing interrupt from a missed wakeup. */
+    uint64_t        CompletionEventCount() const LOCALONLY;
+    uint64_t        CompletionWakeupCount() const LOCALONLY;
+    /* MSI-X bring-up result: which step failed and with what status, plus how
+     * many vectors were granted. Zeroed status with stage NONE means live. */
+    void            GetInterruptStatus(uint32_t *vectors, uint32_t *status,
+                                       uint32_t *stage) const LOCALONLY;
+    void            GetCompletionEqStatus(uint32_t *status, uint32_t *stage,
+                                          uint32_t *syndrome,
+                                          uint32_t *fwStatus) const LOCALONLY;
+    void            GetCompletionEqVariants(uint32_t *variant, uint32_t *tried,
+                                            uint32_t *syndromes) const LOCALONLY;
+    void            GetEqServiceStats(uint64_t *asyncIrq, uint64_t *completionIrq,
+                                      uint64_t *timerTicks,
+                                      uint32_t *timerPeriodMs) const LOCALONLY;
 
 private:
     kern_return_t StartEqPoller() LOCALONLY;
     void StopEqPoller() LOCALONLY;
     virtual void EqTimerOccurred(OSAction *action, uint64_t time)
         TYPE(IOTimerDispatchSource::TimerOccurred) LOCAL;
+    virtual void AsyncInterruptOccurred(OSAction *action, uint64_t count,
+                                        uint64_t time)
+        TYPE(IOInterruptDispatchSource::InterruptOccurred) LOCAL;
+    virtual void CompletionInterruptOccurred(OSAction *action, uint64_t count,
+                                             uint64_t time)
+        TYPE(IOInterruptDispatchSource::InterruptOccurred) LOCAL;
+    kern_return_t StartInterrupts() LOCALONLY;
+    void StopInterrupts() LOCALONLY;
     void DestroyPhase2FirmwareResources() LOCALONLY;
     bool InitPhase2Runtime() LOCALONLY;
 
@@ -113,6 +147,12 @@ private:
     /* Debug interface for mlx_probe (notes/35): FLR without FwInit. */
     kern_return_t   DbgPerformFlr() LOCALONLY;
 
+    void    RecordCompletionEqResult(uint32_t stage,
+                                     kern_return_t kr) LOCALONLY;
+    void    SignalCompletionEvent(uint32_t completions) LOCALONLY;
+    void    BringUpCompletionEq() LOCALONLY;
+    kern_return_t ProbeCompletionVector(uint32_t intr,
+                                        uint32_t *outEqn) LOCALONLY;
     bool    DisableBusMasterAndVerify() LOCALONLY;
     bool    NegotiateRoceCap() LOCALONLY;
     bool    PublishNubs() LOCALONLY;
@@ -123,6 +163,7 @@ private:
     uint16_t         fDeviceId;
     MlxCmd          *fCmd;
     MlxEQ           *fEQ;
+    MlxEQ           *fCompletionEQ;
     MlxUAR          *fUAR;
     MlxHCA          *fHCA;
     MlxHealth       *fHealth;
@@ -131,6 +172,11 @@ private:
     MlxRoCE         *fRoCE;
     IODispatchQueue *fEqQueue;
     IOTimerDispatchSource *fEqTimer;
+    IODispatchQueue *fInterruptQueue;
+    IODispatchQueue *fCompletionWaitQueue;
+    IOInterruptDispatchSource *fAsyncInterrupt;
+    IOInterruptDispatchSource *fCompletionInterrupt;
+    uint64_t         fCompletionGeneration;
     uint32_t         fIssi;
     uint32_t         fPd;
     uint32_t         fXrcd;

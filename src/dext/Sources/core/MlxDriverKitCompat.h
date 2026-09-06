@@ -29,7 +29,20 @@
 static inline void
 mlxMemoryBarrier()
 {
+#if defined(__aarch64__)
+    __asm__ volatile("dmb osh" ::: "memory");
+#else
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+static inline void mlxDmaReadBarrier()
+{
+#if defined(__aarch64__)
+    __asm__ volatile("dmb oshld" ::: "memory");
+#else
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+#endif
 }
 
 /*

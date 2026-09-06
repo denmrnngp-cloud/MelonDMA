@@ -68,6 +68,7 @@ public:
     kern_return_t   PostSendInline(const struct mlx_post_send_inline_req *req);
     kern_return_t   PostSendAtomic(const struct mlx_post_send_atomic_req *req);
     kern_return_t   ArmCQ(const struct mlx_arm_cq_req *req);
+    kern_return_t   ModifyCqModeration(const struct mlx_modify_cq_moderation_req *req);
 
     kern_return_t   GetAsyncEvent(struct mlx_async_event *event);
     void            QueueAsyncEvent(uint32_t eventType, uint32_t elementType,

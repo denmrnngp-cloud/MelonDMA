@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 
 static int failures = 0;
 static void check(bool cond, const char *msg)
@@ -216,6 +217,17 @@ static void test_wqe_encoding(void)
           ((11u << 8) | MLX_OPCODE_RDMA_WRITE_IMM) &&
           ((MlxWqeCtrlSeg *)wqe)->imm == 0xaabbccdd,
           "RDMA_WRITE_WITH_IMM opcode and immediate data encoded");
+    memset(wqe, 0, sizeof(wqe));
+    ds = mlxEncodeRcSendWqeImm(wqe, sizeof(wqe), 1, 12,
+                               MLX_OPCODE_RDMA_WRITE_IMM, nullptr, 0,
+                               0x2000, 0x5678, 0x01020304,
+                               true, false, false);
+    check(ds == 2 && MLX_BE32(((MlxWqeCtrlSeg *)wqe)->qpn_ds) == 0x102 &&
+          ((MlxWqeCtrlSeg *)wqe)->imm == 0x01020304,
+          "zero-length RDMA_WRITE_WITH_IMM encodes ctrl+raddr");
+    check(!mlxEncodeRcSendWqe(wqe, sizeof(wqe), 1, 13, MLX_OPCODE_SEND,
+                              nullptr, 0, 0, 0, true, false, false),
+          "zero-length SEND remains invalid");
 
     MlxRcSge sges[2] = {
         { 0x100000, 1024, 0x111 },
@@ -248,7 +260,7 @@ static void test_create_mkey(void)
     bool ok = mlxEncodeCreateMkey(in, sizeof(in), pages, 1,
                                   0x10000, 0x1000,
                                   MLX_MR_ACCESS_LOCAL_WRITE | MLX_MR_ACCESS_REMOTE_WRITE,
-                                  1, 0x42, &inputSize);
+                                  1, 0x42, MLX_MTT_PAGE_SHIFT, &inputSize);
     check(ok, "CREATE_MKEY encoder returns success");
     check(inputSize > MLX_CREATE_MKEY_FIXED_BYTES, "input size includes MTT octword");
     const uint8_t *mkc = in + MLX_CREATE_MKEY_MKC_BIT_OFFSET/8;
@@ -280,7 +292,7 @@ static void test_create_mkey(void)
     memset(in, 0, sizeof(in));
     ok = mlxEncodeCreateMkey(in, sizeof(in), translated, 2,
                              0x700000000800ULL, 0x1000,
-                             MLX_MR_ACCESS_LOCAL_WRITE, 1, 0x43, &inputSize);
+                             MLX_MR_ACCESS_LOCAL_WRITE, 1, 0x43, MLX_MTT_PAGE_SHIFT, &inputSize);
     mkc = in + MLX_CREATE_MKEY_MKC_BIT_OFFSET/8;
     check(ok && mlxGetBits(mkc, 0x80, 64) == 0x700000000800ULL,
           "MKC preserves client VA independently of PAS");
@@ -307,7 +319,7 @@ static void test_create_mkey_fragmented(void)
     uint32_t size = 0;
     bool ok = mlxEncodeCreateMkey(in, sizeof(in), frag, 4,
                                   0x700000000000ULL, 0x4000,
-                                  MLX_MR_ACCESS_LOCAL_WRITE, 1, 0x44, &size);
+                                  MLX_MR_ACCESS_LOCAL_WRITE, 1, 0x44, MLX_MTT_PAGE_SHIFT, &size);
     check(ok, "fragmented 4-page MR encodes");
     check(size == MLX_CREATE_MKEY_FIXED_BYTES + mlxMttOctwordCount(4) * 16,
           "fragmented MR input size accounts for every octword");
@@ -329,7 +341,7 @@ static void test_create_mkey_fragmented(void)
     memset(in, 0, sizeof(in));
     ok = mlxEncodeCreateMkey(in, sizeof(in), big, 256,
                              0x800000000000ULL, 0x100000,
-                             MLX_MR_ACCESS_REMOTE_WRITE, 1, 0x45, &size);
+                             MLX_MR_ACCESS_REMOTE_WRITE, 1, 0x45, MLX_MTT_PAGE_SHIFT, &size);
     check(ok, "1 MiB MR encodes");
     check(size == MLX_CREATE_MKEY_FIXED_BYTES + 128 * 16,
           "1 MiB MR input size = 272 + 128 octwords");
@@ -350,6 +362,84 @@ static void test_mtt(void)
     uint32_t n = 0;
     bool ok = mlxAppendMttPages(0x1000, 0x800, out, 8, &n);
     check(ok && n == 1, "two offsets in one 4KiB page dedup to 1 MTT entry");
+}
+
+/* ---- Large-MR contiguous PAS coalescing ---- */
+static void test_contiguous_large_mr(void)
+{
+    const uint64_t len = 149u << 20;      /* 149 MiB */
+    const uint64_t iova = 0x100000000ULL;  /* 16 KiB-aligned IOVA base */
+    const uint64_t va   = 0x140000000ULL;  /* 2 MiB-aligned client VA */
+
+    /* 2 MiB-congruent: largest granularity, 75 entries. */
+    uint32_t shift = mlxPickMttPageShift(va, iova, MLX_MTT_MAX_PAGE_SHIFT);
+    check(shift == MLX_MTT_MAX_PAGE_SHIFT,
+          "2 MiB-congruent MR picks 2 MiB granularity");
+    check(mlxMttPageCountShift(va, len, shift) == 75,
+          "149 MiB @ 2 MiB = 75 MTT entries");
+
+    uint64_t pas[480] = {0};
+    uint32_t count = 0;
+    bool ok = mlxBuildContiguousPas(iova, va, len, shift, pas, 480, &count);
+    check(ok && count == 75, "contiguous PAS build yields 75 entries");
+    check(pas[0] == iova && pas[74] == iova + 74 * (2u << 20),
+          "contiguous PAS first/last entries correct");
+
+    uint8_t in[MLX_CREATE_MKEY_FIXED_BYTES + 480 * 8] = {0};
+    uint32_t size = 0;
+    ok = mlxEncodeCreateMkey(in, sizeof(in), pas, count, va, len,
+                             MLX_MR_ACCESS_LOCAL_WRITE | MLX_MR_ACCESS_REMOTE_WRITE,
+                             1, 0x77, shift, &size);
+    check(ok, "149 MiB 2 MiB-granular CREATE_MKEY encodes");
+    const uint8_t *mkc = in + MLX_CREATE_MKEY_MKC_BIT_OFFSET/8;
+    check(mlxGetBits(mkc, 0x1da, 6) == MLX_MTT_MAX_PAGE_SHIFT,
+          "2 MiB-granular MR log_page_size = 21");
+    check(mlxGetBits(mkc, 0x1a0, 32) == 38, /* ceil(75/2) */
+          "2 MiB-granular MR translations_octword_size = 38");
+
+    /* The real DEXT case: VA and IOVA are both 16 KiB-aligned but at
+     * different offsets within a 2 MiB window, so the largest congruent
+     * shift is 14 (16 KiB) -> 9536 entries for 149 MiB, carried in a large
+     * mailbox (not the 480-entry small one). */
+    const uint64_t va2   = 0x140004000ULL;  /* 16 KiB into its 2 MiB window */
+    const uint64_t iova2 = 0x100008000ULL;  /* 32 KiB into its 2 MiB window */
+    shift = mlxPickMttPageShift(va2, iova2, MLX_MTT_MAX_PAGE_SHIFT);
+    check(shift == 14, "16 KiB-congruent (not 2 MiB) MR picks 16 KiB granularity");
+    check(mlxMttPageCountShift(va2, len, shift) == 9536,
+          "149 MiB @ 16 KiB = 9536 MTT entries");
+
+    uint64_t *big = (uint64_t *)calloc(9536, sizeof(*big));
+    check(big != NULL, "large PAS scratch allocated");
+    if (big) {
+        ok = mlxBuildContiguousPas(iova2, va2, len, shift, big, 9536, &count);
+        check(ok && count == 9536, "16 KiB-granular PAS build yields 9536 entries");
+        check(big[0] == (iova2 & ~0x3fffULL) && big[9535] == (iova2 & ~0x3fffULL) + 9535ull * 0x4000,
+              "16 KiB-granular PAS first/last entries correct");
+        size_t cap = mlxCreateMkeyInputSize(9536);
+        uint8_t *bin = (uint8_t *)calloc(1, cap);
+        check(bin != NULL, "large CREATE_MKEY input allocated");
+        if (bin) {
+            ok = mlxEncodeCreateMkey(bin, cap, big, 9536, va2, len,
+                                     MLX_MR_ACCESS_LOCAL_WRITE, 1, 0x78, shift, &size);
+            check(ok, "149 MiB 16 KiB-granular CREATE_MKEY encodes");
+            mkc = bin + MLX_CREATE_MKEY_MKC_BIT_OFFSET/8;
+            check(mlxGetBits(mkc, 0x1da, 6) == 14, "16 KiB-granular log_page_size = 14");
+            check(mlxGetBits(mkc, 0x1a0, 32) == 4768, /* ceil(9536/2) */
+                  "16 KiB-granular translations_octword_size = 4768");
+            check(size == cap, "large CREATE_MKEY input size exact");
+            free(bin);
+        }
+        free(big);
+    }
+
+    /* IOVA misaligned vs VA by 4 KiB: only 4 KiB is congruent (both are still
+     * page-aligned), so the picker falls to shift 12 — the caller then sees
+     * the 4 KiB entry count exceed the mailbox and falls back to chunked. */
+    check(mlxPickMttPageShift(va, iova + 0x1000, MLX_MTT_MAX_PAGE_SHIFT) == MLX_MTT_PAGE_SHIFT,
+          "4 KiB-misaligned IOVA degrades to 4 KiB granularity");
+    /* IOVA offset by a full 1 MiB: still congruent at 1 MiB. */
+    check(mlxPickMttPageShift(va, iova + 0x100000, MLX_MTT_MAX_PAGE_SHIFT) == 20,
+          "1 MiB-offset IOVA/VA picks 1 MiB granularity");
 }
 
 /* ---- MANAGE_PAGES(TAKE) decoder ---- */
@@ -518,6 +608,7 @@ int main(void)
     test_create_mkey();
     test_create_mkey_fragmented();
     test_mtt();
+    test_contiguous_large_mr();
     test_manage_pages_take();
     test_general_caps_sw_owner();
     test_inline_atomic_wqe();

@@ -38,8 +38,14 @@ public:
     MlxEQ();
     ~MlxEQ();
 
-    kern_return_t   Init(MlxPCIDriver *core, uint32_t vector);
+    kern_return_t   Init(MlxPCIDriver *core, uint32_t vector,
+                         bool completionOnly = false, uint32_t logSize = 8);
     void            Free();
+
+    /* CreateEQ input firmware may object to; set between Init and CreateEQ.
+     * Zero keeps the boot UAR. The ring size is an Init parameter instead,
+     * because the PAS list has to be allocated to match it. */
+    void            SetUarPage(uint32_t uarPage);
 
     /* Create the EQ in firmware and arm it. */
     kern_return_t   CreateEQ(uint32_t *eqn);
@@ -53,8 +59,11 @@ public:
     void            AddNotifier(MlxEventNotifier *n);
     void            RemoveNotifier(MlxEventNotifier *n);
 
-    /* Poll the EQE ring and dispatch events (called from interrupt source). */
-    void            Poll();
+    /* Poll the EQE ring and dispatch events (called from interrupt source).
+     * `completions` receives how many of the processed EQEs were completion
+     * events. Without a dedicated completion EQ, CQs are bound to the async
+     * EQ, so its poller is what must release blocked completion waiters. */
+    uint32_t        Poll(uint32_t *completions = nullptr);
 
     /* Arm the EQ after an interrupt storm or initial setup. */
     kern_return_t   Arm();

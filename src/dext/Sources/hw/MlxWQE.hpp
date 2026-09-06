@@ -299,7 +299,9 @@ mlxEncodeRcSendWqe(void *buffer, size_t bufferBytes, uint32_t qpn,
                    uint64_t remoteAddr, uint32_t rkey, bool signaled,
                    bool fenced, bool solicited)
 {
-    if (!buffer || !qpn || !sges || !numSge || numSge > MLX_RC_MAX_SGE ||
+    bool zeroWriteImm = opcode == MLX_OPCODE_RDMA_WRITE_IMM && numSge == 0;
+    if (!buffer || !qpn || (!zeroWriteImm && (!sges || !numSge)) ||
+        numSge > MLX_RC_MAX_SGE ||
         (opcode != MLX_OPCODE_SEND && opcode != MLX_OPCODE_SEND_IMM &&
          opcode != MLX_OPCODE_RDMA_WRITE && opcode != MLX_OPCODE_RDMA_WRITE_IMM &&
          opcode != MLX_OPCODE_RDMA_READ && opcode != MLX_OPCODE_LOCAL_INVAL))

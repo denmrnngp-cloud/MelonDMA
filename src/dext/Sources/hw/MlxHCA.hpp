@@ -70,6 +70,9 @@ struct MlxHcaCaps {
     uint16_t ibMaxPkeys;
     bool     ibSupported;
 
+    /* Max MKC log_page_size for MTT mkeys (0 = fall back to 21) */
+    uint8_t  maxMttLogPageSize;
+
     bool isEthernet() const { return portType == MLX_PORT_TYPE_ETH; }
     bool isIB() const { return portType == MLX_PORT_TYPE_IB; }
     int linkLayer() const {

@@ -21,6 +21,8 @@ int main(void)
 
     check(ibv_open_device(NULL) == NULL, "open_device(NULL) guarded");
     check(ibv_query_device(NULL, NULL) != 0, "query_device(NULL) guarded");
+    check(ibv_mlx5_query_telemetry(NULL, NULL) != 0,
+          "query_telemetry(NULL) guarded");
     check(ibv_mlx5_configure_roce(NULL, NULL) != 0,
           "configure_roce(NULL) guarded");
     check(ibv_alloc_pd(NULL) == NULL, "alloc_pd(NULL) guarded");

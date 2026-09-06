@@ -47,6 +47,7 @@ struct MlxEQ::State {
     IOPCIDevice           *pci;
     uint8_t                barIndex;
     uint32_t               vector;       /* MSI-X vector index (MVP: 0) */
+    bool                   completionOnly;
     uint32_t               eqn;         /* firmware EQ number */
     IOBufferMemoryDescriptor *eqeMem;
     IODMACommand          *eqeDma;
@@ -55,6 +56,7 @@ struct MlxEQ::State {
     uint32_t               head;        /* consumer index */
     uint32_t               depth;
     uint32_t               logSize;
+    uint32_t               uarOverride;  /* 0 = boot UAR */
     uint64_t               mask[4];      /* event mask (4×64-bit) */
     uint64_t               pageDMA[MLX_MAX_EQ_PAGES];
     uint32_t               numPages;
@@ -70,9 +72,10 @@ MlxEQ::MlxEQ() : s(NULL) {}
 MlxEQ::~MlxEQ() { Free(); }
 
 kern_return_t
-MlxEQ::Init(MlxPCIDriver *core, uint32_t vector)
+MlxEQ::Init(MlxPCIDriver *core, uint32_t vector, bool completionOnly,
+            uint32_t logSize)
 {
-    if (!core) return kIOReturnBadArgument;
+    if (!core || logSize < 4 || logSize > 16) return kIOReturnBadArgument;
     s = new State;
     if (!s) return kIOReturnNoMemory;
     memset(s, 0, sizeof(*s));
@@ -80,8 +83,9 @@ MlxEQ::Init(MlxPCIDriver *core, uint32_t vector)
     s->pci      = core->GetPCI();
     s->barIndex = core->GetBar0Index();
     s->vector   = vector;
-    s->depth    = MLX_EQ_DEPTH;
-    s->logSize  = 8;   /* log2(256) */
+    s->completionOnly = completionOnly;
+    s->logSize  = logSize;
+    s->depth    = 1u << logSize;
     s->lock     = IOLockAlloc();
     if (!s->lock) { delete s; s = NULL; return kIOReturnNoMemory; }
 
@@ -135,31 +139,34 @@ MlxEQ::Init(MlxPCIDriver *core, uint32_t vector)
         s->eqeBuf[i].owner = 1;
     mlxMemoryBarrier();
 
-    /* Event mask: CMD completion + PAGE_REQUEST + port events.
-     * NOTE: MLX_EVENT_TYPE_COMPLETION (bit 0) is deliberately NOT set here.
-     * This single EQ is created with intr=0 (async vector), and ConnectX-4 Lx
-     * firmware rejects the completion bit on an async-vector EQ → CREATE_EQ
-     * fails → fEQ stays NULL → fHealth is never created → QueryHealth reports
-     * healthy=0. The userspace completion channel does not need the EQ
-     * completion event: GetCompletions() scans the CQE ring for pending CQEs
-     * directly. A dedicated completion EQ (with a real MSI-X vector) is the
-     * future path if EQ-driven wakeups ever replace the 1 ms poll. */
+    /* Completion traffic uses its own MSI-X vector/EQ.  mlx5 completion EQs
+     * are selected by the CQ's c_eqn and MUST use an all-zero event mask:
+     * event type 0 is not a subscribable asynchronous event.  Setting bit 0
+     * makes ConnectX-4 reject the second CREATE_EQ with BAD_PARAM. */
     memset(s->mask, 0, sizeof(s->mask));
-    mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_CMD);
-    mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_PAGE_REQUEST);
-    mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_PORT_STATE_CHANGE);
-    mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_NIC_VPORT_CHANGE);
-    mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_DEVICE_FATAL);
-    mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_WQ_CATAS_ERROR);
+    if (!s->completionOnly) {
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_CMD);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_PAGE_REQUEST);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_PORT_STATE_CHANGE);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_NIC_VPORT_CHANGE);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_DEVICE_FATAL);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_WQ_CATAS_ERROR);
+    }
 
     return kIOReturnSuccess;
+}
+
+void
+MlxEQ::SetUarPage(uint32_t uarPage)
+{
+    if (s) s->uarOverride = uarPage;
 }
 
 void
 MlxEQ::Free()
 {
     if (!s) return;
-    if (s->eqn && (s->eqeDma || s->eqeMem)) {
+    if ((s->eqn || s->core->DmaQuarantined()) && (s->eqeDma || s->eqeMem)) {
         s->core->RetainDmaUntilReset(s->eqeMem, s->eqeDma,
                                      0x45510000u | (s->eqn & 0xffffu));
         s->eqeDma = NULL;
@@ -188,7 +195,8 @@ MlxEQ::CreateEQ(uint32_t *eqn)
     /* eqc (mlx5_ifc_eqc_bits) */
     uint8_t *eqc = in + eqcOff;
     mlxSetBits(eqc, 0x63, 5, s->logSize);                     /* log_eq_size */
-    uint32_t uarPage = s->core->GetUAR() ? s->core->GetUAR()->GetBootUarIndex() : 0;
+    uint32_t uarPage = s->uarOverride ? s->uarOverride :
+        (s->core->GetUAR() ? s->core->GetUAR()->GetBootUarIndex() : 0);
     mlxSetBits(eqc, 0x68, 24, uarPage);                       /* uar_page */
     mlxSetBits(eqc, 0xb4, 12, s->vector);                     /* intr (MVP: 0 = poll) */
     mlxSetBits(eqc, 0xc3, 5, 0);                              /* log_page_size = 4 KiB */
@@ -268,30 +276,33 @@ MlxEQ::RemoveNotifier(MlxEventNotifier *n)
     IOLockUnlock(s->lock);
 }
 
-void
-MlxEQ::Poll()
+uint32_t
+MlxEQ::Poll(uint32_t *completions)
 {
-    if (!s || !s->armed || !s->eqeBuf) return;
+    if (completions) *completions = 0;
+    if (!s || !s->armed || !s->eqeBuf) return 0;
     /* Exec/user-client callbacks and the continuous timer run on different
      * DriverKit queues.  Serialize ownership of head/owner processing; a
      * plain bool is not a cross-queue exclusion primitive. */
     IOLockLock(s->lock);
     if (s->polling) {
         IOLockUnlock(s->lock);
-        return;
+        return 0;
     }
     s->polling = true;
     IOLockUnlock(s->lock);
     uint32_t sizeMask = s->depth - 1;
     const uint32_t BUDGET = 64;   /* don't monopolize the workloop */
     uint32_t processed = 0;
+    uint32_t completionEqes = 0;
     while (processed < BUDGET) {
         MlxEqe *eqe = &s->eqeBuf[s->head & sizeMask];
         mlxMemoryBarrier();
         /* owner toggles each ring wrap (lib/eq.h:61): new iff owner == expected. */
-        uint32_t owner    = eqe->owner & 1;
+        uint32_t owner    = *(volatile uint8_t *)&eqe->owner & 1;
         uint32_t expected = (s->head >> s->logSize) & 1;
         if ((owner ^ expected) != 0) break;   /* HW still owns — drained */
+        mlxDmaReadBarrier(); /* body must be read AFTER hardware ownership */
         /* Copy the EQE and advance head BEFORE dispatch: a nested Poll (from GIVE
          * inside the handler) must not see this same EQE again. */
         MlxEqe localEqe = *eqe;
@@ -301,16 +312,25 @@ MlxEQ::Poll()
         IOLockLock(s->lock);
         n = s->notifier;
         IOLockUnlock(s->lock);
+        if (localEqe.type == MLX_EVENT_TYPE_COMPLETION) completionEqes++;
         if (n) n->HandleEvent(localEqe.type, &localEqe);
         else   s->unknown++;
     }
+    if (completions) *completions = completionEqes;
     if (processed == BUDGET) s->overflow++;
     /* Publish the consumer index only when head actually advanced.
-     * An empty 10-ms poll must not generate meaningless PCIe MMIO. */
-    if (processed) UpdateCi(false);
+     * An empty 10-ms poll must not generate meaningless PCIe MMIO.
+     *
+     * Arm on the same write. mlx5 disarms an EQ once it raises an interrupt,
+     * so whoever drains the ring owes it a re-arm — including the 10 ms timer
+     * poller. Publishing the CI without the arm bit there left the EQ silent
+     * until the next drain, which cost a blocked completion waiter its whole
+     * timeout. The arm bit rides in the doorbell this write already makes. */
+    if (processed) UpdateCi(true);
     IOLockLock(s->lock);
     s->polling = false;
     IOLockUnlock(s->lock);
+    return processed;
 }
 
 void

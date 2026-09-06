@@ -8,10 +8,10 @@
  * IOPCIDevice::MemoryWrite32 on the init-segment cmd_dbell register, and the
  * command is polled for completion by reading the command outbox over MMIO.
  *
- * Large commands (>16B input or output) use a mailbox chain (one or more
- * 576-byte MlxCmdMailbox blocks linked via next, each DMA-pinned). This
- * covers ENABLE_HCA, QUERY_ISSI, QUERY_PAGES, INIT_HCA, and QUERY_HCA_CAP
- * (4112B output) — the full Gate P1 / Phase 1 bring-up sequence (notes/08).
+ * Large commands (>16B input or output) use a mailbox chain of full 4096-byte
+ * DMA pages. Each page carries one 576-byte MlxCmdMailbox block linked via
+ * next. This proven layout covers ENABLE_HCA, QUERY_ISSI, QUERY_PAGES,
+ * INIT_HCA, QUERY_HCA_CAP and large inline-PAS CREATE_MKEY commands.
  *
  * MVP scope: single command slot (no concurrency), polling completion. The
  * kext donor's 32-slot bitmap + event-mode completion is a later optimization.
@@ -30,9 +30,10 @@
 class MlxPCIDriver;
 class IOPCIDevice;
 
-#define MLX_CMD_MAX_SIZE        4112   /* max command input/output (QUERY_HCA_CAP) */
+#define MLX_CMD_MAX_SIZE        4112   /* max small command input/output (QUERY_HCA_CAP) */
 #define MLX_CMD_DATA_BLOCK_SIZE 512    /* mailbox data block (mlx5_cmd_prot_block) */
-#define MLX_CMD_MAX_BLOCKS      8      /* 8 * 512 = 4096B + 16B header = 4112B */
+#define MLX_CMD_MAX_BLOCKS      1024   /* large CREATE_MKEY: 149 MiB @ 4 KiB PAS = 597 blocks */
+#define MLX_CMD_MAX_INPUT_SIZE  (16 + MLX_CMD_MAX_BLOCKS * MLX_CMD_DATA_BLOCK_SIZE) /* 524304 */
 
 /* Mailbox block (576 bytes): 512B data + descriptor. device.h:781. */
 struct MlxCmdMailbox {

@@ -27,8 +27,6 @@
 class MlxRoCE;
 class MlxPCIDriver;
 
-#define MLX_MAX_MR_SEGMENTS     480
-
 struct MlxMRContext {
     uint32_t    mrHandle;
     uint32_t    pd;

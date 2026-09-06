@@ -85,7 +85,10 @@ MlxHealth::StopTimer()
 }
 
 bool
-MlxHealth::IsHealthy() const { return s ? s->healthy : false; }
+MlxHealth::IsHealthy() const {
+    return s && __atomic_load_n(&s->healthy, __ATOMIC_ACQUIRE) &&
+           !s->core->DmaQuarantined();
+}
 uint8_t
 MlxHealth::Syndrome() const { return s ? s->synd : 0; }
 uint16_t
@@ -94,18 +97,17 @@ MlxHealth::ExtSynd() const { return s ? s->extSynd : 0; }
 void
 MlxHealth::Check()
 {
-    if (!s) return;
+    if (!IsHealthy()) return; /* fatal is latched until a new Init after reset */
     uint32_t counter = mlxMMIORead32BE(s->pci, s->barIndex,
                                        offsetof(struct MlxInitSeg, health_counter));
-    if (counter == s->healthCounter) {
-        if (++s->missed >= MLX_HEALTH_MISSED_THRESHOLD) {
-            MLX_LOG("FATAL: watchdog — missed=%u", s->missed);
-            MarkFatal();
-        }
-    } else {
+    /* On ConnectX-4 Lx firmware health_counter is a stable snapshot in the
+     * normal state; it is not a periodic heartbeat. Treating an unchanged
+     * value as fatal quarantines a healthy card after ~10 seconds. Fatal
+     * hardware state is delivered through DEVICE_FATAL/WQ_FATAL and enters
+     * MarkFatal() from MlxRoCE::HandleAsyncEvent(). */
+    if (counter != s->healthCounter) {
         s->healthCounter = counter;
         s->missed = 0;
-        s->healthy = true;
     }
 }
 
@@ -113,7 +115,7 @@ void
 MlxHealth::MarkFatal()
 {
     if (!s) return;
-    s->healthy = false;
+    if (!__atomic_exchange_n(&s->healthy, false, __ATOMIC_ACQ_REL)) return;
     /* irisc_index/synd/ext_synd occupy one aligned big-endian dword.
      * DriverKit MemoryRead32 must not be issued at the byte-aligned
      * synd/ext_synd offsets. */
@@ -129,10 +131,5 @@ MlxHealth::MarkFatal()
     /* §5.7 fail-closed: also stop the card's DMA by clearing bus
      * mastering. MSE stays set so MMIO remains readable while the
      * quarantined mappings drain to the next verified FLR. */
-    uint16_t cmd = 0;
-    s->pci->ConfigurationRead16(4, &cmd);
-    s->pci->ConfigurationWrite16(4, cmd & ~0x2u);
-    uint16_t verify = 0;
-    s->pci->ConfigurationRead16(4, &verify);
-    MLX_LOG("FATAL: bus mastering disabled (cmd=0x%04x)", verify);
+    /* EnterDmaQuarantine performs and verifies the common BME fence. */
 }

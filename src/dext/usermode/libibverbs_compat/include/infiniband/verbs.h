@@ -114,6 +114,102 @@ struct ibv_mlx5_roce_config {
     uint16_t udp_sport;    /* 0 selects the standard provider-derived port */
 };
 
+/* P0 per-client performance counters. */
+struct ibv_mlx5_perf {
+    uint64_t external_methods;
+    uint64_t external_method_ns;
+    uint64_t post_send_calls;
+    uint64_t post_recv_calls;
+    uint64_t poll_cq_calls;
+    uint64_t sync_fast_path_calls;
+    uint64_t sync_qp_tails_calls;
+    uint64_t arm_cq_calls;
+    uint64_t doorbells;
+    uint64_t cqe_consumed;
+    uint64_t cqe_errors;
+    uint64_t mr_registers;
+    uint64_t mr_deregisters;
+    uint64_t mr_bytes;
+    uint64_t copied_bytes;
+    /* cq_events is device-wide (every client sees the same completion-MSI-X
+     * total); cq_event_wakeups is this client's own woken waits. */
+    uint64_t cq_events;
+    uint64_t cq_event_wakeups;
+};
+
+#define IBV_MLX5_TELEMETRY_VERSION 2u
+/* Fixed runtime v1 wire shape. Size-aware functions never overwrite a smaller
+ * caller buffer; v2 telemetry stays frozen for old dynamically linked apps. */
+struct ibv_mlx5_runtime {
+    uint32_t version, size;
+    uint64_t device_epoch;
+    uint64_t pinned_bytes, peak_pinned_bytes, pin_failures;
+    uint64_t client_pinned_bytes, client_pinned_limit, device_pinned_limit;
+    uint64_t quarantine_bytes, quarantine_objects;
+    uint64_t irq_completion_eqes, timer_completion_eqes, last_completion_irq_ns;
+    uint32_t quarantined, bme_fenced, completion_eq_ready, completion_irq_proven;
+};
+struct ibv_context;
+int ibv_mlx5_query_runtime(struct ibv_context *, void *, size_t);
+int ibv_mlx5_query_telemetry_ex(struct ibv_context *, void *, size_t);
+/* Full-stack monotonic telemetry. Unlike ibv_mlx5_perf (the stable DEXT ABI
+ * snapshot), this also includes userspace direct-path and completion-channel
+ * activity. Callers take a before/after snapshot around one request. */
+struct ibv_mlx5_telemetry {
+    uint32_t version;
+    uint32_t size;
+    uint64_t external_methods;
+    uint64_t external_method_ns;
+    uint64_t kernel_post_send_calls;
+    uint64_t kernel_post_recv_calls;
+    uint64_t kernel_poll_cq_methods;
+    uint64_t kernel_sync_fast_path_calls;
+    uint64_t kernel_sync_qp_tails_calls;
+    uint64_t kernel_arm_cq_calls;
+    uint64_t mr_registers;
+    uint64_t mr_deregisters;
+    uint64_t mr_bytes;
+    uint64_t copied_bytes;
+    uint64_t mapped_qps;
+    uint64_t direct_send_batches;
+    uint64_t direct_send_wrs;
+    uint64_t direct_doorbells;
+    uint64_t direct_recv_batches;
+    uint64_t direct_recv_wrs;
+    uint64_t cq_consumer_publications;
+    uint64_t shadow_publications;
+    uint64_t blue_flame_wqes;
+    uint64_t direct_poll_calls;
+    uint64_t direct_poll_empty;
+    uint64_t direct_cqes;
+    uint64_t direct_cqe_errors;
+    uint64_t kernel_poll_calls;
+    uint64_t kernel_cqes;
+    uint64_t fallback_direct_disabled;
+    uint64_t fallback_cq_unmapped;
+    uint64_t fallback_unknown_qp;
+    uint64_t fallback_missing_metadata;
+    uint64_t fallback_dext_owned;
+    uint64_t cq_arm_requests;
+    uint64_t cq_arm_cached;
+    uint64_t completion_waits;
+    uint64_t completion_events;
+    uint64_t completion_hw_waits;
+    uint64_t completion_hw_wakeups;
+    uint64_t completion_poll_ticks;
+    uint64_t completion_poll_wakeups;
+    uint64_t completion_lost_events;
+    uint64_t single_owner_violations;
+    uint64_t wc_cache_hits;
+    uint64_t wc_cache_prefetched;
+    /* Version 2. Driver-counted, so they pair with the direct_* fields above
+     * to split one request's work between the direct path and the DEXT. */
+    uint64_t kernel_doorbells;
+    uint64_t kernel_cqe_errors;
+    uint64_t driver_cq_events;
+    uint64_t driver_cq_event_wakeups;
+};
+
 /* DCQCN reaction-point parameters (QUERY/MODIFY_CONG_PARAMS 0x824/0x825). */
 struct ibv_mlx5_cong_params {
     uint32_t rpg_min_dec_fac;  /* multiplicative decrease factor */
@@ -183,6 +279,8 @@ struct ibv_mw;
 struct ibv_ah;
 struct ibv_comp_channel;
 struct ibv_srq;
+struct ibv_cq;
+struct ibv_qp;
 
 struct ibv_port_attr {
     enum ibv_port_state state;
@@ -302,7 +400,18 @@ struct ibv_cq {
     uint64_t event_count;
     uint64_t acked_events;
     uint64_t lost_events;
+    uint64_t notify_generation;
+    uint64_t worker_generation;
     int notify_armed;
+    struct ibv_cq *channel_next;
+    struct ibv_cq *context_next;
+    struct ibv_wc wc_cache[16];
+    uint32_t wc_cache_head;
+    uint32_t wc_cache_count;
+    int single_threaded;
+    int poll_owner_valid;
+    pthread_t poll_owner;
+    pthread_mutex_t poll_lock;
     pthread_mutex_t notify_lock;
 };
 struct ibv_ah {
@@ -345,6 +454,7 @@ struct ibv_qp {
     enum ibv_qp_state state;
     enum ibv_qp_type qp_type;
     void *priv;
+    struct ibv_qp *context_next;
 };
 
 struct ibv_device **ibv_get_device_list(int *num_devices);
@@ -356,6 +466,68 @@ int ibv_query_device(struct ibv_context *context,
                      struct ibv_device_attr *device_attr);
 int ibv_mlx5_configure_roce(struct ibv_context *context,
                              const struct ibv_mlx5_roce_config *config);
+int ibv_mlx5_query_perf(struct ibv_context *context,
+                        struct ibv_mlx5_perf *perf);
+int ibv_mlx5_query_telemetry(struct ibv_context *context,
+                             struct ibv_mlx5_telemetry *telemetry);
+
+/* MSI-X bring-up diagnosis. A provider that does not advertise the completion
+ * interrupt still answers this, so a client can report why the blocking
+ * completion path is unavailable instead of silently polling. Returns ENOTSUP
+ * on a provider that predates the query. */
+enum {
+    IBV_MLX5_IRQ_STAGE_NONE          = 0,
+    IBV_MLX5_IRQ_STAGE_CONFIGURE     = 1,
+    IBV_MLX5_IRQ_STAGE_QUEUE         = 2,
+    IBV_MLX5_IRQ_STAGE_SOURCE        = 3,
+    IBV_MLX5_IRQ_STAGE_ACTION        = 4,
+    IBV_MLX5_IRQ_STAGE_HANDLER       = 5,
+    IBV_MLX5_IRQ_STAGE_ENABLE        = 6,
+    IBV_MLX5_IRQ_STAGE_NOT_ATTEMPTED = 7,
+};
+enum {
+    IBV_MLX5_CQEQ_STAGE_NOT_ATTEMPTED = 0,
+    IBV_MLX5_CQEQ_STAGE_ALLOC         = 1,
+    IBV_MLX5_CQEQ_STAGE_INIT          = 2,
+    IBV_MLX5_CQEQ_STAGE_CREATE        = 3,
+    IBV_MLX5_CQEQ_STAGE_OK            = 4,
+};
+struct ibv_mlx5_interrupts {
+    uint32_t vectors;
+    uint32_t setup_status;
+    uint32_t setup_stage;
+    uint32_t async_eqn;
+    uint32_t completion_eqn;
+    uint32_t completion_ready;
+    uint64_t completion_events;
+    /* Completion-EQ bring-up. The vectors can be live while this EQ is
+     * missing, and only then does the blocking completion path go away. */
+    uint32_t completion_eq_status;
+    uint32_t completion_eq_stage;
+    uint32_t completion_eq_syndrome;
+    uint32_t completion_eq_fw_status;
+    /* Which CreateEQ variant firmware accepted, 1-based, 0 = none. */
+    uint32_t completion_eq_variant;
+    uint32_t completion_eq_variant_tried;
+    uint32_t completion_eq_variant_syndrome[4];
+    /* Does vector 0 actually deliver, and has the EQ timer stepped down? */
+    uint64_t async_interrupts;
+    uint64_t completion_interrupts;
+    uint64_t eq_timer_ticks;
+    uint32_t eq_timer_period_ms;
+};
+int ibv_mlx5_query_interrupts(struct ibv_context *context,
+                              struct ibv_mlx5_interrupts *irq);
+const char *ibv_mlx5_irq_stage_name(uint32_t stage);
+const char *ibv_mlx5_cqeq_stage_name(uint32_t stage);
+
+/* Hardware completion moderation: hold a completion event back until `period`
+ * microseconds have passed or `max_count` CQEs have accumulated. Zero in a
+ * field disables that half; both zero restores unmoderated behaviour. This
+ * coalesces in the NIC, so it removes wakeups rather than deciding not to act
+ * on them. Returns ENOTSUP on a provider that predates it. */
+int ibv_mlx5_modify_cq_moderation(struct ibv_cq *cq, uint32_t period,
+                                  uint32_t max_count);
 int ibv_mlx5_query_cong(struct ibv_context *context,
                         struct ibv_mlx5_cong_params *params);
 int ibv_mlx5_modify_cong(struct ibv_context *context,
@@ -412,6 +584,10 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
 int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
                   struct ibv_recv_wr **bad_wr);
 int ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc);
+/* MelonDMA equivalent of a single-threaded CQ/thread-domain contract. Once
+ * enabled, the first poller becomes the debug owner and poll_cq skips its
+ * mutex. A poll from another thread fails instead of silently racing. */
+int ibv_mlx5_set_single_threaded(struct ibv_cq *cq, int enable);
 const char *ibv_wc_status_str(enum ibv_wc_status status);
 
 #ifdef __cplusplus

@@ -6,7 +6,7 @@
  * hang, never a crash. This is the trust-boundary hardening the DEXT must
  * provide before untrusted multi-process use.
  *
- * Covered (P2.2 ABI-fuzz/property gate):
+ * Covered (mirrors Plan.md P2.2):
  *   - input/output size mismatch (truncated structure)
  *   - reserved fields (CreateQP rsvd, sqBufAddr/rqBufAddr/maxInlineData)
  *   - integer overflow (RegMR / RegMRIndirect address + length)
@@ -206,13 +206,28 @@ int main(void)
             call(c, kMlxUCMethodCreateCQ, &cqReq, sizeof(cqReq), &cqResp, sizeof(cqResp)) != kIOReturnSuccess) {
             printf("  skip reserved-field probe (PD/CQ setup failed)\n");
         } else {
-            struct mlx_create_qp_req rsvd = {
-                .pd = pd, .sendCq = cqResp.cqHandle, .recvCq = cqResp.cqHandle,
-                .qpType = 0, .sqSize = 64, .rqSize = 64, .rsvd = 1,
-            };
             struct mlx_create_qp_resp qpResp = {};
-            expect(call(c, kMlxUCMethodCreateQP, &rsvd, sizeof(rsvd), &qpResp, sizeof(qpResp)),
-                   kIOReturnBadArgument, "CreateQP rsvd=1 -> BadArgument");
+            /* bit0 (MLX_UC_QP_TRUSTED) is a known flag, not an error; without
+             * a fast-path bundle it degrades to the validated path here. */
+            struct mlx_create_qp_req trusted = {
+                .pd = pd, .sendCq = cqResp.cqHandle, .recvCq = cqResp.cqHandle,
+                .qpType = 0, .sqSize = 64, .rqSize = 64,
+                .rsvd = MLX_UC_QP_TRUSTED,
+            };
+            kern_return_t kr = call(c, kMlxUCMethodCreateQP, &trusted,
+                                    sizeof(trusted), &qpResp, sizeof(qpResp));
+            expect(kr, kIOReturnSuccess, "CreateQP rsvd=TRUSTED accepted");
+            if (kr == kIOReturnSuccess)
+                (void)call(c, kMlxUCMethodDestroyQP, &qpResp.qpn,
+                           sizeof(qpResp.qpn), NULL, 0);
+            /* Unknown flag bits are still refused. */
+            struct mlx_create_qp_req unknown = {
+                .pd = pd, .sendCq = cqResp.cqHandle, .recvCq = cqResp.cqHandle,
+                .qpType = 0, .sqSize = 64, .rqSize = 64, .rsvd = 2,
+            };
+            expect(call(c, kMlxUCMethodCreateQP, &unknown, sizeof(unknown),
+                        &qpResp, sizeof(qpResp)),
+                   kIOReturnBadArgument, "CreateQP rsvd=2 (unknown bit) -> BadArgument");
             struct mlx_create_qp_req buf = {
                 .pd = pd, .sendCq = cqResp.cqHandle, .recvCq = cqResp.cqHandle,
                 .qpType = 0, .sqSize = 64, .rqSize = 64, .sqBufAddr = 0x1000,

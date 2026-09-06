@@ -25,7 +25,11 @@ enum {
     MLX_CREATE_MKEY_PAS_BYTE_OFFSET = 0x880 / 8,
     MLX_MTT_PAGE_SHIFT = 12,
     MLX_MTT_PAGE_SIZE = 1u << MLX_MTT_PAGE_SHIFT,
-    MLX_CREATE_MKEY_MAX_PAGES = (4112 - MLX_CREATE_MKEY_FIXED_BYTES) / 8,
+    /* Coarsest MTT page granularity for large contiguous MRs: 2 MiB.
+     * 480 entries x 2 MiB = 960 MiB, well above the DART ~240 MiB IOVA
+     * ceiling (Makefile mlx_large_mr_test). Going coarser risks the NIC's
+     * max MTT entity size for zero benefit. */
+    MLX_MTT_MAX_PAGE_SHIFT = 21,
 };
 
 enum MlxMrAccessFlags {
@@ -233,15 +237,64 @@ mlxAppendMttPages(uint64_t dmaAddress, uint64_t length, uint64_t *pages,
 }
 
 static inline uint64_t
-mlxMttPageCount(uint64_t startAddress, uint64_t length)
+mlxMttPageCountShift(uint64_t startAddress, uint64_t length, uint32_t pageShift)
 {
-    uint64_t pageOffset = startAddress & (MLX_MTT_PAGE_SIZE - 1);
+    if (pageShift < MLX_MTT_PAGE_SHIFT || pageShift > 63)
+        return 0;
+    uint64_t pageSize = 1ULL << pageShift;
+    uint64_t pageOffset = startAddress & (pageSize - 1);
     if (!length || length > UINT64_MAX - startAddress ||
         length > UINT64_MAX - pageOffset)
         return 0;
     uint64_t span = pageOffset + length;
-    return (span >> MLX_MTT_PAGE_SHIFT) +
-           !!(span & (MLX_MTT_PAGE_SIZE - 1));
+    return (span >> pageShift) + !!(span & (pageSize - 1));
+}
+
+static inline uint64_t
+mlxMttPageCount(uint64_t startAddress, uint64_t length)
+{
+    return mlxMttPageCountShift(startAddress, length, MLX_MTT_PAGE_SHIFT);
+}
+
+/* Largest MTT page shift for a contiguous-IOVA MR that respects the
+ * DART/client-VA page-congruence the firmware needs (the low `pageSize` bits
+ * of iovaBase and startAddr must match, or entry 0 maps the wrong first page —
+ * mlx5_ib_cont_pages constraint). `maxShift` is the HCA's
+ * max_mkey_log_entity_size_mtt clamped to our 2 MiB ceiling; 0 returned only
+ * if even 4 KiB is not congruent (never, for a DART-mapped buffer). */
+static inline uint32_t
+mlxPickMttPageShift(uint64_t startAddress, uint64_t iovaBase, uint32_t maxShift)
+{
+    if (maxShift < MLX_MTT_PAGE_SHIFT)
+        maxShift = MLX_MTT_PAGE_SHIFT;
+    if (maxShift > MLX_MTT_MAX_PAGE_SHIFT)
+        maxShift = MLX_MTT_MAX_PAGE_SHIFT;
+    for (uint32_t shift = maxShift; shift >= MLX_MTT_PAGE_SHIFT; shift--) {
+        uint64_t mask = (1ULL << shift) - 1;
+        if ((iovaBase & mask) == (startAddress & mask))
+            return shift;
+    }
+    return 0;
+}
+
+/* Build the PAS list for a contiguous IOVA range at `pageShift` granularity.
+ * pageDMA[i] = (iovaBase & ~(pageSize-1)) + i*pageSize, the mlx5 flat-MTT
+ * shape (reg_create's populate path, log_page_size = pageShift). */
+static inline bool
+mlxBuildContiguousPas(uint64_t iovaBase, uint64_t startAddress, uint64_t length,
+                      uint32_t pageShift, uint64_t *pages, uint32_t capacity,
+                      uint32_t *pageCount)
+{
+    if (pageShift < MLX_MTT_PAGE_SHIFT || pageShift > 63)
+        return false;
+    uint64_t npages = mlxMttPageCountShift(startAddress, length, pageShift);
+    if (!npages || npages > capacity || !pages || !pageCount)
+        return false;
+    uint64_t pageStart = iovaBase & ~((1ULL << pageShift) - 1);
+    for (uint64_t i = 0; i < npages; i++)
+        pages[i] = pageStart + (i << pageShift);
+    *pageCount = (uint32_t)npages;
+    return true;
 }
 
 static inline uint32_t
@@ -260,11 +313,18 @@ static inline bool
 mlxEncodeCreateMkey(void *input, size_t capacity, const uint64_t *pages,
                     uint32_t pageCount, uint64_t startAddress, uint64_t length,
                     uint32_t accessFlags, uint32_t pd, uint8_t keyVariant,
-                    uint32_t *inputSize)
+                    uint32_t pageShift, uint32_t *inputSize)
 {
-    if (pageCount > MLX_CREATE_MKEY_MAX_PAGES)
+    /* The old 480-page inline cap was a property of the 4112-byte small
+     * mailbox; the real bound is now the caller-provided `capacity` (checked
+     * via size > capacity below). This loose guard only stops the 32-bit
+     * mlxCreateMkeyInputSize() from overflowing on a nonsensical count. */
+    if (pageCount > (1u << 20))
         return false;
-    uint64_t expectedPages = mlxMttPageCount(startAddress, length);
+    if (pageShift < MLX_MTT_PAGE_SHIFT || pageShift > 63)
+        return false;
+    uint64_t pageSize = 1ULL << pageShift;
+    uint64_t expectedPages = mlxMttPageCountShift(startAddress, length, pageShift);
     uint32_t size = mlxCreateMkeyInputSize(pageCount);
     if (!input || !pages || !pageCount || !length || !keyVariant ||
         (accessFlags & ~MLX_MR_ACCESS_SUPPORTED) || pd > 0xffffff ||
@@ -276,7 +336,7 @@ mlxEncodeCreateMkey(void *input, size_t capacity, const uint64_t *pages,
     uint32_t xltOctwords = mlxMttOctwordCount(pageCount);
 
     for (uint32_t i = 0; i < pageCount; i++) {
-        if (pages[i] & (MLX_MTT_PAGE_SIZE - 1))
+        if (pages[i] & (pageSize - 1))
             return false;
     }
 
@@ -303,7 +363,7 @@ mlxEncodeCreateMkey(void *input, size_t capacity, const uint64_t *pages,
     mlxSetBits(mkc, 0x80, 64, startAddress);
     mlxSetBits(mkc, 0xc0, 64, length);
     mlxSetBits(mkc, 0x1a0, 32, xltOctwords);
-    mlxSetBits(mkc, 0x1da, 6, MLX_MTT_PAGE_SHIFT);
+    mlxSetBits(mkc, 0x1da, 6, pageShift);
     mlxSetBits(in, MLX_CREATE_MKEY_ACTUAL_XLT_BIT_OFFSET, 32,
                xltOctwords);
 
