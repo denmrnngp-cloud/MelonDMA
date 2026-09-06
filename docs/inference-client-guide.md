@@ -12,9 +12,9 @@ llama.cpp, MLX or any runner.
 
 ## 1. What the API gives you (verbs subset)
 
-For the disaggregated KV path, see [the 7–15% TTFT target and implementation candidates](ttft-7-15-target-2026-09-05.md). A single destination MR does not imply one batched RPC. Reuse requires allocation ownership/generation, not just a cache hit by virtual address. Current driver pin quotas also require bounded transfer windows for large contexts.
+For the disaggregated KV path (7–15% TTFT target), a single destination MR does not imply one batched RPC. Reuse requires allocation ownership/generation, not just a cache hit by virtual address. Current driver pin quotas also require bounded transfer windows for large contexts.
 
-The companion llama.cpp now has an [opt-in one-request KV batch, direct TX-ring filling and owned host arena](kv-transfer-batch-pipeline-2026-09-05.md). Its accepted profile requires `MELONDMA_COMPLETION_POLICY=latency`; this does not establish working low-latency hardware IRQ delivery. The destination is a serialized host-state buffer, not final Metal KV tensors.
+The companion llama.cpp now has an opt-in one-request KV batch, direct TX-ring filling and an owned host arena. Its accepted profile requires `MELONDMA_COMPLETION_POLICY=latency`; this does not establish working low-latency hardware IRQ delivery. The destination is a serialized host-state buffer, not final Metal KV tensors.
 
 Header: `src/dext/usermode/libibverbs_compat/include/infiniband/verbs.h`.
 Objects: `ibv_context` → `ibv_pd` → `ibv_mr` + `ibv_cq` + `ibv_qp` (+ `ibv_ah`,
@@ -262,11 +262,11 @@ gate confirms that the SQ does not exhaust. The smoke result is stored at
   `enX`/ARP.
 - No UD/DC/XRC/SRQ/multicast; RC only.
 
-The full list — `docs/rdma-driver-spec.md`; the firmware/RoCE protocol facts — `docs/research.md` and `docs/architecture.md`.
+The full list and the firmware/RoCE protocol facts are in `docs/architecture.md`.
 
 ## 10. Overhead reduction roadmap — beat TCP
 
-Measured baseline (`docs/benchmark-rdma-cluster-2026-09-02.md`, RDMA vs the
+Measured baseline (RDMA vs the
 10GbE TCP control-path fallback): RDMA already wins the bulk path (prefill
 +2–12 %, TTFT up to −10.7 % at 65K) but pays for it twice — the Mac receiver
 burns **~45 % of a core** on `ibv_poll_cq` busy-poll in disagg, and **split
@@ -502,8 +502,7 @@ split by the caller (or use `posix_memalign` + `bytesNoCopy`, §4.B of the recip
 
 ## 13. Consumer-side transport levers (llama.cpp — not the driver)
 
-These live in `ggml/src/ggml-rpc/transport.cpp`, not MelonDMA. Ordered by impact
-(reasoning in `docs/rdma-optimization-levers.md`).
+These live in `ggml/src/ggml-rpc/transport.cpp`, not MelonDMA. Ordered by impact.
 
 1. **Pipeline the one-sided `rdma_write`.** ✅ DONE — `rdma_write` now posts a
    batch of up to 16 WRITEs in flight (unsignaled except the last) and waits once,

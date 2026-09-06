@@ -207,7 +207,7 @@ static rdma_cq *rdma_find_cq_token(rdma_device *dev, uint32_t token)
 }
 
 /* Publish the QP producer/consumer shadow state into the per-QP DB-record
- * slot (docs/shared-page-fast-path.md).  Hardware doorbell records occupy the
+ * slot (shared-page fast path).  Hardware doorbell records occupy the
  * first 8 bytes; the shadow state starts at MLX_QP_SHADOW_OFFSET and is read
  * by the DEXT once the trusted fast path is enabled.  Writing it is always
  * safe: the rest of the 128-byte slot is otherwise zeroed and unused. */

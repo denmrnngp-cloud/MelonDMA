@@ -82,7 +82,7 @@ struct mlx_query_abi_resp {
     uint32_t features;
 };
 
-/* Shared-page fast path (docs/shared-page-fast-path.md): the per-QP DB-record
+/* Shared-page fast path: the per-QP DB-record
  * slot is 128 bytes; hardware doorbell records use offsets 0..7.  The software
  * producer/consumer shadow state lives at offset 8 so a trusted client can
  * publish sq/rq heads and tails without a DriverKit crossing.  All indices are
