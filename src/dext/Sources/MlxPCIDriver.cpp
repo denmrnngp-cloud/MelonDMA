@@ -52,6 +52,12 @@
 #define MLX_LOG(fmt, ...)  IOLog("MlxPCIDriver: " fmt "\n", ##__VA_ARGS__)
 #define MLX_DBG(fmt, ...)  MLX_DBGLOG("MlxPCIDriver: " fmt, ##__VA_ARGS__)
 
+/* Two messaged sub-vectors: async on host index 0, completion on index 1.
+ * Set back to 1 to share the first sub-vector, which is what the driver did
+ * for as long as the MSI-X table was never programmed. The kernel now fills
+ * the table (nine vectors, data 1..9, all unmasked), so index 1 is live. */
+#define MLX_SINGLE_MSIX_VECTOR 0
+
 /* Quarantined MlxFwPages must outlive the driver instance that lost BAR/MMIO.
  * The registry retains the full object (and therefore every DMA reference)
  * until a later verified FLR establishes a DMA boundary. */
@@ -169,6 +175,21 @@ struct MlxPCIDriver_IVars {
     IODispatchQueue      *fCompletionWaitQueue;
     IOInterruptDispatchSource *fAsyncInterrupt;
     IOInterruptDispatchSource *fCompletionInterrupt;
+    /* Host interrupt index map (MLX_IRQ_KIND_* per index) and the indices the
+     * two dispatch sources were actually bound to. fMsixIndexBase is the host
+     * index carrying firmware vector 0; MLX_IRQ_INDEX_NONE means no messaged
+     * pair answered and the historical hardcoded 0/1 were kept instead. */
+    uint8_t               fIrqIndexKind[MLX_IRQ_INDEX_MAP];
+    uint8_t               fIrqIndexKindPre[MLX_IRQ_INDEX_MAP];
+    uint64_t              fIrqIndexType[MLX_IRQ_INDEX_MAP];
+    uint32_t              fIrqIndexCount;
+    uint32_t              fIrqIndexCountPre;
+    uint32_t              fIrqIndexProbeStatus;
+    /* Result of claiming the vectors before firmware init; 0 = granted. */
+    uint32_t              fEarlyMsixStatus;
+    uint32_t              fMsixIndexBase;
+    uint32_t              fAsyncIndex;
+    uint32_t              fCompletionIndex;
     OSAction             *fAsyncInterruptAction;
     OSAction             *fCompletionInterruptAction;
     uint64_t              fCompletionGeneration;
@@ -193,6 +214,10 @@ struct MlxPCIDriver_IVars {
     uint32_t              fIrqVectors;
     uint32_t              fIrqSetupStatus;
     uint32_t              fIrqSetupStage;
+    /* MSI-X entry 0 read BEFORE our own ConfigureInterrupts, to see whether
+     * the previous owner (Apple) programmed the table (front A experiment). */
+    uint32_t              fMsixPreConfigureEntry0AddrLo;
+    uint32_t              fMsixPreConfigureEntry0Data;
     /* Completion-EQ bring-up result. The MSI-X vectors can be live while this
      * EQ is rejected, which is exactly the case that leaves clients polling. */
     uint32_t              fCqEqStatus;
@@ -204,6 +229,7 @@ struct MlxPCIDriver_IVars {
     uint32_t              fCqEqVariantSyndrome[4];
     uint64_t             fLastHealthCheck;
     uint64_t             fEqTickCount;
+    uint32_t             fEqTimerPaused;
     uint32_t             fIssi;
     uint32_t             fPd;
     uint32_t             fXrcd;
@@ -555,28 +581,225 @@ MlxDrainEqTimerQueue(void *)
      * this serial queue have completed when it returns. */
 }
 
+/* PCIDriverKit exports only the two messaged bits of the GetInterruptType
+ * word (IOPCIFamilyDefinitions.h). The edge/level flag lives in the low bit
+ * of the same word; the SDK documents it by name but does not export it, so
+ * it is spelled out rather than referenced. */
+enum { MLX_IRQ_TYPE_LEVEL_BIT = 0x1 };
+
+static uint8_t
+MlxClassifyInterruptType(uint64_t type)
+{
+    if (type & kIOInterruptTypePCIMessagedX) return MLX_IRQ_KIND_MSIX;
+    if (type & kIOInterruptTypePCIMessaged)  return MLX_IRQ_KIND_MSI;
+    if (type & ~(uint64_t)MLX_IRQ_TYPE_LEVEL_BIT) return MLX_IRQ_KIND_OTHER;
+    return (type & MLX_IRQ_TYPE_LEVEL_BIT) ? MLX_IRQ_KIND_LEVEL
+                                           : MLX_IRQ_KIND_EDGE;
+}
+
+/* Asks the provider what each of the first MLX_IRQ_INDEX_MAP interrupt
+ * indices actually is. Read-only and side-effect free: nothing is created,
+ * enabled or written to hardware, so it is safe to run before and after
+ * ConfigureInterrupts. */
+void
+MlxPCIDriver::ProbeInterruptIndices(uint8_t *kind, uint64_t *typeRaw,
+                                    uint32_t *count,
+                                    kern_return_t *firstFailure)
+{
+    uint32_t answered = 0;
+    kern_return_t first = kIOReturnSuccess;
+    for (uint32_t i = 0; i < MLX_IRQ_INDEX_MAP; i++) {
+        uint64_t type = 0;
+        kern_return_t kr = IOInterruptDispatchSource::GetInterruptType(
+            ivars->fPci, i, &type);
+        if (kr != kIOReturnSuccess) {
+            if (kind)    kind[i] = MLX_IRQ_KIND_ABSENT;
+            if (typeRaw) typeRaw[i] = 0;
+            if (first == kIOReturnSuccess) first = kr;
+            continue;
+        }
+        answered++;
+        if (kind)    kind[i] = MlxClassifyInterruptType(type);
+        if (typeRaw) typeRaw[i] = type;
+    }
+    if (count)        *count = answered;
+    if (firstFailure) *firstFailure = first;
+}
+
+/* Picks the host indices to bind the two dispatch sources to. Firmware vector
+ * V is raised on host index base + V, so the async EQ (intr 0) and the
+ * completion EQ (intr 1) must land on two consecutive messaged indices.
+ * Without such a pair the historical hardcoded 0/1 are kept, so a provider
+ * that does not answer GetInterruptType cannot make things worse than before. */
+void
+MlxPCIDriver::SelectInterruptIndices()
+{
+    ivars->fMsixIndexBase   = MLX_IRQ_INDEX_NONE;
+    ivars->fAsyncIndex      = 0;
+    ivars->fCompletionIndex = 0;
+#if MLX_SINGLE_MSIX_VECTOR
+    for (uint32_t i = 0; i < MLX_IRQ_INDEX_MAP; i++) {
+        if (ivars->fIrqIndexKind[i] == MLX_IRQ_KIND_MSIX ||
+            ivars->fIrqIndexKind[i] == MLX_IRQ_KIND_MSI) {
+            ivars->fMsixIndexBase = i;
+            ivars->fAsyncIndex = i;
+            ivars->fCompletionIndex = i;
+            return;
+        }
+    }
+#else
+    for (uint8_t want = MLX_IRQ_KIND_MSIX; ; want = MLX_IRQ_KIND_MSI) {
+        for (uint32_t i = 0; i + 1 < MLX_IRQ_INDEX_MAP; i++) {
+            if (ivars->fIrqIndexKind[i] == want &&
+                ivars->fIrqIndexKind[i + 1] == want) {
+                ivars->fMsixIndexBase = i;
+                ivars->fAsyncIndex = i;
+                ivars->fCompletionIndex = i + 1;
+                return;
+            }
+        }
+        if (want == MLX_IRQ_KIND_MSI) break;
+    }
+#endif
+    MLX_LOG("interrupt index probe found no usable messaged vector "
+            "(count=%u status=0x%x)", ivars->fIrqIndexCount,
+            ivars->fIrqIndexProbeStatus);
+}
+
+/* Reads back the MSI-X Message Control and logs whether the enable bit is set
+ * at this point in bring-up. The bit is what firmware would look at if it
+ * decides once, at its own initialization, whether the function has message
+ * interrupts at all. */
+void
+MlxPCIDriver::LogMsixEnable(const char *stage)
+{
+    if (!ivars || !ivars->fPci) return;
+    uint16_t status = 0;
+    ivars->fPci->ConfigurationRead16(0x06, &status);
+    if (!(status & 0x0010)) return;
+    uint8_t ptr = 0;
+    ivars->fPci->ConfigurationRead8(0x34, &ptr);
+    for (uint32_t guard = 0; ptr >= 0x40 && guard < 48; guard++) {
+        uint16_t idNext = 0;
+        ivars->fPci->ConfigurationRead16(ptr, &idNext);
+        if ((idNext & 0xff) == 0x11) {
+            uint16_t mc = 0;
+            ivars->fPci->ConfigurationRead16((uint64_t)ptr + 0x02, &mc);
+            MLX_LOG("MSI-X at %s: control=0x%04x enable=%u function_mask=%u",
+                    stage, mc, (mc >> 15) & 1u, (mc >> 14) & 1u);
+            return;
+        }
+        ptr = (uint8_t)(idNext >> 8);
+    }
+}
+
+/* Enables MSI-X in the device before firmware initialization.
+ *
+ * The order used to be reset, then firmware init, then interrupts. A function
+ * level reset clears the MSI-X enable bit, so firmware ran its entire
+ * initialization while the capability read disabled. If firmware samples that
+ * bit once, when it comes up, to decide whether the function has message
+ * interrupts, then enabling MSI-X afterwards is too late: the table can be
+ * programmed, the queues armed and events delivered, and no vector is ever
+ * raised — which is exactly what was measured, on both queues, regardless of
+ * table contents.
+ *
+ * This only asks for the vectors. Dispatch sources are still created later by
+ * StartInterrupts, which tolerates being called twice. */
+kern_return_t
+MlxPCIDriver::EnableMsixEarly()
+{
+    if (!ivars || !ivars->fPci) return kIOReturnNotReady;
+    LogMsixEnable("after FLR, before enabling");
+    /* Allocate once, before firmware init.  ConfigureInterrupts is the
+     * provider-side allocation boundary; calling it again in StartInterrupts
+     * can retain the first allocation and leave the MSI-X table unrouted.
+     *
+     * Ask for two required, nine requested.  Two is what the driver actually
+     * binds once the vectors are split: async on host index 0, completion on
+     * index 1.  Asking for one used to look harmless only because
+     * rdar://118153788 keeps a nub's first interrupt configuration for life,
+     * so on this machine the request met a pre-existing nine-vector
+     * allocation and became a no-op.  On a freshly enumerated nub it would
+     * allocate exactly one vector, index 1 would not exist, and the
+     * completion source would silently fall back onto the async vector.
+     * Nine matches what the platform publishes and what Apple's own driver
+     * for this card requests; allocateDeviceInterrupts walks down from there
+     * and only fails below the required two. */
+    kern_return_t kr = ivars->fPci->ConfigureInterrupts(
+        kIOInterruptTypePCIMessagedX, MLX_SINGLE_MSIX_VECTOR ? 1 : 2, 9, 0);
+    ivars->fEarlyMsixStatus = (uint32_t)kr;
+    if (kr != kIOReturnSuccess)
+        MLX_LOG("early MSI-X enable failed: 0x%x — falling back to the old "
+                "ordering, interrupts are claimed after firmware init", kr);
+    LogMsixEnable("after early enable, before firmware init");
+    return kr;
+}
+
 kern_return_t
 MlxPCIDriver::StartInterrupts()
 {
     if (!ivars || !ivars->fPci) return kIOReturnNotReady;
-    ivars->fIrqSetupStage = MLX_IRQ_STAGE_CONFIGURE;
-    kern_return_t kr = ivars->fPci->ConfigureInterrupts(
-        kIOInterruptTypePCIMessagedX, 2, 2, 0);
+    /* Probe once before allocation, so the map can show whether the messaged
+     * indices exist only after ConfigureInterrupts. Skipped on the FLR re-arm
+     * path, where the first probe's answer is the one that matters. */
+    if (!ivars->fCompletionInterrupt)
+        ProbeInterruptIndices(ivars->fIrqIndexKindPre, NULL,
+                              &ivars->fIrqIndexCountPre, NULL);
+    /* Front A experiment: snapshot MSI-X entry 0 BEFORE our own
+     * ConfigureInterrupts, to see whether the previous owner (Apple) left a
+     * programmed table (addrLo = the platform MSI doorbell 0xfffff000) or the
+     * table was already empty. Walk the capability list like ReadMsixState so
+     * the read is the same one the diagnostic uses. */
+    ivars->fMsixPreConfigureEntry0AddrLo = 0;
+    ivars->fMsixPreConfigureEntry0Data = 0;
+    {
+        uint16_t status = 0;
+        ivars->fPci->ConfigurationRead16(0x06, &status);
+        uint8_t ptr = 0;
+        ivars->fPci->ConfigurationRead8(0x34, &ptr);
+        uint32_t cap = 0;
+        for (uint32_t g = 0; (status & 0x10) && ptr >= 0x40 && g < 48; g++) {
+            uint16_t idNext = 0;
+            ivars->fPci->ConfigurationRead16(ptr, &idNext);
+            if ((idNext & 0xff) == 0x11) { cap = ptr; break; }
+            ptr = (uint8_t)(idNext >> 8);
+        }
+        if (cap) {
+            uint32_t tbl = 0;
+            ivars->fPci->ConfigurationRead32((uint64_t)cap + 0x04, &tbl);
+            const uint64_t base = (uint64_t)(tbl & ~0x7u);
+            ivars->fPci->MemoryRead32(ivars->fBar0Index, base + 0,
+                                      &ivars->fMsixPreConfigureEntry0AddrLo);
+            ivars->fPci->MemoryRead32(ivars->fBar0Index, base + 8,
+                                      &ivars->fMsixPreConfigureEntry0Data);
+        }
+        MLX_LOG("MSI-X pre-configure entry0: addrLo=0x%08x data=0x%08x",
+                ivars->fMsixPreConfigureEntry0AddrLo,
+                ivars->fMsixPreConfigureEntry0Data);
+    }
+    /* EnableMsixEarly owns the single ConfigureInterrupts allocation.  The
+     * dispatch sources are intentionally created here, after firmware init,
+     * but the provider must not be configured a second time. */
+    kern_return_t kr = (ivars->fEarlyMsixStatus == kIOReturnSuccess)
+        ? kIOReturnSuccess : (kern_return_t)ivars->fEarlyMsixStatus;
     if (kr != kIOReturnSuccess) {
         ivars->fIrqSetupStatus = (uint32_t)kr;
-        MLX_LOG("MSI-X allocation (2 vectors) failed: 0x%x", kr);
+        MLX_LOG("MSI-X allocation failed before firmware init: 0x%x", kr);
         return kr;
     }
-    ivars->fIrqVectors = 2;
+    /* fIrqVectors reports how many vectors the driver binds, not how many the
+     * provider allocated; the real allocation is in fIrqIndexCount. */
+    ivars->fIrqVectors = MLX_SINGLE_MSIX_VECTOR ? 1 : 2;
     if (ivars->fCompletionInterrupt) {
         /* Re-arm after a reinit FLR. The host-side dispatch sources survive a
          * reset, the device's MSI-X capability does not, so only the device
          * side is redone; recreating the sources would race DriverKit's
          * asynchronous disable/cancel. */
         ivars->fIrqSetupStage = MLX_IRQ_STAGE_ENABLE;
-        kr = ivars->fAsyncInterrupt->SetEnableWithCompletion(true, nullptr);
-        if (kr == kIOReturnSuccess)
-            kr = ivars->fCompletionInterrupt->SetEnableWithCompletion(true, nullptr);
+        kr = ivars->fAsyncInterrupt->SetEnable(true);
+        if (kr == kIOReturnSuccess && !MLX_SINGLE_MSIX_VECTOR)
+            kr = ivars->fCompletionInterrupt->SetEnable(true);
         if (kr != kIOReturnSuccess) {
             ivars->fIrqSetupStatus = (uint32_t)kr;
             MLX_LOG("MSI-X re-arm after reset failed: 0x%x", kr);
@@ -587,6 +810,13 @@ MlxPCIDriver::StartInterrupts()
         MLX_LOG("MSI-X re-armed after reset");
         return kIOReturnSuccess;
     }
+    /* Now that the vectors are allocated, ask again and choose. */
+    kern_return_t probeKr = kIOReturnSuccess;
+    ProbeInterruptIndices(ivars->fIrqIndexKind, ivars->fIrqIndexType,
+                          &ivars->fIrqIndexCount, &probeKr);
+    ivars->fIrqIndexProbeStatus = (uint32_t)probeKr;
+    SelectInterruptIndices();
+
     ivars->fIrqSetupStage = MLX_IRQ_STAGE_QUEUE;
     kr = IODispatchQueue::Create("MlxIRQ", 0, 0, &ivars->fInterruptQueue);
     if (kr == kIOReturnSuccess)
@@ -595,32 +825,49 @@ MlxPCIDriver::StartInterrupts()
     if (kr == kIOReturnSuccess) {
         ivars->fIrqSetupStage = MLX_IRQ_STAGE_SOURCE;
         kr = IOInterruptDispatchSource::Create(
-            ivars->fPci, 0, ivars->fInterruptQueue, &ivars->fAsyncInterrupt);
+            ivars->fPci, ivars->fAsyncIndex, ivars->fInterruptQueue,
+            &ivars->fAsyncInterrupt);
+        /* A chosen index that the provider then refuses is worse than the old
+         * behaviour, so fall back rather than leave the device without any
+         * interrupt path at all. */
+        if (kr != kIOReturnSuccess &&
+            ivars->fMsixIndexBase != MLX_IRQ_INDEX_NONE) {
+            MLX_LOG("async source refused at index %u (0x%x) — falling back "
+                    "to 0/1", ivars->fAsyncIndex, kr);
+            ivars->fMsixIndexBase   = MLX_IRQ_INDEX_NONE;
+            ivars->fAsyncIndex      = 0;
+            ivars->fCompletionIndex = 1;
+            kr = IOInterruptDispatchSource::Create(
+                ivars->fPci, ivars->fAsyncIndex, ivars->fInterruptQueue,
+                &ivars->fAsyncInterrupt);
+        }
     }
-    if (kr == kIOReturnSuccess)
+    if (kr == kIOReturnSuccess && !MLX_SINGLE_MSIX_VECTOR)
         kr = IOInterruptDispatchSource::Create(
-            ivars->fPci, 1, ivars->fInterruptQueue,
+            ivars->fPci, ivars->fCompletionIndex, ivars->fInterruptQueue,
             &ivars->fCompletionInterrupt);
+    else if (kr == kIOReturnSuccess)
+        ivars->fCompletionInterrupt = ivars->fAsyncInterrupt;
     if (kr == kIOReturnSuccess) {
         ivars->fIrqSetupStage = MLX_IRQ_STAGE_ACTION;
         kr = CreateActionAsyncInterruptOccurred(0, &ivars->fAsyncInterruptAction);
     }
-    if (kr == kIOReturnSuccess)
+    if (kr == kIOReturnSuccess && !MLX_SINGLE_MSIX_VECTOR)
         kr = CreateActionCompletionInterruptOccurred(
             0, &ivars->fCompletionInterruptAction);
     if (kr == kIOReturnSuccess) {
         ivars->fIrqSetupStage = MLX_IRQ_STAGE_HANDLER;
         kr = ivars->fAsyncInterrupt->SetHandler(ivars->fAsyncInterruptAction);
     }
-    if (kr == kIOReturnSuccess)
+    if (kr == kIOReturnSuccess && !MLX_SINGLE_MSIX_VECTOR)
         kr = ivars->fCompletionInterrupt->SetHandler(
             ivars->fCompletionInterruptAction);
     if (kr == kIOReturnSuccess) {
         ivars->fIrqSetupStage = MLX_IRQ_STAGE_ENABLE;
-        kr = ivars->fAsyncInterrupt->SetEnableWithCompletion(true, nullptr);
+        kr = ivars->fAsyncInterrupt->SetEnable(true);
     }
-    if (kr == kIOReturnSuccess)
-        kr = ivars->fCompletionInterrupt->SetEnableWithCompletion(true, nullptr);
+    if (kr == kIOReturnSuccess && !MLX_SINGLE_MSIX_VECTOR)
+        kr = ivars->fCompletionInterrupt->SetEnable(true);
     if (kr != kIOReturnSuccess) {
         ivars->fIrqSetupStatus = (uint32_t)kr;
         MLX_LOG("MSI-X dispatch setup failed at stage %u: 0x%x",
@@ -630,7 +877,12 @@ MlxPCIDriver::StartInterrupts()
     }
     ivars->fIrqSetupStage = MLX_IRQ_STAGE_NONE;
     ivars->fIrqSetupStatus = 0;
-    MLX_LOG("MSI-X dispatch active: async vector=0 completion vector=1");
+    MLX_LOG("MSI-X dispatch active: async index=%u completion index=%u "
+            "msixBase=%d probed=%u/%u",
+            ivars->fAsyncIndex, ivars->fCompletionIndex,
+            ivars->fMsixIndexBase == MLX_IRQ_INDEX_NONE
+                ? -1 : (int)ivars->fMsixIndexBase,
+            ivars->fIrqIndexCount, ivars->fIrqIndexCountPre);
     return kIOReturnSuccess;
 }
 
@@ -659,6 +911,340 @@ MlxPCIDriver::GetEqServiceStats(uint64_t *asyncIrq, uint64_t *completionIrq,
                      ivars->fRoCE->GetCQ()->LiveCount();
         *timerPeriodMs = mlxEqPollPeriodMs(inUse, CompletionInterruptReady());
     }
+}
+
+void
+MlxPCIDriver::GetInterruptIndexMap(uint32_t *count, uint32_t *countPre,
+                                   uint32_t *msixBase, uint32_t *asyncIndex,
+                                   uint32_t *completionIndex,
+                                   uint32_t *probeStatus,
+                                   uint8_t *kind, uint8_t *kindPre,
+                                   uint64_t *typeRaw) const
+{
+    if (count)           *count           = ivars ? ivars->fIrqIndexCount : 0;
+    if (countPre)        *countPre        = ivars ? ivars->fIrqIndexCountPre : 0;
+    if (msixBase)        *msixBase        = ivars ? ivars->fMsixIndexBase
+                                                  : MLX_IRQ_INDEX_NONE;
+    if (asyncIndex)      *asyncIndex      = ivars ? ivars->fAsyncIndex : 0;
+    if (completionIndex) *completionIndex = ivars ? ivars->fCompletionIndex : 0;
+    if (probeStatus)     *probeStatus     = ivars ? ivars->fIrqIndexProbeStatus : 0;
+    for (uint32_t i = 0; i < MLX_IRQ_INDEX_MAP; i++) {
+        if (kind)    kind[i]    = ivars ? ivars->fIrqIndexKind[i] : 0;
+        if (kindPre) kindPre[i] = ivars ? ivars->fIrqIndexKindPre[i] : 0;
+        if (typeRaw) typeRaw[i] = ivars ? ivars->fIrqIndexType[i] : 0;
+    }
+}
+
+/* QUERY_EQ (0x302): asks firmware what state an event queue is actually in.
+ *
+ * Everything else about the interrupt path can be verified by reading our own
+ * code; this cannot. An EQ that still reads ARMED after firmware has written
+ * an entry into it never fired, which means the silence is upstream of the
+ * MSI-X table and no amount of programming the table will help. An EQ that
+ * reads FIRED did raise its vector, and the message was lost afterwards.
+ *
+ * The output mailbox is larger than the raw debug-exec path allows, which is
+ * why this has its own selector: query_eq_out is status and syndrome, then the
+ * event queue context at 0x40, then the event bitmask and the page list. */
+kern_return_t
+MlxPCIDriver::QueryEqState(const struct mlx_query_eq_req *req,
+                           struct mlx_query_eq_resp *resp)
+{
+    if (!req || !resp) return kIOReturnBadArgument;
+    memset(resp, 0, sizeof(*resp));
+    if (!ivars || !ivars->fCmd) return kIOReturnNotReady;
+
+    uint8_t in[16] = {};
+    mlxSetBits(in, 0x00, 16, MLX_CMD_OP_QUERY_EQ);
+    /* eq_number lives at bit 0x58, after uid, op_mod and the reserved span —
+     * the same place DestroyEQ writes it. Putting it at 0x20 lands in a
+     * reserved field and firmware rejects the command with BAD_PARAM. */
+    mlxSetBits(in, 0x58, 8, req->eqn);
+
+    /* query_eq_out is far larger than the fixed header suggests: after status
+     * and syndrome come the 80-byte event queue context, the four event
+     * bitmask words, a large reserved span and then the page list. Handing
+     * firmware a short output mailbox makes the command fail outright rather
+     * than truncate, which is what a 256-byte buffer did here. One kilobyte
+     * covers the fixed part and the page list of any EQ this driver creates. */
+    const uint32_t outBytes = 0x400;
+    uint8_t *out = IONewZero(uint8_t, outBytes);
+    if (!out) return kIOReturnNoMemory;
+    kern_return_t kr = ivars->fCmd->Exec(MLX_CMD_OP_QUERY_EQ, in, sizeof(in),
+                                         out, outBytes, 5000);
+    if (kr != kIOReturnSuccess) {
+        /* Report the failure in the payload instead of only as a return code:
+         * the kernel log channel is dead on this machine, so an opaque error
+         * here costs a rebuild to diagnose. */
+        resp->status = (uint32_t)kr;
+        resp->fwStatus = ivars->fCmd->LastFwStatus();
+        resp->syndrome = ivars->fCmd->LastSyndrome();
+        resp->state = 0xffffffffu;
+        IODelete(out, uint8_t, outBytes);
+        return kIOReturnSuccess;
+    }
+    /* The event queue context begins at bit 0x80 of the output, i.e. byte 16 —
+     * the same offset CreateEQ uses on the way in. mlxGetBits takes a BIT
+     * offset, so the context is reached by advancing the POINTER by bytes and
+     * then using the field offsets from mlx5_ifc_eqc_bits relative to it.
+     * Adding 0x40 to the bit offsets instead reads neighbouring fields and
+     * yields values that look plausible but are not the ones asked for. */
+    const uint8_t *eqc = out + (0x80 / 8);
+    resp->status        = 0;
+    resp->state         = (uint32_t)mlxGetBits(eqc, 0x14, 4);
+    resp->logEqSize     = (uint32_t)mlxGetBits(eqc, 0x63, 5);
+    resp->uarPage       = (uint32_t)mlxGetBits(eqc, 0x68, 24);
+    resp->intr          = (uint32_t)mlxGetBits(eqc, 0xb4, 12);
+    /* Both counters are 24-bit and sit after a 0x60-bit reserved span that
+     * ends at 0x140, each preceded by its own reserved byte: consumer at
+     * 0x148, producer at 0x168. Reading them 0x18 bits early returns the value
+     * shifted, which is what a producer counter of 0x230000 was. */
+    resp->consumerIndex = (uint32_t)mlxGetBits(eqc, 0x148, 24);
+    resp->producerIndex = (uint32_t)mlxGetBits(eqc, 0x168, 24);
+    IODelete(out, uint8_t, outBytes);
+    MLX_LOG("QUERY_EQ %u: state=0x%x intr=%u uar=%u ci=%u pi=%u",
+            req->eqn, resp->state, resp->intr, resp->uarPage,
+            resp->consumerIndex, resp->producerIndex);
+    return kIOReturnSuccess;
+}
+
+/* Locates the MSI-X table in BAR0 and returns the byte offset of one entry,
+ * or 0 when the capability is absent, the table lives in a BAR this driver
+ * does not map, or the vector is outside the implemented table. Shared by the
+ * readback and the writer so both agree on where the table is. */
+uint64_t
+MlxPCIDriver::MsixEntryOffset(uint32_t vector, uint32_t *tableSizeOut)
+{
+    if (tableSizeOut) *tableSizeOut = 0;
+    if (!ivars || !ivars->fPci) return 0;
+    uint16_t status = 0;
+    ivars->fPci->ConfigurationRead16(0x06, &status);
+    if (!(status & 0x0010)) return 0;
+    uint8_t ptr = 0;
+    ivars->fPci->ConfigurationRead8(0x34, &ptr);
+    uint32_t cap = 0;
+    for (uint32_t guard = 0; ptr >= 0x40 && guard < 48; guard++) {
+        uint16_t idNext = 0;
+        ivars->fPci->ConfigurationRead16(ptr, &idNext);
+        if ((idNext & 0xff) == 0x11) { cap = ptr; break; }
+        ptr = (uint8_t)(idNext >> 8);
+    }
+    if (!cap) return 0;
+    uint16_t mc = 0;
+    ivars->fPci->ConfigurationRead16((uint64_t)cap + 0x02, &mc);
+    uint32_t tableSize = (uint32_t)(mc & 0x07ffu) + 1u;
+    if (tableSizeOut) *tableSizeOut = tableSize;
+    if (vector >= tableSize) return 0;
+    uint32_t tbl = 0;
+    ivars->fPci->ConfigurationRead32((uint64_t)cap + 0x04, &tbl);
+    if ((tbl & 0x7u) != ivars->fBar0Index) return 0;
+    return (uint64_t)(tbl & ~0x7u) + (uint64_t)vector * 16u;
+}
+
+/* Writes one MSI-X table entry.
+ *
+ * Normally the kernel does this: IOPCIFamily's initDevice, reached from
+ * allocateDeviceInterrupts, fills every entry with an address and a data base
+ * it obtains from the platform. On this machine that never ran to completion —
+ * the capability reads enabled with 64 entries, yet every entry is zero, so a
+ * raised vector became a DMA write of zero to physical address zero and went
+ * nowhere. This writes the entry the kernel would have written.
+ *
+ * The address is the platform MSI doorbell and the data selects one of the
+ * controller's vectors. Both come from the caller: the data base in particular
+ * is not derivable inside a DEXT (it lives in the device tree, as
+ * msi-vector-offset on the PCIe controller node), so the bring-up finds it by
+ * trying candidates and seeing which one actually delivers. */
+kern_return_t
+MlxPCIDriver::ProgramMsix(struct mlx_program_msix_req *req)
+{
+    if (!req) return kIOReturnBadArgument;
+    if (req->op > MLX_MSIX_OP_PEEK) return kIOReturnBadArgument;
+
+    /* Raw access stays inside the two MSI-X structures and nowhere else: this
+     * is a diagnostic, and a stray dword written into a device register window
+     * would be a far worse bug than the one it is meant to find. */
+    if (req->op == MLX_MSIX_OP_POKE || req->op == MLX_MSIX_OP_PEEK) {
+        uint32_t tableSizeRaw = 0;
+        if (!MsixEntryOffset(0, &tableSizeRaw) || !tableSizeRaw)
+            return kIOReturnUnsupported;
+        uint16_t status = 0;
+        ivars->fPci->ConfigurationRead16(0x06, &status);
+        uint8_t ptr = 0;
+        ivars->fPci->ConfigurationRead8(0x34, &ptr);
+        uint32_t cap = 0;
+        for (uint32_t guard = 0; ptr >= 0x40 && guard < 48; guard++) {
+            uint16_t idNext = 0;
+            ivars->fPci->ConfigurationRead16(ptr, &idNext);
+            if ((idNext & 0xff) == 0x11) { cap = ptr; break; }
+            ptr = (uint8_t)(idNext >> 8);
+        }
+        if (!cap) return kIOReturnUnsupported;
+        uint32_t which = req->addrLo;          /* 0 = table, 1 = pending bits */
+        uint32_t reg = 0;
+        ivars->fPci->ConfigurationRead32((uint64_t)cap + (which ? 0x08 : 0x04),
+                                         &reg);
+        if ((reg & 0x7u) != ivars->fBar0Index) return kIOReturnUnsupported;
+        uint32_t dwords = which ? ((tableSizeRaw + 31u) / 32u)
+                                : (tableSizeRaw * 4u);
+        if (req->vector >= dwords) return kIOReturnBadArgument;
+        uint64_t at = (uint64_t)(reg & ~0x7u) + (uint64_t)req->vector * 4u;
+        if (req->op == MLX_MSIX_OP_POKE)
+            ivars->fPci->MemoryWrite32(ivars->fBar0Index, at, req->data);
+        else
+            ivars->fPci->MemoryRead32(ivars->fBar0Index, at, &req->dataOut);
+        return kIOReturnSuccess;
+    }
+
+    uint32_t tableSize = 0;
+    uint64_t off = MsixEntryOffset(req->vector, &tableSize);
+    if (!off) return tableSize ? kIOReturnBadArgument : kIOReturnUnsupported;
+
+    if (req->op == MLX_MSIX_OP_MASK) {
+        /* Read/modify/write so an entry that is already programmed keeps its
+         * address and data; masking must not erase them. */
+        uint32_t ctrl = 0;
+        ivars->fPci->MemoryRead32(ivars->fBar0Index, off + 12, &ctrl);
+        ctrl = req->masked ? (ctrl | 1u) : (ctrl & ~1u);
+        ivars->fPci->MemoryWrite32(ivars->fBar0Index, off + 12, ctrl);
+        return kIOReturnSuccess;
+    }
+
+    /* Mask first, then write address and data, then set the requested mask
+     * state. Per the PCIe specification an entry must not be updated while it
+     * is unmasked: the function may send a message built from a half-written
+     * entry. */
+    ivars->fPci->MemoryWrite32(ivars->fBar0Index, off + 12, 1u);
+    ivars->fPci->MemoryWrite32(ivars->fBar0Index, off + 0, req->addrLo);
+    ivars->fPci->MemoryWrite32(ivars->fBar0Index, off + 4, req->addrHi);
+    ivars->fPci->MemoryWrite32(ivars->fBar0Index, off + 8, req->data);
+    ivars->fPci->MemoryWrite32(ivars->fBar0Index, off + 12,
+                               req->masked ? 1u : 0u);
+    MLX_LOG("MSI-X vector %u programmed: addr=0x%08x%08x data=0x%x masked=%u",
+            req->vector, req->addrHi, req->addrLo, req->data, req->masked);
+    return kIOReturnSuccess;
+}
+
+/* Negotiated PCIe link, from the PCI Express Capability (id 0x10) Link Status
+ * register at cap+0x12: bits 3:0 encode the generation and bits 9:4 the lane
+ * count. This is what a measured transfer has to be divided by for the result
+ * to mean anything on another machine — on this one the card sits behind a
+ * Thunderbolt tunnel and negotiates far less than its own wire rate. */
+void
+MlxPCIDriver::GetPcieLink(uint32_t *speed, uint32_t *width)
+{
+    if (speed) *speed = 0;
+    if (width) *width = 0;
+    if (!ivars || !ivars->fPci) return;
+    uint16_t status = 0;
+    ivars->fPci->ConfigurationRead16(0x06, &status);
+    if (!(status & 0x0010)) return;          /* no capability list */
+    uint8_t ptr = 0;
+    ivars->fPci->ConfigurationRead8(0x34, &ptr);
+    for (uint32_t guard = 0; ptr >= 0x40 && guard < 48; guard++) {
+        uint16_t idNext = 0;
+        ivars->fPci->ConfigurationRead16(ptr, &idNext);
+        if ((idNext & 0xff) == 0x10) {       /* PCI Express Capability */
+            uint16_t link = 0;
+            ivars->fPci->ConfigurationRead16((uint64_t)ptr + 0x12, &link);
+            if (speed) *speed = link & 0xfu;
+            if (width) *width = (link >> 4) & 0x3fu;
+            return;
+        }
+        ptr = (uint8_t)(idNext >> 8);
+    }
+}
+
+/* Reads the MSI-X capability out of config space and the head of the table
+ * and the pending bits out of the BAR the capability points at. Read-only:
+ * nothing here writes, masks or enables anything, so it can be taken at any
+ * time, including around a traffic burst to see whether pending bits latch.
+ *
+ * Layout (PCIe base spec, MSI-X capability id 0x11):
+ *   cap+0x00  cap id | next
+ *   cap+0x02  message control: bit 15 enable, bit 14 function mask,
+ *                              bits 10:0 table size minus one
+ *   cap+0x04  table offset (bits 31:3) | BIR (bits 2:0)
+ *   cap+0x08  PBA offset   (bits 31:3) | BIR (bits 2:0)
+ * Each table entry is 16 bytes: addr low, addr high, data, vector control. */
+kern_return_t
+MlxPCIDriver::ReadMsixState(struct mlx_msix_state_resp *out)
+{
+    if (!out) return kIOReturnBadArgument;
+    memset(out, 0, sizeof(*out));
+    if (!ivars || !ivars->fPci) return kIOReturnNotReady;
+    out->barIndexUsed = MLX_IRQ_INDEX_NONE;
+
+    uint16_t cmd = 0;
+    ivars->fPci->ConfigurationRead16(0x04, &cmd);
+    out->commandReg = cmd;
+
+    /* Walk the capability list rather than trusting a known offset: the same
+     * code has to survive a different card. */
+    uint16_t status = 0;
+    ivars->fPci->ConfigurationRead16(0x06, &status);
+    if (!(status & 0x0010)) return kIOReturnUnsupported;  /* no capability list */
+    uint8_t ptr = 0;
+    ivars->fPci->ConfigurationRead8(0x34, &ptr);
+    uint32_t cap = 0;
+    for (uint32_t guard = 0; ptr >= 0x40 && guard < 48; guard++) {
+        uint16_t idNext = 0;
+        ivars->fPci->ConfigurationRead16(ptr, &idNext);
+        if ((idNext & 0xff) == 0x11) { cap = ptr; break; }
+        ptr = (uint8_t)(idNext >> 8);
+    }
+    if (!cap) return kIOReturnUnsupported;
+    out->capOffset = cap;
+
+    uint16_t mc = 0;
+    ivars->fPci->ConfigurationRead16((uint64_t)cap + 0x02, &mc);
+    out->messageControl = mc;
+    out->tableSize = (uint32_t)(mc & 0x07ffu) + 1u;
+
+    uint32_t tbl = 0, pba = 0;
+    ivars->fPci->ConfigurationRead32((uint64_t)cap + 0x04, &tbl);
+    ivars->fPci->ConfigurationRead32((uint64_t)cap + 0x08, &pba);
+    out->tableBir    = tbl & 0x7u;
+    out->tableOffset = tbl & ~0x7u;
+    out->pbaBir      = pba & 0x7u;
+    out->pbaOffset   = pba & ~0x7u;
+
+    /* The BIR is a BAR number while fBar0Index is the memory index used with
+     * MemoryRead32; the two numbering schemes coincide on this card, where
+     * both the table and the PBA live in BAR0 at memory index 0. A card that
+     * puts them elsewhere reports the BIRs and leaves the payload empty rather
+     * than reading through an index that means something else. */
+    if (out->tableBir != ivars->fBar0Index || out->pbaBir != ivars->fBar0Index) {
+        out->status = kIOReturnUnsupported;
+        return kIOReturnSuccess;
+    }
+    out->barIndexUsed = ivars->fBar0Index;
+    out->preConfigureEntry0AddrLo = ivars->fMsixPreConfigureEntry0AddrLo;
+    out->preConfigureEntry0Data = ivars->fMsixPreConfigureEntry0Data;
+
+    uint32_t entries = out->tableSize;
+    if (entries > MLX_MSIX_TABLE_SNAPSHOT) entries = MLX_MSIX_TABLE_SNAPSHOT;
+    for (uint32_t i = 0; i < entries; i++) {
+        uint64_t base = (uint64_t)out->tableOffset + (uint64_t)i * 16u;
+        ivars->fPci->MemoryRead32(ivars->fBar0Index, base + 0,
+                                  &out->entry[i].addrLo);
+        ivars->fPci->MemoryRead32(ivars->fBar0Index, base + 4,
+                                  &out->entry[i].addrHi);
+        ivars->fPci->MemoryRead32(ivars->fBar0Index, base + 8,
+                                  &out->entry[i].data);
+        ivars->fPci->MemoryRead32(ivars->fBar0Index, base + 12,
+                                  &out->entry[i].vectorControl);
+    }
+    out->entriesRead = entries;
+
+    uint32_t words = (out->tableSize + 31u) / 32u;
+    if (words > MLX_MSIX_PBA_WORDS) words = MLX_MSIX_PBA_WORDS;
+    for (uint32_t i = 0; i < words; i++)
+        ivars->fPci->MemoryRead32(ivars->fBar0Index,
+                                  (uint64_t)out->pbaOffset + i * 4u,
+                                  &out->pba[i]);
+    out->pbaWords = words;
+    return kIOReturnSuccess;
 }
 
 void
@@ -695,12 +1281,20 @@ MlxPCIDriver::BringUpCompletionEq()
     if (!ivars || !ivars->fCompletionInterrupt || ivars->fCompletionEQ) return;
 
     struct Variant { uint32_t intr; uint32_t logSize; bool ownUar; bool usable; };
+#if MLX_SINGLE_MSIX_VECTOR
     static const Variant kVariants[] = {
-        { 1, 8, false, true  },  /* baseline: own vector, 256 entries */
-        { 1, 6, false, true  },  /* smaller ring */
-        { 1, 8, true,  true  },  /* its own UAR page rather than the boot one */
-        { 0, 8, false, false },  /* diagnostic only: is the vector index it? */
+        { 0, 8, false, true  },  /* shared first sub-vector, 256 entries */
     };
+#else
+    /* Own sub-vector first, sharing vector 0 as the fallback. The fallback is
+     * exactly the old behaviour, so firmware that refuses intr=1 leaves the
+     * driver no worse off; which variant won is reported as fCqEqVariant and
+     * in the log line below. ProbeCompletionVector can rebind at runtime. */
+    static const Variant kVariants[] = {
+        { 1, 8, false, true  },  /* own sub-vector, host index 1 */
+        { 0, 8, false, true  },  /* fallback: shared with the async vector */
+    };
+#endif
     const uint32_t count = sizeof(kVariants) / sizeof(kVariants[0]);
 
     for (uint32_t i = 0; i < count; i++) {
@@ -821,7 +1415,8 @@ MlxPCIDriver::StopInterrupts()
             &ivars->fCompletionGeneration, kIODispatchQueueWakeupAll);
     if (ivars->fAsyncInterrupt)
         (void)ivars->fAsyncInterrupt->SetEnableWithCompletion(false, nullptr);
-    if (ivars->fCompletionInterrupt)
+    if (ivars->fCompletionInterrupt &&
+        ivars->fCompletionInterrupt != ivars->fAsyncInterrupt)
         (void)ivars->fCompletionInterrupt->SetEnableWithCompletion(false, nullptr);
     /* DriverKit disable/cancel completion is asynchronous. Retain the source
      * objects until the DEXT process exits instead of racing an in-flight IRQ. */
@@ -848,12 +1443,31 @@ MlxPCIDriver::AsyncInterruptOccurred_Impl(OSAction *, uint64_t, uint64_t)
 {
     if (!ivars || ivars->fStopping || !ivars->fEQ) return;
     __atomic_fetch_add(&ivars->fAsyncIrqCount, 1, __ATOMIC_RELAXED);
-    uint32_t completions = 0;
-    (void)ivars->fEQ->Poll(&completions);
+    uint32_t totalAsyncCompletions = 0;
+    uint32_t totalCompletionEqes = 0;
+    /* One interrupt now represents both EQs. Drain both to quiescence, but
+     * keep a hard bound so a hot ring cannot monopolize the DriverKit queue. */
+    for (uint32_t pass = 0; pass < 16; pass++) {
+        uint32_t asyncCompletions = 0;
+        uint32_t completionEqes = 0;
+        uint32_t asyncEntries = ivars->fEQ->Poll(&asyncCompletions);
+        uint32_t completionEntries = ivars->fCompletionEQ
+            ? ivars->fCompletionEQ->Poll(&completionEqes) : 0;
+        totalAsyncCompletions += asyncCompletions;
+        totalCompletionEqes += completionEqes;
+        if (!asyncEntries && !completionEntries) break;
+    }
     (void)ivars->fEQ->Arm();
-    /* The async EQ remains a valid completion fallback when no dedicated EQ
-     * was accepted. Its CQEs wake waiters, but do not prove vector 1 works. */
-    SignalCompletionEvent(completions);
+    if (ivars->fCompletionEQ) (void)ivars->fCompletionEQ->Arm();
+    if (totalCompletionEqes) {
+        __atomic_fetch_add(&ivars->fCompletionIrqCount, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&ivars->fIrqCompletionEqes, totalCompletionEqes,
+                           __ATOMIC_RELAXED);
+        __atomic_store_n(&ivars->fLastCompletionIrqNs,
+                         clock_gettime_nsec_np(CLOCK_UPTIME_RAW),
+                         __ATOMIC_RELEASE);
+    }
+    SignalCompletionEvent(totalAsyncCompletions + totalCompletionEqes);
 }
 
 void
@@ -988,6 +1602,11 @@ MlxPCIDriver::EqTimerOccurred_Impl(OSAction *action, uint64_t time)
     if (!ivars || ivars->fStopping || !ivars->fEqTimer) return;
     uint64_t tick = __atomic_add_fetch(&ivars->fEqTickCount, 1, __ATOMIC_RELAXED);
     if (tick == 1) MLX_LOG("EQ timer first callback entered");
+    if (__atomic_load_n(&ivars->fEqTimerPaused, __ATOMIC_ACQUIRE)) {
+        (void)ivars->fEqTimer->WakeAtTime(
+            kIOTimerClockUptimeRaw, MlxEqPollDeadline(10), 1000000);
+        return;
+    }
     if (ivars->fEQ) {
         uint32_t completions = 0;
         (void)ivars->fEQ->Poll(&completions);
@@ -1031,6 +1650,15 @@ MlxPCIDriver::EqTimerOccurred_Impl(OSAction *action, uint64_t time)
     }
     if ((tick % 500) == 0)
         MLX_DBG("EQ timer heartbeat ticks=%llu", (unsigned long long)tick);
+}
+
+kern_return_t
+MlxPCIDriver::SetEqTimerPaused(bool paused)
+{
+    if (!ivars || !ivars->fEqTimer) return kIOReturnNotReady;
+    __atomic_store_n(&ivars->fEqTimerPaused, paused ? 1u : 0u, __ATOMIC_RELEASE);
+    MLX_LOG("EQ timer diagnostic pause=%u", paused ? 1u : 0u);
+    return kIOReturnSuccess;
 }
 
 void
@@ -1255,6 +1883,11 @@ MlxPCIDriver::init()
     if (!ivars)
         return false;
     ivars->fBar0Index           = 0;   /* BAR0 = memory index 0 on this card */
+    /* Index 0 is a real interrupt index, so "not found" needs its own value.
+     * Until StartInterrupts runs, the map reports the historical binding. */
+    ivars->fMsixIndexBase       = MLX_IRQ_INDEX_NONE;
+    ivars->fAsyncIndex          = 0;
+    ivars->fCompletionIndex     = MLX_SINGLE_MSIX_VECTOR ? 0 : 1;
     ivars->fHcaEnabled          = false;
     ivars->fHcaInitialized      = false;
     ivars->fRuntimePagesStarted = false;
@@ -1464,6 +2097,11 @@ MlxPCIDriver::Start_Impl(IOService * provider)
         }
     }
 
+    /* Claim the MSI-X vectors BEFORE firmware initialization: the FLR above
+     * cleared the enable bit, and firmware appears to decide once, at its own
+     * init, whether this function has message interrupts. See EnableMsixEarly. */
+    (void)EnableMsixEarly();
+
     /* ---- Phase 1, step 1-2: MlxCmd (init-seg + cmdq DMA + enable) ---- */
     ivars->fCmd = new MlxCmd();
     kern_return_t cmdKr = ivars->fCmd->Init(this);
@@ -1475,6 +2113,7 @@ MlxPCIDriver::Start_Impl(IOService * provider)
         /* Steps 4-6: ENABLE_HCA → QUERY/SET_ISSI */
         if (FwInit()) {
             MLX_LOG("Phase 1 COMPLETE: HCA enabled, ISSI set");
+            LogMsixEnable("after firmware init");
             /* Now that the device has been reset and the firmware is up, claim
              * the MSI-X vectors. Additive: if two vectors are unavailable the
              * timer/direct-CQ polling path remains valid. */
@@ -1817,6 +2456,11 @@ bool MlxPCIDriver::CompletionInterruptReady() const
     if (!CompletionEventReady() || !ivars->fCompletionEQ ||
         !ivars->fCompletionInterrupt)
         return false;
+    if (MLX_SINGLE_MSIX_VECTOR) {
+        uint64_t irq = __atomic_load_n(&ivars->fAsyncIrqCount, __ATOMIC_ACQUIRE);
+        uint64_t last = __atomic_load_n(&ivars->fLastCompletionIrqNs, __ATOMIC_ACQUIRE);
+        return irq && last && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - last < 5000000000ULL;
+    }
     uint64_t last = __atomic_load_n(&ivars->fLastCompletionIrqNs, __ATOMIC_ACQUIRE);
     uint64_t irq = __atomic_load_n(&ivars->fCompletionIrqCount, __ATOMIC_ACQUIRE);
     return irq && last && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - last < 5000000000ULL;
@@ -1971,22 +2615,45 @@ MlxPCIDriver::PerformFlr()
     MLX_DBG("DBG PerformFlr: before FLR ctl=0x%08x cmd=0x%04x devId=0x%08x fw_rev=0x%08x",
             ctlBefore, cmdBefore, devIdBefore, fwRevBefore);
 
-    /* FLR: write initiator bit. */
-    ivars->fPci->ConfigurationWrite32(pcieCap + 8, ctlBefore | (1u << 15));
-
-    /* Wait for self-clearing of the FLR bit (up to 2s). */
-    bool flrDone = false;
-    for (uint32_t i = 0; i < 100; i++) {
-        IOSleep(20);
-        uint32_t c = 0;
-        ivars->fPci->ConfigurationRead32(pcieCap + 8, &c);
-        if (!(c & (1u << 15))) { flrDone = true; break; }
-        if (i == 0 || i == 49 || i == 99)
-            MLX_DBG("DBG PerformFlr: FLR poll i=%u ctl=0x%08x", i, c);
+    /* Reset through the framework rather than by poking the initiator bit.
+     * IOPCIDevice::Reset routes to IOPCIBridge::resetDeviceGated, which calls
+     * restoreDeviceState on the way out, and that reaches
+     * IOPCIMessagedInterruptController::initDevice — the only code in
+     * IOPCIFamily that ever writes address and data into the MSI-X table.
+     * A reset performed by writing the bit ourselves is invisible to the
+     * kernel, so the table stays wiped and a raised vector becomes a write of
+     * zero to physical address zero, which is what every measurement showed.
+     * The manual path stays as a fallback: the runtime ownership takeover is
+     * not a configuration Apple tests, so Reset may well be refused here. */
+    bool frameworkReset = false;
+    kern_return_t resetKr = ivars->fPci->Reset(kIOPCIDeviceResetTypeFunctionReset,
+                                               kIOPCIDeviceResetOptionNone);
+    if (resetKr == kIOReturnSuccess) {
+        frameworkReset = true;
+        MLX_LOG("PerformFlr: framework Reset() ok — kernel owns the MSI-X restore");
+    } else {
+        MLX_LOG("PerformFlr: framework Reset() refused (0x%x) — manual FLR bit",
+                resetKr);
     }
-    MLX_DBG("DBG PerformFlr: FLR self-clear: %s (%u ms)",
-            flrDone ? "OK" : "TIMEOUT", flrDone ? 0 : 2000);
-    if (!flrDone) return false;
+
+    if (!frameworkReset) {
+        /* FLR: write initiator bit. */
+        ivars->fPci->ConfigurationWrite32(pcieCap + 8, ctlBefore | (1u << 15));
+
+        /* Wait for self-clearing of the FLR bit (up to 2s). */
+        bool flrDone = false;
+        for (uint32_t i = 0; i < 100; i++) {
+            IOSleep(20);
+            uint32_t c = 0;
+            ivars->fPci->ConfigurationRead32(pcieCap + 8, &c);
+            if (!(c & (1u << 15))) { flrDone = true; break; }
+            if (i == 0 || i == 49 || i == 99)
+                MLX_DBG("DBG PerformFlr: FLR poll i=%u ctl=0x%08x", i, c);
+        }
+        MLX_DBG("DBG PerformFlr: FLR self-clear: %s (%u ms)",
+                flrDone ? "OK" : "TIMEOUT", flrDone ? 0 : 2000);
+        if (!flrDone) return false;
+    }
 
     /* Diagnostic: config after FLR (before restoring MSE). */
     uint32_t devIdAfter = 0;
@@ -2106,9 +2773,9 @@ MlxPCIDriver::ReinitFw()
         MLX_LOG("ReinitFw: FwInit failed (see log above)");
         return kIOReturnIOError;
     }
-    /* The FLR above cleared the device's MSI-X capability; re-arm it before
-     * Phase 2 recreates the EQs, or their intr indices refer to vectors the
-     * firmware no longer has. */
+    /* The FLR above cleared the device's MSI-X capability; repeat the single
+     * provider allocation before Phase 2 recreates the EQs. */
+    (void)EnableMsixEarly();
     (void)StartInterrupts();
     if (!InitPhase2Runtime()) {
         MLX_LOG("ReinitFw: Phase 2 rebuild failed");
@@ -2887,4 +3554,213 @@ MlxPCIDriver::AllocXrcd()
     ivars->fXrcd = (uint32_t)mlxGetBits(out, 0x48, 24);
     MLX_LOG("ALLOC_XRCD ok — xrcd=%u", ivars->fXrcd);
     return true;
+}
+
+/* ---- RMP context layout probe ---------------------------------------------
+ *
+ * A basic SRQ on firmware with ISSI set is an RMP, so everything an SRQ needs
+ * rests on the rmpc layout being right. Every offset used here is recalled
+ * from mlx5_ifc rather than taken from a working path in this tree, and a
+ * wrong offset produces a queue that is silently never filled. That failure
+ * mode already cost this project an evening on the MSI-X table, so the layout
+ * is proven with a readback before anything is built on it.
+ *
+ * create_rmp_in: opcode @0x00, rmpc @0x100.
+ * rmpc:          state @0x08 (4b), basic_cyclic_rcv_wqe @0x20 (1b), wq @0x180.
+ * query_rmp_out: rmpc @0x100 as well.
+ */
+#define MLX_RMPC_OFF        0x100
+#define MLX_RMP_WQ_OFF      (MLX_RMPC_OFF + 0x180)
+/* wq_bits ends with reserved_at_200[0x400], so the struct spans 0x600 bits and
+ * its PAS array starts there, not at 0x300. That lands the PAS at absolute
+ * 0x880 — the same offset create_cq_in uses, which is a useful cross-check.
+ * Taken from linux/mlx5/mlx5_ifc.h on the Spark, not from recollection. */
+#define MLX_RMP_WQ_SIZE     0x600
+#define MLX_RMP_PAS_OFF     (MLX_RMP_WQ_OFF + MLX_RMP_WQ_SIZE)
+#define MLX_RMPC_STATE_RDY  1
+
+kern_return_t
+MlxPCIDriver::ProbeRmpLayout(struct mlx_probe_rmp_layout_resp *resp)
+{
+    if (!ivars || !resp) return kIOReturnBadArgument;
+    if (!ivars->fCmd || !ivars->fUAR) return kIOReturnNotReady;
+    memset(resp, 0, sizeof(*resp));
+    resp->variantUsed = 0xffffffffu;
+
+    const uint32_t logWqSz     = 4;              /* 16 WQEs */
+    const uint32_t logWqStride = 2;              /* log2(64) - 4, a 64B WQE */
+    const uint32_t logWqPgSz   = 0;              /* 4 KiB pages */
+    const uint64_t wqBytes     = (1ull << logWqSz) * 64;
+
+    IOBufferMemoryDescriptor *desc = NULL;
+    IODMACommand *dmaCmd = NULL;
+    IOAddressSegment segs[8];
+    uint32_t segCount = 8;
+    uint64_t pages[8] = {};
+    uint32_t pageCount = 0;
+    uint64_t dbDma = 0;
+    uint32_t dbOffset = 0;
+    bool dbHeld = false;
+    uint32_t rmpn = 0;
+    bool created = false;
+    uint32_t exactIn = 0;
+    kern_return_t kr;
+
+    kr = mlxAllocDmaBuffer(wqBytes, 4096, kIOMemoryDirectionOutIn, &desc);
+    if (kr != kIOReturnSuccess || !desc) { resp->status = kIOReturnNoMemory; goto done; }
+    kr = mlxPrepareDma(ivars->fPci, desc, segs, &segCount, &dmaCmd);
+    if (kr != kIOReturnSuccess || segCount == 0) { resp->status = kIOReturnNoSpace; goto done; }
+    for (uint32_t i = 0; i < segCount && pageCount < 8; i++)
+        if (!mlxAppendMttPages(segs[i].address, segs[i].length, pages, 8, &pageCount)) {
+            resp->status = kIOReturnNoSpace; goto done;
+        }
+    if (!pageCount) { resp->status = kIOReturnNoSpace; goto done; }
+
+    kr = ivars->fUAR->AllocDbSlot(&dbDma, &dbOffset);
+    if (kr != kIOReturnSuccess) { resp->status = kr; goto done; }
+    dbHeld = true;
+
+    /* create_rmp_in is 0x100 header + rmpc, rmpc is 0x180 + wq, wq is 0x600
+     * before its PAS array, so 272 bytes plus 8 per page. The first attempt
+     * used 0x300 for the wq span and firmware rejected every variant with one
+     * syndrome, which is what a length error looks like: the contents are
+     * never reached. */
+    exactIn = (MLX_RMPC_OFF + 0x180 + MLX_RMP_WQ_SIZE) / 8 + pageCount * 8;
+
+    resp->setState       = MLX_RMPC_STATE_RDY;
+    resp->setLogWqStride = logWqStride;
+    resp->setLogWqSz     = logWqSz;
+    resp->setLogWqPgSz   = logWqPgSz;
+    resp->setPd          = ivars->fPd;
+    resp->setUarPage     = ivars->fUAR->GetBootUarIndex();
+    resp->setDbrAddr     = dbDma;
+    resp->setPas0        = pages[0];
+
+    {
+        /* Hypotheses, cheapest first. Each rebuild costs a cycle, so they are
+         * all tried here rather than one per cycle. */
+        /* The length gate is passed: 280 bytes now fails the same way 1024 did,
+         * while the short 184 fails differently. Content is the objection, and
+         * wq_type and basic_cyclic are ruled out — all four gave one syndrome.
+         * Two suspects remain. The QPC expresses a receive stride as
+         * log2(bytes) - 4, but wq_bits may want the plain log2; and mlx5's own
+         * set_wq never writes uar_page for an RMP, so writing one may itself be
+         * the objection. Sweep both. */
+        const uint32_t uar = ivars->fUAR->GetBootUarIndex();
+        struct { uint32_t inSize, wqType, basicCyclic, stride, uarPage; }
+        tries[MLX_RMP_VARIANTS] = {
+            { exactIn, 0, 0, 6, 0   },  /* plain log2(64), no uar — most mlx5-faithful */
+            { exactIn, 0, 0, 6, uar },  /* plain log2, uar written */
+            { exactIn, 0, 0, 2, 0   },  /* QPC convention, no uar */
+            { exactIn, 0, 0, 2, uar },  /* what already failed, kept as control */
+            { exactIn, 0, 0, 4, 0   },  /* between the two conventions */
+            { exactIn, 0, 0, 0, 0   },  /* let firmware default the stride */
+        };
+        for (uint32_t v = 0; v < MLX_RMP_VARIANTS && !created; v++) {
+            uint8_t in[1024] = {};
+            uint8_t out[256] = {};
+            mlxSetBits(in, 0x00, 16, MLX_CMD_OP_CREATE_RMP);
+            mlxSetBits(in, MLX_RMPC_OFF + 0x08, 4, MLX_RMPC_STATE_RDY);
+            mlxSetBits(in, MLX_RMPC_OFF + 0x20, 1, tries[v].basicCyclic);
+            uint32_t wq = MLX_RMP_WQ_OFF;
+            mlxSetBits(in, wq + 0x000, 4,  tries[v].wqType);
+            mlxSetBits(in, wq + 0x048, 24, resp->setPd);
+            mlxSetBits(in, wq + 0x068, 24, tries[v].uarPage);
+            mlxSetBits(in, wq + 0x080, 64, resp->setDbrAddr);
+            mlxSetBits(in, wq + 0x10c, 4,  tries[v].stride);
+            mlxSetBits(in, wq + 0x113, 5,  logWqPgSz);
+            mlxSetBits(in, wq + 0x11b, 5,  logWqSz);
+            for (uint32_t i = 0; i < pageCount; i++)
+                mlxSetBits(in, MLX_RMP_PAS_OFF + i * 64, 64, pages[i]);
+
+            kern_return_t vkr = ivars->fCmd->Exec(MLX_CMD_OP_CREATE_RMP, in,
+                                                  tries[v].inSize, out, sizeof(out), 5000);
+            resp->variant[v].inSize      = tries[v].inSize;
+            resp->variant[v].wqType      = tries[v].wqType;
+            resp->variant[v].basicCyclic = tries[v].basicCyclic;
+            resp->variant[v].logWqStride = tries[v].stride;
+            resp->variant[v].uarPage     = tries[v].uarPage;
+            resp->variant[v].status      = (uint32_t)vkr;
+            resp->variant[v].syndrome    = ivars->fCmd->LastSyndrome();
+            MLX_LOG("RMP probe v%u: in=%u stride=%u uar=%u -> 0x%x syn=0x%x",
+                    v, tries[v].inSize, tries[v].stride, tries[v].uarPage,
+                    vkr, resp->variant[v].syndrome);
+            if (vkr == kIOReturnSuccess) {
+                rmpn = (uint32_t)mlxGetBits(out, 0x48, 24);
+                resp->rmpn = rmpn;
+                resp->setWqType = tries[v].wqType;
+                resp->setLogWqStride = tries[v].stride;
+                resp->setUarPage = tries[v].uarPage;
+                resp->variantUsed = v;
+                created = true;
+            }
+        }
+        if (!created) {
+            resp->stage = 0;
+            resp->status = (kern_return_t)resp->variant[0].status;
+            resp->fwStatus = resp->variant[0].syndrome;
+            goto done;
+        }
+    }
+
+    {
+        uint8_t in[16] = {};
+        uint8_t out[512] = {};
+        mlxSetBits(in, 0x00, 16, MLX_CMD_OP_QUERY_RMP);
+        mlxSetBits(in, 0x48, 24, rmpn);
+        /* query_rmp_out carries the whole rmpc, so the buffer has to reach
+         * past the PAS array or the readback reads zeros. */
+        kr = ivars->fCmd->Exec(MLX_CMD_OP_QUERY_RMP, in, sizeof(in),
+                               out, sizeof(out), 5000);
+        if (kr != kIOReturnSuccess) {
+            resp->stage = 1; resp->status = kr;
+            resp->fwStatus = ivars->fCmd->LastSyndrome();
+            goto destroy;
+        }
+        uint32_t wq = MLX_RMP_WQ_OFF;
+        resp->gotState       = (uint32_t)mlxGetBits(out, MLX_RMPC_OFF + 0x08, 4);
+        resp->gotWqType      = (uint32_t)mlxGetBits(out, wq + 0x000, 4);
+        resp->gotPd          = (uint32_t)mlxGetBits(out, wq + 0x048, 24);
+        resp->gotUarPage     = (uint32_t)mlxGetBits(out, wq + 0x068, 24);
+        resp->gotDbrAddr     =           mlxGetBits(out, wq + 0x080, 64);
+        resp->gotLogWqStride = (uint32_t)mlxGetBits(out, wq + 0x10c, 4);
+        resp->gotLogWqPgSz   = (uint32_t)mlxGetBits(out, wq + 0x113, 5);
+        resp->gotLogWqSz     = (uint32_t)mlxGetBits(out, wq + 0x11b, 5);
+        resp->gotPas0        =           mlxGetBits(out, MLX_RMP_PAS_OFF, 64);
+
+        uint32_t bad = 0;
+        if (resp->gotState       != resp->setState)       bad |= 1u << 0;
+        if (resp->gotWqType      != resp->setWqType)      bad |= 1u << 1;
+        if (resp->gotLogWqStride != resp->setLogWqStride) bad |= 1u << 2;
+        if (resp->gotLogWqSz     != resp->setLogWqSz)     bad |= 1u << 3;
+        if (resp->gotLogWqPgSz   != resp->setLogWqPgSz)   bad |= 1u << 4;
+        if (resp->gotPd          != resp->setPd)          bad |= 1u << 5;
+        if (resp->gotUarPage     != resp->setUarPage)     bad |= 1u << 6;
+        if (resp->gotDbrAddr     != resp->setDbrAddr)     bad |= 1u << 7;
+        if (resp->gotPas0        != resp->setPas0)        bad |= 1u << 8;
+        resp->mismatches = bad;
+        resp->stage = 2;
+        resp->status = kIOReturnSuccess;
+        MLX_LOG("RMP probe: rmpn=%u variant=%u mismatches=0x%x",
+                rmpn, resp->variantUsed, bad);
+    }
+
+destroy:
+    if (created) {
+        uint8_t in[16] = {};
+        uint8_t out[16] = {};
+        mlxSetBits(in, 0x00, 16, MLX_CMD_OP_DESTROY_RMP);
+        mlxSetBits(in, 0x48, 24, rmpn);
+        kern_return_t dkr = ivars->fCmd->Exec(MLX_CMD_OP_DESTROY_RMP, in, sizeof(in),
+                                              out, sizeof(out), 5000);
+        if (dkr != kIOReturnSuccess && resp->status == kIOReturnSuccess) {
+            resp->stage = 3; resp->status = dkr;
+        }
+    }
+
+done:
+    if (dbHeld) ivars->fUAR->FreeDbSlot(dbOffset);
+    if (dmaCmd) mlxCompleteDma(dmaCmd);
+    if (desc) desc->release();
+    return kIOReturnSuccess;   /* the report is the result; failures live in it */
 }

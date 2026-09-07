@@ -15,6 +15,7 @@
  */
 #include "MlxQP.hpp"
 #include "MlxRoCE.hpp"
+#include "MlxAH.hpp"
 #include "MlxPCIDriver.h"
 #include "MlxCmd.hpp"
 #include "MlxDMA.hpp"
@@ -217,7 +218,9 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     /* The external user client owns its own firmware PD.  Ownership and
      * client isolation are checked by MlxUserClient before reaching here;
      * comparing against the provider's bootstrap PD rejects valid clients. */
-    if (!req->pd || req->qpType != 0 || !s->roce->GetCQ() ||
+    /* Connected (0) and datagram (1) are the two transports this driver
+     * carries; anything else is refused rather than encoded blindly. */
+    if (!req->pd || req->qpType > 1 || !s->roce->GetCQ() ||
         !s->roce->GetCQ()->Lookup(req->sendCq) ||
         !s->roce->GetCQ()->Lookup(req->recvCq))
         return kIOReturnNotPermitted;
@@ -263,11 +266,23 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     mlxSetBits(qpc, 0x08, 8, st);
     mlxSetBits(qpc, 0x13, 2, 3);            /* pm_state = MIGRATED (Linux) */
     mlxSetBits(qpc, 0x28, 24, req->pd);
-    /* This provider owns a PAS-backed receive ring per QP. SRQ/RMP is a
-     * separate verbs object model and is not mixed into RC QP creation. */
-    mlxSetBits(qpc, 0x565, 3, 0);
-    mlxSetBits(qpc, 0x49, 4, logRq);
-    mlxSetBits(qpc, 0x4d, 3, 2);            /* log_rq_stride = log2(64)-4 = 2 (64B WQE) */
+    /* rq_type: 0 keeps this QP's own PAS-backed receive ring, 1 (MLX5_SRQ_RQ)
+     * points it at a shared one. srqn_rmpn_xrqn follows rq_type at 0x568.
+     * The RMP that backs an SRQ here was proven field by field before this
+     * binding was written; see MlxSRQ.hpp. */
+    if (req->srqn) {
+        /* A QPC cannot claim both a shared receive queue and its own ring:
+         * with rq_type = SRQ_RQ the size and stride have to read zero, or
+         * firmware rejects the context. */
+        mlxSetBits(qpc, 0x565, 3, 1);
+        mlxSetBits(qpc, 0x568, 24, req->srqn);
+        mlxSetBits(qpc, 0x49, 4, 0);
+        mlxSetBits(qpc, 0x4d, 3, 0);
+    } else {
+        mlxSetBits(qpc, 0x565, 3, 0);
+        mlxSetBits(qpc, 0x49, 4, logRq);
+        mlxSetBits(qpc, 0x4d, 3, 2);        /* log_rq_stride = log2(64)-4, 64B WQE */
+    }
     mlxSetBits(qpc, 0x51, 4, logSq);
     mlxSetBits(qpc, 0x5b, 1, 1);            /* rlky (relaxed ordering) */
     mlxSetBits(qpc, 0x68, 24, uarPage);     /* uar_page — a QP without UAR is invalid */
@@ -285,7 +300,7 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
             (unsigned long long)mlxGetBits(qpc, 0x4e8, 24),
             (unsigned long long)mlxGetBits(qpc, 0x500, 64),
             qpc[125], qpc[127]);
-    MLX_DBG("QP rq_type=native srqn=0 native_rq=1");
+    MLX_DBG("QP rq_type=%s srqn=%u", req->srqn ? "srq" : "native", req->srqn);
 
     /* SQ/RQ are intentionally DEXT-owned for kernel-mediated posting. */
     uint64_t sqLen = (uint64_t)req->sqSize * 64;
@@ -358,11 +373,16 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     resp->sqStrideSize = 64;
     resp->dbRecordOffset = dbOffset;
     resp->bfOffset = MLX_BF_OFFSET;
+    resp->bfFlags = 0;
     resp->mappingVersion = bundle ? MLX_FAST_PATH_ABI_VERSION : 0;
     resp->uarPage = uarPage;
-    const uint8_t logBf = s->core->GetHCA() ?
-        s->core->GetHCA()->Caps().logBfRegSize : 0;
+    const MlxHcaCaps *hcaCaps = s->core->GetHCA() ?
+        &s->core->GetHCA()->Caps() : NULL;
+    const uint8_t logBf = hcaCaps ? hcaCaps->logBfRegSize : 0;
     const uint32_t bfRegSize = logBf && logBf < 13 ? (1u << logBf) : 0;
+    const uint32_t uarPageSize = !hcaCaps ? 4096u :
+        (hcaCaps->uar4k ? 4096u : (1u << hcaCaps->logUarPageSize));
+    const uint32_t bfRegs = mlxBfRegsPerUar(uarPageSize, bfRegSize);
     resp->bfBufSize = bfRegSize / 2u;
 
     /* Record the context. */
@@ -370,6 +390,25 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     int slot = -1;
     for (int i = 0; i < s->tableCap; i++)
         if (!s->used[i]) { slot = i; break; }
+    /* Pick the least-loaded blue-flame register on this client's UAR page.
+     * Done under tableLock so a concurrent CreateQP cannot pick the same one,
+     * and by counting live contexts so a destroyed QP frees its register. */
+    uint32_t bfIndex = 0, bfPeers = 0;
+    if (slot >= 0 && bfRegs > 1) {
+        uint32_t counts[MLX_BF_MAX_REGS] = {};
+        for (int i = 0; i < s->tableCap; i++) {
+            if (!s->used[i] || s->table[i].uarPage != uarPage) continue;
+            uint32_t off = s->table[i].bfOffset;
+            if (off < MLX_BF_OFFSET) continue;
+            uint32_t idx = (off - MLX_BF_OFFSET) / bfRegSize;
+            if (idx < bfRegs) counts[idx]++;
+        }
+        for (uint32_t i = 1; i < bfRegs; i++)
+            if (counts[i] < counts[bfIndex]) bfIndex = i;
+        bfPeers = counts[bfIndex];
+        resp->bfOffset = MLX_BF_OFFSET + bfIndex * bfRegSize;
+    }
+    if (bfPeers) resp->bfFlags |= MLX_QP_BF_SHARED;
     if (slot < 0) {
         IOLockUnlock(s->tableLock);
         uint8_t din[16] = {}, dout[16] = {};
@@ -418,9 +457,10 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     ctx->uarPage = uarPage;
     ctx->sqSize = req->sqSize;
     ctx->rqSize = req->rqSize;
+    ctx->srqn = req->srqn;
     ctx->sqBufAddr = req->sqBufAddr;
     ctx->rqBufAddr = req->rqBufAddr;
-    ctx->bfOffset = MLX_BF_OFFSET;
+    ctx->bfOffset = resp->bfOffset;
     ctx->dbRecordOffset = dbOffset;
     ctx->sqCpu = (volatile uint8_t *)(uintptr_t)sqAddr;
     ctx->rqCpu = (volatile uint8_t *)(uintptr_t)rqAddr;
@@ -480,9 +520,71 @@ MlxQP::ModifyQP(const struct mlx_modify_qp_req *req)
     uint32_t optParamMask = 0;
     bool ok = opcode == MLX_CMD_OP_2ERR_QP || opcode == MLX_CMD_OP_2RST_QP;
 
+    /* A datagram queue pair carries no path in its context: the destination
+     * rides in the address vector of every work request instead. So RST->INIT
+     * adds the queue key and INIT->RTR is a bare state change, with none of
+     * the RoCE path validation and encoding a connected pair needs. */
+    const bool isUd = ctx->st == MLX_QP_ST_UD;
+
     if (opcode == MLX_CMD_OP_RST2INIT_QP) {
+        /* The encoder answers with a single bool, and the driver's log does not
+         * reach userspace on this machine, so the caller could not tell which
+         * field was rejected. Check the same conditions here and answer with a
+         * code that names one. This is better behaviour than a blanket bad
+         * argument regardless of the diagnosis it is serving now. */
+        if (!req->portNum || req->portNum > 0xff) { UnlockQp(ctx); return kIOReturnNotAligned; }
+        if (req->pkeyIndex > 0xffff) { UnlockQp(ctx); return kIOReturnBadMedia; }
         ok = mlxEncodeRst2InitQpc(qpc, MLX_QPC_BYTES, req->pkeyIndex,
-                                  req->portNum, &optParamMask);
+                                  req->portNum, ctx->st, &optParamMask);
+        if (ok && isUd) {
+            mlxSetBits(qpc, MLX_QPC_QKEY_BIT_OFFSET, 32, req->qkey);
+            ctx->qkey = req->qkey;
+            /* Firmware refuses this transition (status 3) and the syndrome does
+             * not name the field, so the optional-parameter mask is walked
+             * here rather than one guess per rebuild. mlx5's own table allows
+             * the queue key, the P_Key index and the primary port for a
+             * datagram pair at this transition; the encoder's comment claims
+             * the mask must be empty. Both cannot be right. */
+            static const uint32_t masks[] = {
+                MLX_QP_OPTPAR_Q_KEY,
+                0,
+                MLX_QP_OPTPAR_Q_KEY | MLX_QP_OPTPAR_PKEY_INDEX |
+                    MLX_QP_OPTPAR_PRI_PORT,
+                MLX_QP_OPTPAR_PKEY_INDEX | MLX_QP_OPTPAR_PRI_PORT,
+            };
+            ctx->udMaskTried = 0;
+            for (uint32_t v = 0; v < sizeof(masks) / sizeof(masks[0]); v++) {
+                uint8_t probeIn[MLX_QP_MODIFY_IN_BYTES];
+                uint8_t probeOut[16] = {};
+                memcpy(probeIn, in, sizeof(probeIn));
+                mlxSetBits(probeIn, 0x00, 16, opcode);
+                mlxSetBits(probeIn, 0x48, 24, req->qpn);
+                mlxSetBits(probeIn, 0x80, 32, masks[v]);
+                kern_return_t pk = s->core->Exec(opcode, probeIn, sizeof(probeIn),
+                                                 probeOut, sizeof(probeOut), 5000);
+                if (pk == kIOReturnSuccess) {
+                    ctx->udMaskUsed = masks[v];
+                    ctx->udMaskTried = v + 1;
+                    ctx->state = req->newState;
+                    UnlockQp(ctx);
+                    return kIOReturnSuccess;
+                }
+                ctx->lastFwStatus = s->core->GetCmd() ?
+                    s->core->GetCmd()->LastFwStatus() : 0;
+                ctx->lastFwSyndrome = s->core->GetCmd() ?
+                    s->core->GetCmd()->LastSyndrome() : 0;
+                ctx->udMaskTried = v + 1;
+            }
+            UnlockQp(ctx);
+            return kIOReturnBadArgument;
+        }
+    } else if (opcode == MLX_CMD_OP_INIT2RTR_QP && isUd) {
+        /* No path to encode, but the service type still has to match what the
+         * pair was created as: the context buffer starts zeroed, and zero
+         * means connected. */
+        mlxSetBits(qpc, 0x08, 8, ctx->st);
+        mlxSetBits(qpc, 0x13, 2, 3);   /* pm_state = MIGRATED, as elsewhere */
+        ok = true;
     } else if (opcode == MLX_CMD_OP_INIT2RTR_QP) {
         MlxGID *gidTable = s->roce->GetGID();
         uint16_t minUdpSport = s->core->GetHCA()->Caps().roceMinSrcUdpPort;
@@ -516,6 +618,14 @@ MlxQP::ModifyQP(const struct mlx_modify_qp_req *req)
                                   s->core->GetHCA()->Caps().atomicMode,
                                   s->core->GetHCA()->Caps().logMaxMsg,
                                   &optParamMask);
+    } else if (opcode == MLX_CMD_OP_RTR2RTS_QP && isUd) {
+        /* Only the send sequence number matters; retry and atomic limits are
+         * properties of a connected pair. The service type is written for the
+         * same reason as above. */
+        mlxSetBits(qpc, 0x08, 8, ctx->st);
+        mlxSetBits(qpc, 0x13, 2, 3);
+        mlxSetBits(qpc, MLX_QPC_SQ_PSN_BIT_OFFSET, 24, req->sqPsn);
+        ok = true;
     } else if (opcode == MLX_CMD_OP_RTR2RTS_QP) {
         ok = mlxEncodeRtr2RtsQpc(qpc, MLX_QPC_BYTES, req->sqPsn,
                                  req->maxRdAtomic,
@@ -523,7 +633,19 @@ MlxQP::ModifyQP(const struct mlx_modify_qp_req *req)
                                  req->rnrRetry,
                                  &optParamMask);
     }
-    if (!ok) { UnlockQp(ctx); return kIOReturnBadArgument; }
+    if (!ok) {
+        /* One code for every rejected transition tells the caller nothing about
+         * which field was wrong. Name the values that reached the encoder. */
+        MLX_LOG("QP[%u] %s refused: st=%u pkey=%u port=%u qkey=0x%x mask=0x%x "
+                "mtu=%u dqpn=%u", ctx->qpNum,
+                opcode == MLX_CMD_OP_RST2INIT_QP ? "RST->INIT" :
+                opcode == MLX_CMD_OP_INIT2RTR_QP ? "INIT->RTR" :
+                opcode == MLX_CMD_OP_RTR2RTS_QP  ? "RTR->RTS"  : "?",
+                ctx->st, req->pkeyIndex, req->portNum, req->qkey,
+                req->attrMask, req->pathMtu, req->destQpn);
+        UnlockQp(ctx);
+        return kIOReturnBadArgument;
+    }
 
     mlxSetBits(in, 0x00, 16, opcode);
     mlxSetBits(in, 0x48, 24, req->qpn);
@@ -560,6 +682,13 @@ MlxQP::ModifyQP(const struct mlx_modify_qp_req *req)
 
     kern_return_t kr = s->core->Exec(opcode, in, sizeof(in),
                                       out, sizeof(out), 5000);
+    if (kr != kIOReturnSuccess && s->core->GetCmd()) {
+        /* Keep why firmware refused: the return code alone collapses several
+         * distinct outbox statuses into one, and the syndrome is the only
+         * value that names the field. Readable afterwards through QueryQP. */
+        ctx->lastFwStatus = s->core->GetCmd()->LastFwStatus();
+        ctx->lastFwSyndrome = s->core->GetCmd()->LastSyndrome();
+    }
     if (kr == kIOReturnSuccess) {
         struct mlx_query_qp_resp queried = {};
         kr = QueryQP(req->qpn, &queried);
@@ -741,6 +870,19 @@ MlxQP::DestroyQP(uint32_t qpn)
     return kr;
 }
 
+/* The completion path needs this: a receive from a shared queue carries no
+ * usable srqn in the CQE, so the queue is found through the QP that took it,
+ * which is also how libmlx5 resolves it. */
+uint32_t
+MlxQP::SrqnFor(uint32_t qpn)
+{
+    MlxQPContext *ctx = LockQp(qpn);
+    if (!ctx) return 0;
+    uint32_t srqn = ctx->srqn;
+    UnlockQp(ctx);
+    return srqn;
+}
+
 kern_return_t
 MlxQP::ResetQP(uint32_t qpn)
 {
@@ -788,6 +930,31 @@ MlxQP::QueryQP(uint32_t qpn, void *outPtr)
     resp->rqPsn = (uint32_t)mlxGetBits(qpc, 0x4a8, 24);
     resp->sendCq = (uint32_t)mlxGetBits(qpc, 0x3e8, 24);
     resp->recvCq = (uint32_t)mlxGetBits(qpc, 0x4e8, 24);
+    /* Traffic-marking readback (front F, task 2): what the card actually
+     * holds on the primary path, not what the client requested. The DSCP the
+     * switch sees is the upper 6 bits of the full tclass field. */
+    {
+        const uint32_t ads = MLX_QPC_PRIMARY_PATH_BIT_OFFSET;
+        resp->trafficClass = (uint32_t)mlxGetBits(qpc, ads + 0x64, 8);
+        resp->dscp = (uint32_t)mlxGetBits(qpc, ads + 0x10a, 6);
+        resp->sl = (uint32_t)mlxGetBits(qpc, ads + 0x121, 3);
+    }
+    return kIOReturnSuccess;
+}
+
+/* Why the last state transition was refused. Deliberately not folded into
+ * QueryQP: ModifyQP calls that while already holding this QP's lock, and
+ * LockQp is not recursive, so taking it there deadlocks every transition.
+ * Callers of this one hold nothing. */
+kern_return_t
+MlxQP::LastRefusal(uint32_t qpn, uint32_t *fwStatus, uint32_t *syndrome)
+{
+    if (!s || !fwStatus || !syndrome) return kIOReturnBadArgument;
+    MlxQPContext *ctx = LockQp(qpn);
+    if (!ctx) return kIOReturnNotFound;
+    *fwStatus = ctx->lastFwStatus;
+    *syndrome = ctx->lastFwSyndrome;
+    UnlockQp(ctx);
     return kIOReturnSuccess;
 }
 
@@ -924,32 +1091,65 @@ MlxQP::PostSendBatch(const struct mlx_post_send_req *req, uint32_t count)
 
     uint64_t head = ctx->sqHead;
     struct MlxWqeCtrlSeg *lastCtrl = NULL;
+    const bool udQp = ctx->st == MLX_QP_ST_UD;
+    /* A datagram request is 80 bytes and takes two slots, so the producer
+     * advances by what the encoder consumed rather than by one per request. */
+    uint64_t producer = head;
     for (uint32_t i = 0; i < count; i++) {
         const struct mlx_post_send_req *wr = &req[i];
-        uint64_t producer = head + i;
         uint32_t idx = (uint32_t)producer & (ctx->sqSize - 1);
         volatile uint8_t *wqe = ctx->sqCpu + (uint64_t)idx * 64;
         uint8_t hwOpcode =
             wr->opcode == MLX_UC_WR_RDMA_WRITE ? MLX_OPCODE_RDMA_WRITE :
             wr->opcode == MLX_UC_WR_RDMA_READ  ? MLX_OPCODE_RDMA_READ :
                                                  MLX_OPCODE_SEND;
-        if (!mlxEncodeRcSendWqe64Flags((void *)(uintptr_t)wqe, ctx->qpNum,
+        uint32_t slots = 0;
+        if (udQp) {
+            /* Only sends exist on a datagram queue: there is no remote memory
+             * to address. */
+            if (hwOpcode != MLX_OPCODE_SEND) { UnlockQp(ctx); return kIOReturnBadArgument; }
+            MlxAH *ahs = s->roce->GetAH();
+            MlxAHContext *ah = ahs ? ahs->Lookup(wr->ahHandle) : NULL;
+            if (!ah) { UnlockQp(ctx); return kIOReturnNotFound; }
+            /* Encode into a staging buffer and copy in: a two-slot request at
+             * the end of the ring wraps, and writing 128 bytes straight at the
+             * last slot would run off the mapping. */
+            uint8_t staged[128];
+            struct MlxRcSge sge = { wr->sge.addr, wr->sge.length, wr->sge.lkey };
+            slots = mlxEncodeUdSendWqe(staged, sizeof(staged), ctx->qpNum,
                                        (uint16_t)producer, hwOpcode,
-                                       wr->sge.addr, wr->sge.length, wr->sge.lkey,
-                                       wr->remoteAddr, wr->rkey,
+                                       &ah->av, wr->remoteQpn, wr->remoteQkey,
+                                       &sge, 1,
                                        (wr->sendFlags & MLX_UC_SEND_SIGNALED) != 0,
-                                       (wr->sendFlags & MLX_UC_SEND_FENCE) != 0,
-                                       (wr->sendFlags & MLX_UC_SEND_SOLICITED) != 0)) {
-            UnlockQp(ctx);
-            return kIOReturnBadArgument;
+                                       (wr->sendFlags & MLX_UC_SEND_SOLICITED) != 0);
+            if (!slots) { UnlockQp(ctx); return kIOReturnBadArgument; }
+            for (uint32_t sl = 0; sl < slots; sl++) {
+                uint32_t dst = ((uint32_t)producer + sl) & (ctx->sqSize - 1);
+                memcpy((void *)(uintptr_t)(ctx->sqCpu + (uint64_t)dst * 64),
+                       staged + (size_t)sl * 64, 64);
+            }
+            wqe = ctx->sqCpu + (uint64_t)idx * 64;
+        } else {
+            if (!mlxEncodeRcSendWqe64Flags((void *)(uintptr_t)wqe, ctx->qpNum,
+                                           (uint16_t)producer, hwOpcode,
+                                           wr->sge.addr, wr->sge.length, wr->sge.lkey,
+                                           wr->remoteAddr, wr->rkey,
+                                           (wr->sendFlags & MLX_UC_SEND_SIGNALED) != 0,
+                                           (wr->sendFlags & MLX_UC_SEND_FENCE) != 0,
+                                           (wr->sendFlags & MLX_UC_SEND_SOLICITED) != 0)) {
+                UnlockQp(ctx);
+                return kIOReturnBadArgument;
+            }
+            slots = 1;
         }
         lastCtrl = (struct MlxWqeCtrlSeg *)(uintptr_t)wqe;
         ctx->sqWrid[idx] = wr->wrId;
         ctx->sqOpcode[idx] = (uint8_t)wr->opcode;
-        ctx->sqSpan[idx] = 1;
+        ctx->sqSpan[idx] = (uint8_t)slots;
+        producer += slots;
     }
     mlxMemoryBarrier();
-    ctx->sqHead = head + count;
+    ctx->sqHead = producer;
     ctx->dbRecord[1] = OSSwapHostToBigInt32((uint32_t)ctx->sqHead & 0xffff);
     mlxMemoryBarrier();
     uint64_t doorbell = 0;
@@ -1099,22 +1299,34 @@ MlxQP::PostSendInline(const struct mlx_post_send_inline_req *req)
 {
     if (!s || !req || !req->inlineLen ||
         req->inlineLen > MLX_UC_MAX_INLINE_DATA ||
-        (req->opcode != MLX_UC_WR_SEND && req->opcode != MLX_UC_WR_SEND_IMM) ||
+        (req->opcode != MLX_UC_WR_SEND && req->opcode != MLX_UC_WR_SEND_IMM &&
+         req->opcode != MLX_UC_WR_RDMA_WRITE && req->opcode != MLX_UC_WR_RDMA_WRITE_IMM) ||
         (req->sendFlags & ~(MLX_UC_SEND_SIGNALED | MLX_UC_SEND_FENCE |
                             MLX_UC_SEND_SOLICITED | MLX_UC_SEND_INLINE)))
+        return kIOReturnBadArgument;
+    /* A write needs a destination; a send must not carry one, or a client
+     * could smuggle a remote address past the opcode check. */
+    const bool inlineWrite = req->opcode == MLX_UC_WR_RDMA_WRITE ||
+                             req->opcode == MLX_UC_WR_RDMA_WRITE_IMM;
+    if (inlineWrite ? (!req->remoteAddr || !req->rkey)
+                    : (req->remoteAddr || req->rkey))
         return kIOReturnBadArgument;
     MlxQPContext *ctx = LockQp(req->qpn);
     if (!ctx || ctx->state != MLX_QP_STATE_RTS || !ctx->sqCpu || !ctx->dbRecord) {
         UnlockQp(ctx);
         return ctx ? kIOReturnBusy : kIOReturnNotFound;
     }
-    uint8_t hwOpcode = req->opcode == MLX_UC_WR_SEND_IMM ?
-                       MLX_OPCODE_SEND_IMM : MLX_OPCODE_SEND;
+    uint8_t hwOpcode =
+        req->opcode == MLX_UC_WR_SEND_IMM  ? MLX_OPCODE_SEND_IMM :
+        req->opcode == MLX_UC_WR_RDMA_WRITE     ? MLX_OPCODE_RDMA_WRITE :
+        req->opcode == MLX_UC_WR_RDMA_WRITE_IMM ? MLX_OPCODE_RDMA_WRITE_IMM :
+                                             MLX_OPCODE_SEND;
     uint64_t head = ctx->sqHead;
     uint8_t flat[MLX_UC_MAX_INLINE_DATA + 64] = {};
-    uint32_t ds = mlxEncodeRcInlineSendWqe(
+    uint32_t ds = mlxEncodeRcInlineWqe(
         flat, sizeof(flat), ctx->qpNum, (uint16_t)head, hwOpcode,
-        req->inlineData, req->inlineLen, req->immData,
+        req->inlineData, req->inlineLen, req->remoteAddr, req->rkey,
+        req->immData,
         (req->sendFlags & MLX_UC_SEND_SIGNALED) != 0,
         (req->sendFlags & MLX_UC_SEND_FENCE) != 0,
         (req->sendFlags & MLX_UC_SEND_SOLICITED) != 0);
@@ -1269,6 +1481,14 @@ MlxQP::PostRecvSge(const struct mlx_post_recv_sge_req *req)
     if (!ctx || ctx->state < MLX_QP_STATE_INIT || ctx->state > MLX_QP_STATE_RTS ||
         !ctx->rqCpu || !ctx->dbRecord || ctx->rqHead - ctx->rqTail >= ctx->rqSize) {
         UnlockQp(ctx); return ctx ? kIOReturnBusy : kIOReturnNotFound;
+    }
+    /* A datagram receive begins with 40 bytes of global routing header, so a
+     * buffer with no room for it silently truncates the payload. Refuse it
+     * here rather than let the caller discover it as corrupt data. */
+    if (ctx->st == MLX_QP_ST_UD) {
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < req->numSge; i++) total += req->sge[i].length;
+        if (total <= MLX_GRH_BYTES) { UnlockQp(ctx); return kIOReturnBadArgument; }
     }
     uint32_t slot = (uint32_t)ctx->rqHead & (ctx->rqSize - 1);
     uint8_t *wqe = (uint8_t *)(uintptr_t)(ctx->rqCpu + (uint64_t)slot * 64);
@@ -1485,7 +1705,7 @@ MlxQP::PostUmrKlm(uint32_t qpn, uint32_t mrHandle, const uint32_t *childHandles,
  * this driver had never decoded them before (notes/42), just reported
  * MLX_UC_WC_GENERAL for every error opcode with no detail.
  */
-static uint32_t
+uint32_t
 MlxSyndromeToWcStatus(uint8_t syndrome)
 {
     switch (syndrome) {
@@ -1641,6 +1861,8 @@ MlxQP::CompleteCQE(uint32_t cqHandle, const struct MlxCqe64 *cqe,
         uint32_t idx = counter & (ctx->rqSize - 1);
         wc->wrId = ctx->rqWrid[idx];
         wc->opcode = MLX_UC_WC_RECV;
+        /* Tell the client where its payload starts. */
+        if (ctx->st == MLX_QP_ST_UD) wc->wcFlags |= MLX_UC_WC_GRH;
         if (cqeOpcode == MLX_CQE_RESP_WR_IMM ||
             cqeOpcode == MLX_CQE_RESP_SEND_IMM) {
             wc->immData = cqe->imm_inval_pkey;

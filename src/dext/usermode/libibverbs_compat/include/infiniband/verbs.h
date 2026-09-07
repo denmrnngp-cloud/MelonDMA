@@ -10,7 +10,8 @@
 extern "C" {
 #endif
 
-enum ibv_qp_type { IBV_QPT_RC = 2 };
+/* Values match rdma-core so consumer sources compile unchanged. */
+enum ibv_qp_type { IBV_QPT_RC = 2, IBV_QPT_UD = 4 };
 enum ibv_qp_state {
     IBV_QPS_RESET = 0, IBV_QPS_INIT = 1, IBV_QPS_RTR = 2,
     IBV_QPS_RTS = 3, IBV_QPS_SQD = 4, IBV_QPS_SQE = 5, IBV_QPS_ERR = 6
@@ -61,7 +62,11 @@ enum ibv_wc_opcode {
     IBV_WC_COMP_SWAP = 4,
     IBV_WC_RECV = 1 << 7
 };
-enum { IBV_WC_WITH_IMM = 1 << 0, IBV_WC_WITH_ATOMIC = 1 << 1 };
+/* IBV_WC_GRH marks a datagram receive whose buffer begins with 40 bytes of
+ * global routing header; the payload starts after it. */
+enum { IBV_WC_WITH_IMM = 1 << 0, IBV_WC_WITH_ATOMIC = 1 << 1,
+       IBV_WC_GRH = 1 << 2 };
+#define IBV_GRH_BYTES 40
 
 enum {
     IBV_ACCESS_LOCAL_WRITE = 1 << 0,
@@ -79,6 +84,7 @@ enum {
 enum {
     IBV_QP_STATE = 1 << 0,
     IBV_QP_CUR_STATE = 1 << 1,
+    IBV_QP_QKEY = 1 << 2,       /* datagram only */
     IBV_QP_ACCESS_FLAGS = 1 << 3,
     IBV_QP_PKEY_INDEX = 1 << 4,
     IBV_QP_PORT = 1 << 5,
@@ -134,6 +140,11 @@ struct ibv_mlx5_perf {
     /* cq_events is device-wide (every client sees the same completion-MSI-X
      * total); cq_event_wakeups is this client's own woken waits. */
     uint64_t cq_events;
+    /* Device-wide firmware command counters. Every control operation goes
+     * through the command path, so a high sleep ratio adds a flat millisecond
+     * to memory registration, QP creation and GID programming alike. */
+    uint64_t fw_commands;
+    uint64_t fw_command_sleeps;
     uint64_t cq_event_wakeups;
 };
 
@@ -315,6 +326,13 @@ struct ibv_send_wr {
             uint64_t swap;          /* CMP_SWAP: new value */
         } atomic;
         struct { uint32_t invalidate_rkey; } local_inv;
+        /* A datagram names its peer per work request: one address handle can
+         * serve many of them, so the destination is not baked into the handle. */
+        struct {
+            struct ibv_ah *ah;
+            uint32_t remote_qpn;
+            uint32_t remote_qkey;
+        } ud;
     } wr;
 };
 
@@ -382,6 +400,9 @@ struct ibv_qp_attr {
     uint16_t pkey_index;
     uint8_t port_num, timeout, retry_cnt, rnr_retry;
     uint32_t max_rd_atomic, max_dest_rd_atomic, min_rnr_timer;
+    /* Datagram only. Appended, never inserted: every field before it is
+     * laid out by position, and moving one shifts the rest. */
+    uint32_t qkey;
 };
 
 /* Public handle fields used by normal consumers such as llama.cpp. */
@@ -492,6 +513,18 @@ enum {
     IBV_MLX5_CQEQ_STAGE_CREATE        = 3,
     IBV_MLX5_CQEQ_STAGE_OK            = 4,
 };
+#define IBV_MLX5_IRQ_INDEX_MAP  16
+#define IBV_MLX5_IRQ_INDEX_NONE 0xffffffffu
+enum {
+    IBV_MLX5_IRQ_KIND_ABSENT = 0,  /* the provider refused this index */
+    IBV_MLX5_IRQ_KIND_LEVEL  = 1,  /* level-triggered, i.e. legacy INTx */
+    IBV_MLX5_IRQ_KIND_EDGE   = 2,
+    IBV_MLX5_IRQ_KIND_MSI    = 3,
+    IBV_MLX5_IRQ_KIND_MSIX   = 4,
+    IBV_MLX5_IRQ_KIND_OTHER  = 5,
+};
+const char *ibv_mlx5_irq_kind_name(uint8_t kind);
+
 struct ibv_mlx5_interrupts {
     uint32_t vectors;
     uint32_t setup_status;
@@ -515,9 +548,73 @@ struct ibv_mlx5_interrupts {
     uint64_t completion_interrupts;
     uint64_t eq_timer_ticks;
     uint32_t eq_timer_period_ms;
+    /* Host interrupt index map. These are NOT firmware vector numbers:
+     * firmware vector V is raised on host index msix_index_base + V. Kind
+     * values are IBV_MLX5_IRQ_KIND_*. index_kind_pre is the same probe taken
+     * before the provider allocated vectors. When msix_index_base is
+     * IBV_MLX5_IRQ_INDEX_NONE no messaged pair answered and the provider kept
+     * its historical indices, in which case a level-triggered index 0 cannot
+     * deliver on a device that implements only MSI-X. */
+    uint32_t index_count;
+    uint32_t index_count_pre;
+    uint32_t msix_index_base;
+    uint32_t async_index;
+    uint32_t completion_index;
+    uint32_t index_probe_status;
+    uint8_t  index_kind[IBV_MLX5_IRQ_INDEX_MAP];
+    uint8_t  index_kind_pre[IBV_MLX5_IRQ_INDEX_MAP];
+    uint64_t index_type_raw[IBV_MLX5_IRQ_INDEX_MAP];
 };
 int ibv_mlx5_query_interrupts(struct ibv_context *context,
                               struct ibv_mlx5_interrupts *irq);
+
+/* Posting-path capabilities. bf_regs_per_uar is how many QPs of one client can
+ * post without sharing a doorbell register and its ping-pong toggle; zero means
+ * the card reports no blue flame and a WQE cannot be written into the register
+ * at all. */
+struct ibv_mlx5_posting_caps {
+    uint32_t bf_supported;
+    uint32_t log_bf_reg_size;
+    uint32_t uar_page_size;
+    uint32_t bf_regs_per_uar;
+    uint32_t max_inline_data;
+    uint32_t max_sge;
+    uint32_t max_sq_depth;
+    uint32_t max_qp;
+    uint32_t pcie_link_speed;   /* encoded generation, 0 = unknown */
+    uint32_t pcie_link_width;   /* lanes, 0 = unknown */
+};
+int ibv_mlx5_query_posting_caps(struct ibv_context *context,
+                                struct ibv_mlx5_posting_caps *caps);
+/* Raw per-direction line rate of the negotiated PCIe link in Gbit/s, 0 when
+ * unknown. Report measured rates as a fraction of this, not in gigabits: the
+ * fraction is what carries over to a different card or enclosure. */
+double ibv_mlx5_pcie_line_gbps(uint32_t speed, uint32_t width);
+
+/* MSI-X table access for interrupt bring-up. All three need the privileged
+ * diagnostics entitlement and return EPERM without it. `data` selects one of
+ * the interrupt controller's own vectors; it is not the global interrupt
+ * number, and the base that relates the two lives in the device tree, so it
+ * has to be found by experiment. */
+#define IBV_MLX5_MSIX_DOORBELL_ADDR 0xfffff000u
+#define IBV_MLX5_MSIX_TABLE_SNAPSHOT 16
+#define IBV_MLX5_MSIX_PBA_WORDS 4
+struct ibv_mlx5_msix_entry {
+    uint32_t addr_lo, addr_hi, data, vector_control;
+};
+struct ibv_mlx5_msix_state {
+    uint32_t cap_offset, message_control, table_size;
+    uint32_t table_bir, pba_bir, table_offset, pba_offset;
+    uint32_t entries_read, pba_words, status, command_reg, bar_index_used;
+    struct ibv_mlx5_msix_entry entry[IBV_MLX5_MSIX_TABLE_SNAPSHOT];
+    uint32_t pba[IBV_MLX5_MSIX_PBA_WORDS];
+};
+int ibv_mlx5_query_msix_state(struct ibv_context *context,
+                              struct ibv_mlx5_msix_state *state);
+int ibv_mlx5_program_msix(struct ibv_context *context, uint32_t vector,
+                          uint32_t addr_lo, uint32_t addr_hi, uint32_t data,
+                          int masked);
+int ibv_mlx5_mask_msix(struct ibv_context *context, uint32_t vector, int masked);
 const char *ibv_mlx5_irq_stage_name(uint32_t stage);
 const char *ibv_mlx5_cqeq_stage_name(uint32_t stage);
 
@@ -575,6 +672,10 @@ int ibv_destroy_qp(struct ibv_qp *qp);
 struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
                           int access);
 int ibv_dereg_mr(struct ibv_mr *mr);
+/* Refresh an indirect MR's KLM list through a RTS QP with an idle SQ.
+ * `children` must remain registered for the lifetime of `mr`. */
+int ibv_mlx5_retarget_mr(struct ibv_qp *qp, struct ibv_mr *mr,
+                         struct ibv_mr *const *children, uint32_t child_count);
 struct ibv_mw *ibv_alloc_mw(struct ibv_pd *pd, enum ibv_mw_type type);
 int ibv_dealloc_mw(struct ibv_mw *mw);
 int ibv_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
@@ -589,6 +690,186 @@ int ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc);
  * mutex. A poll from another thread fails instead of silently racing. */
 int ibv_mlx5_set_single_threaded(struct ibv_cq *cq, int enable);
 const char *ibv_wc_status_str(enum ibv_wc_status status);
+
+/* ---- Surface required by stock rdma-core consumers -------------------------
+ *
+ * perftest, rping, UCX (libuct_ib) and NCCL resolve these symbols when they
+ * load or dlopen the provider. A symbol that is merely absent stops the
+ * consumer from starting at all, even when it would never have called it, so
+ * every name below exists. What this hardware and driver actually do is
+ * implemented; everything else fails cleanly with EOPNOTSUPP rather than
+ * being missing. Signatures are copied verbatim from rdma-core 50.0 so that
+ * consumer sources compile unchanged against this include path.
+ */
+
+typedef uint16_t __be16;
+typedef uint32_t __be32;
+typedef uint64_t __be64;
+
+enum ibv_node_type {
+    IBV_NODE_UNKNOWN     = -1,
+    IBV_NODE_CA          = 1,
+    IBV_NODE_SWITCH      = 2,
+    IBV_NODE_ROUTER      = 3,
+    IBV_NODE_RNIC        = 4,
+    IBV_NODE_USNIC       = 5,
+    IBV_NODE_USNIC_UDP   = 6,
+    IBV_NODE_UNSPECIFIED = 7,
+};
+
+/* Global routing header, prepended to a UD receive. Declared so consumers that
+ * handle UD compile; UD itself is not implemented yet. */
+struct ibv_grh {
+    __be32 version_tclass_flow;
+    __be16 paylen;
+    uint8_t next_hdr;
+    uint8_t hop_limit;
+    union ibv_gid sgid;
+    union ibv_gid dgid;
+};
+
+struct ibv_srq_attr { uint32_t max_wr; uint32_t max_sge; uint32_t srq_limit; };
+struct ibv_srq_init_attr { void *srq_context; struct ibv_srq_attr attr; };
+struct ibv_srq {
+    struct ibv_context *context;
+    void *srq_context;
+    struct ibv_pd *pd;
+    uint32_t handle;
+    void *priv;
+};
+
+struct ibv_flow { uint32_t comp_mask; struct ibv_context *context; uint32_t handle; };
+struct ibv_flow_attr {
+    uint32_t comp_mask;
+    uint32_t type;
+    uint16_t size;
+    uint16_t priority;
+    uint8_t  num_of_specs;
+    uint8_t  port;
+    uint32_t flags;
+};
+
+struct ibv_ece { uint32_t vendor_id; uint32_t options; uint32_t comp_mask; };
+
+/* Extended posting interface. In rdma-core these wrappers are static inline and
+ * dispatch through function pointers the provider fills in, so the shape below
+ * has to match for consumer sources to compile and link unchanged. The work is
+ * accumulated into a chain and handed to the ordinary post path on complete,
+ * which is also why a batch here costs one doorbell instead of N. */
+struct ibv_data_buf { void *addr; size_t length; };
+
+struct ibv_qp_ex {
+    struct ibv_qp qp_base;
+    uint64_t comp_mask;
+    uint64_t wr_id;
+    unsigned int wr_flags;
+
+    void (*wr_atomic_cmp_swp)(struct ibv_qp_ex *qp, uint32_t rkey,
+                              uint64_t remote_addr, uint64_t compare, uint64_t swap);
+    void (*wr_atomic_fetch_add)(struct ibv_qp_ex *qp, uint32_t rkey,
+                                uint64_t remote_addr, uint64_t add);
+    void (*wr_rdma_read)(struct ibv_qp_ex *qp, uint32_t rkey, uint64_t remote_addr);
+    void (*wr_rdma_write)(struct ibv_qp_ex *qp, uint32_t rkey, uint64_t remote_addr);
+    void (*wr_rdma_write_imm)(struct ibv_qp_ex *qp, uint32_t rkey,
+                              uint64_t remote_addr, __be32 imm_data);
+    void (*wr_send)(struct ibv_qp_ex *qp);
+    void (*wr_send_imm)(struct ibv_qp_ex *qp, __be32 imm_data);
+    void (*wr_local_inv)(struct ibv_qp_ex *qp, uint32_t invalidate_rkey);
+    void (*wr_set_inline_data)(struct ibv_qp_ex *qp, void *addr, size_t length);
+    void (*wr_set_inline_data_list)(struct ibv_qp_ex *qp, size_t num_buf,
+                                    const struct ibv_data_buf *buf_list);
+    void (*wr_set_sge)(struct ibv_qp_ex *qp, uint32_t lkey, uint64_t addr,
+                       uint32_t length);
+    void (*wr_set_sge_list)(struct ibv_qp_ex *qp, size_t num_sge,
+                            const struct ibv_sge *sg_list);
+    void (*wr_start)(struct ibv_qp_ex *qp);
+    int  (*wr_complete)(struct ibv_qp_ex *qp);
+    void (*wr_abort)(struct ibv_qp_ex *qp);
+};
+
+static inline void ibv_wr_start(struct ibv_qp_ex *qp) { qp->wr_start(qp); }
+static inline int  ibv_wr_complete(struct ibv_qp_ex *qp) { return qp->wr_complete(qp); }
+static inline void ibv_wr_abort(struct ibv_qp_ex *qp) { qp->wr_abort(qp); }
+static inline void ibv_wr_rdma_write(struct ibv_qp_ex *qp, uint32_t rkey,
+                                     uint64_t remote_addr)
+{ qp->wr_rdma_write(qp, rkey, remote_addr); }
+static inline void ibv_wr_rdma_write_imm(struct ibv_qp_ex *qp, uint32_t rkey,
+                                         uint64_t remote_addr, __be32 imm_data)
+{ qp->wr_rdma_write_imm(qp, rkey, remote_addr, imm_data); }
+static inline void ibv_wr_rdma_read(struct ibv_qp_ex *qp, uint32_t rkey,
+                                    uint64_t remote_addr)
+{ qp->wr_rdma_read(qp, rkey, remote_addr); }
+static inline void ibv_wr_send(struct ibv_qp_ex *qp) { qp->wr_send(qp); }
+static inline void ibv_wr_send_imm(struct ibv_qp_ex *qp, __be32 imm_data)
+{ qp->wr_send_imm(qp, imm_data); }
+static inline void ibv_wr_local_inv(struct ibv_qp_ex *qp, uint32_t invalidate_rkey)
+{ qp->wr_local_inv(qp, invalidate_rkey); }
+static inline void ibv_wr_atomic_cmp_swp(struct ibv_qp_ex *qp, uint32_t rkey,
+                                         uint64_t remote_addr, uint64_t compare,
+                                         uint64_t swap)
+{ qp->wr_atomic_cmp_swp(qp, rkey, remote_addr, compare, swap); }
+static inline void ibv_wr_atomic_fetch_add(struct ibv_qp_ex *qp, uint32_t rkey,
+                                           uint64_t remote_addr, uint64_t add)
+{ qp->wr_atomic_fetch_add(qp, rkey, remote_addr, add); }
+static inline void ibv_wr_set_sge(struct ibv_qp_ex *qp, uint32_t lkey,
+                                  uint64_t addr, uint32_t length)
+{ qp->wr_set_sge(qp, lkey, addr, length); }
+static inline void ibv_wr_set_sge_list(struct ibv_qp_ex *qp, size_t num_sge,
+                                       const struct ibv_sge *sg_list)
+{ qp->wr_set_sge_list(qp, num_sge, sg_list); }
+static inline void ibv_wr_set_inline_data(struct ibv_qp_ex *qp, void *addr,
+                                          size_t length)
+{ qp->wr_set_inline_data(qp, addr, length); }
+static inline void ibv_wr_set_inline_data_list(struct ibv_qp_ex *qp, size_t num_buf,
+                                               const struct ibv_data_buf *buf_list)
+{ qp->wr_set_inline_data_list(qp, num_buf, buf_list); }
+
+const char *ibv_event_type_str(enum ibv_event_type event);
+const char *ibv_node_type_str(enum ibv_node_type node_type);
+int ibv_fork_init(void);
+int ibv_query_pkey(struct ibv_context *context, uint8_t port_num, int index,
+                   __be16 *pkey);
+struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
+                                uint64_t iova, unsigned int access);
+struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
+                                 size_t length, uint64_t iova, int fd, int access);
+
+/* ---- MelonDMA extension: memory that lives in a GPU buffer -----------------
+ *
+ * This is deliberately not spelled ibv_*. On Linux a consumer reaches GPU
+ * memory through ibv_reg_dmabuf_mr, and dma-buf is a kernel mechanism with no
+ * counterpart on Darwin, so that call refuses here rather than pretending.
+ * The path that does exist is this one: hand it the contents pointer of a
+ * shared-storage MTLBuffer and the region it returns can be written into
+ * directly by a peer, one-sided, through its rkey.
+ *
+ * The registration itself is an ordinary one over host-visible pages; the
+ * reason this has its own name is that a reader looking for GPU memory should
+ * find the supported route instead of concluding it is missing. Pass the
+ * pointer from -[MTLBuffer contents]; a private-storage buffer has none and is
+ * rejected, which is the same condition MlxRegisteredMetalBuffer checks. */
+struct ibv_mr *melon_reg_metal_mr(struct ibv_pd *pd, void *contents,
+                                  size_t length, int access);
+struct ibv_srq *ibv_create_srq(struct ibv_pd *pd,
+                               struct ibv_srq_init_attr *srq_init_attr);
+int ibv_destroy_srq(struct ibv_srq *srq);
+int ibv_post_srq_recv(struct ibv_srq *srq, struct ibv_recv_wr *recv_wr,
+                      struct ibv_recv_wr **bad_recv_wr);
+int ibv_modify_srq(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr,
+                   int srq_attr_mask);
+int ibv_query_srq(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr);
+int ibv_get_srq_num(struct ibv_srq *srq, uint32_t *srq_num);
+
+enum { IBV_SRQ_MAX_WR = 1 << 0, IBV_SRQ_LIMIT = 1 << 1 };
+int ibv_attach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid);
+int ibv_detach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid);
+struct ibv_ah *ibv_create_ah_from_wc(struct ibv_pd *pd, struct ibv_wc *wc,
+                                     struct ibv_grh *grh, uint8_t port_num);
+struct ibv_flow *ibv_create_flow(struct ibv_qp *qp, struct ibv_flow_attr *flow);
+int ibv_destroy_flow(struct ibv_flow *flow_id);
+struct ibv_qp_ex *ibv_qp_to_qp_ex(struct ibv_qp *qp);
+int ibv_query_ece(struct ibv_qp *qp, struct ibv_ece *ece);
+int ibv_set_ece(struct ibv_qp *qp, struct ibv_ece *ece);
 
 #ifdef __cplusplus
 }

@@ -121,6 +121,26 @@ enum {
     MLX_CQEQ_STAGE_OK            = 4,
 };
 
+/* Host interrupt indices live in a DIFFERENT space from the firmware's
+ * CREATE_EQ intr field. IOPCIFamily hands out one IOInterruptDispatchSource
+ * index per published interrupt specifier, and by long-standing convention
+ * index 0 is the legacy INTx line while messaged vectors follow it. Firmware
+ * vector V therefore sits at host index msixIndexBase + V, and binding a
+ * handler to a hardcoded 0/1 can silently attach it to the wrong source or to
+ * INTx, which on an MSI-X-only device behind a Thunderbolt tunnel never fires.
+ * The DEXT probes the first MLX_IRQ_INDEX_MAP indices with
+ * IOInterruptDispatchSource::GetInterruptType and publishes what it found. */
+#define MLX_IRQ_INDEX_MAP 16
+
+enum {
+    MLX_IRQ_KIND_ABSENT = 0,  /* GetInterruptType refused this index */
+    MLX_IRQ_KIND_LEVEL  = 1,  /* level-triggered, i.e. legacy INTx */
+    MLX_IRQ_KIND_EDGE   = 2,
+    MLX_IRQ_KIND_MSI    = 3,  /* kIOInterruptTypePCIMessaged  0x00010000 */
+    MLX_IRQ_KIND_MSIX   = 4,  /* kIOInterruptTypePCIMessagedX 0x00020000 */
+    MLX_IRQ_KIND_OTHER  = 5,  /* answered, but none of the above */
+};
+
 /* Interrupt-path diagnosis. Device-wide, read-only; no firmware payload or
  * DMA address crosses this ABI. eqn fields are firmware EQ numbers, which the
  * DEXT already publishes to clients through CreateCQ. */
@@ -151,6 +171,133 @@ struct mlx_interrupts_resp {
     uint64_t eqTimerTicks;
     uint32_t eqTimerPeriodMs;
     uint32_t rsvd0;
+    /* Host interrupt index map. The "pre" probe runs before
+     * ConfigureInterrupts and the plain one after it, because whether the
+     * messaged indices exist only after allocation is exactly what was never
+     * established. msixIndexBase is the host index carrying firmware vector 0,
+     * or MLX_IRQ_INDEX_NONE when no messaged index answered; in that case the
+     * DEXT falls back to the historical hardcoded 0/1 rather than not binding. */
+    uint32_t indexCount;        /* indices that answered after ConfigureInterrupts */
+    uint32_t indexCountPre;     /* indices that answered before it */
+    uint32_t msixIndexBase;     /* host index of firmware vector 0 */
+    uint32_t asyncIndex;        /* host index the async source is bound to */
+    uint32_t completionIndex;   /* host index the completion source is bound to */
+    uint32_t indexProbeStatus;  /* kern_return_t of the first refusal, 0 = none */
+    uint8_t  indexKind[MLX_IRQ_INDEX_MAP];      /* MLX_IRQ_KIND_*, after */
+    uint8_t  indexKindPre[MLX_IRQ_INDEX_MAP];   /* MLX_IRQ_KIND_*, before */
+    uint64_t indexTypeRaw[MLX_IRQ_INDEX_MAP];   /* raw GetInterruptType value */
+};
+
+#define MLX_IRQ_INDEX_NONE 0xffffffffu
+
+/* MSI-X capability readback (kMlxUCMethodQueryMsixState). Entries and pending
+ * bits are read straight out of the BAR the capability points at, so this is
+ * what the device itself holds, not what the driver believes it asked for.
+ *
+ * How to read the result:
+ *   messageControl bit 15 clear  -> MSI-X was never enabled; the kernel did
+ *                                   not act on ConfigureInterrupts.
+ *   entry[V] addr/data all zero  -> that vector was never programmed. If
+ *     or vectorControl bit 0 set    firmware raises V, it raises into nothing,
+ *                                   which is the host/firmware index mismatch.
+ *   entry programmed and a pba   -> the card did raise it and the event was
+ *     bit set after a burst         lost past the interrupt controller.
+ */
+/* Set in mlx_create_qp_resp.bfShared when this QP had to share its blue-flame
+ * register with another QP of the same client, so posts from two threads
+ * serialise on one MMIO register and on one toggle. */
+#define MLX_QP_BF_SHARED 0x1u
+
+/* kMlxUCMethodProgramMsix operations. */
+enum {
+    MLX_MSIX_OP_PROGRAM = 0,  /* write address, data and mask together */
+    MLX_MSIX_OP_MASK    = 1,  /* touch only the mask bit of vectorControl */
+    /* Raw dword access inside the MSI-X structures, for one question only:
+     * is there hardware behind this window at all? The pending-bit array is
+     * read-only in hardware, so a write that comes back on the next read
+     * proves we are talking to a shadow rather than to the device — and then
+     * masking a vector from here never reached it either. `vector` carries the
+     * dword index and `data` the value; addrLo selects the region, 0 for the
+     * table and 1 for the pending bits. Bounded to those two ranges. */
+    MLX_MSIX_OP_POKE    = 2,
+    MLX_MSIX_OP_PEEK    = 3,
+};
+
+/* The platform's MSI doorbell. Every message is a DMA write of `data` to this
+ * address; the interrupt controller turns `data` into one of its vectors.
+ * Taken from the device tree property msi-address, which reads the same for
+ * the built-in and the Thunderbolt PCIe controllers on this machine, and which
+ * Linux's driver for the same hardware hardcodes with the note that it matches
+ * macOS. Passed in the request rather than assumed, so a machine that differs
+ * can be told the right value without a rebuild. */
+struct mlx_program_msix_req {
+    uint32_t op;          /* MLX_MSIX_OP_* */
+    uint32_t vector;      /* table entry index */
+    uint32_t addrLo;      /* PROGRAM only */
+    uint32_t addrHi;      /* PROGRAM only */
+    uint32_t data;        /* PROGRAM, or the value for POKE */
+    uint32_t masked;      /* 1 = set the mask bit, 0 = clear it */
+    uint32_t dataOut;     /* PEEK returns the dword here */
+    uint32_t rsvd0;
+};
+
+/* QUERY_EQ (kMlxUCMethodQueryEqState). mlx5 EQ states: 0x9 armed, 0xa fired,
+ * 0xb always-armed. consumerIndex is the queue's own idea of how far the
+ * driver has drained it, which is what the arm doorbell publishes. */
+struct mlx_query_eq_req {
+    uint32_t eqn;
+    uint32_t rsvd0;
+};
+
+struct mlx_query_eq_resp {
+    uint32_t status;        /* firmware command status */
+    uint32_t state;         /* eqc.st */
+    uint32_t intr;          /* eqc.intr — the MSI-X vector it would raise */
+    uint32_t uarPage;       /* eqc.uar_page — where its doorbells must go */
+    uint32_t consumerIndex; /* eqc.consumer_counter */
+    uint32_t producerIndex; /* eqc.producer_counter */
+    uint32_t logEqSize;
+    /* Filled only when the command failed: the firmware status byte and its
+     * syndrome. Without them a refusal is a bare kern_return and costs a
+     * rebuild to interpret, which is expensive on a machine whose kernel log
+     * channel is dead. */
+    uint32_t fwStatus;
+    uint32_t syndrome;
+};
+
+#define MLX_MSIX_TABLE_SNAPSHOT 16
+#define MLX_MSIX_PBA_WORDS      4
+
+struct mlx_msix_entry {
+    uint32_t addrLo;
+    uint32_t addrHi;
+    uint32_t data;
+    uint32_t vectorControl;   /* bit 0 = masked */
+};
+
+struct mlx_msix_state_resp {
+    uint32_t capOffset;       /* config offset of the MSI-X capability, 0 = absent */
+    uint32_t messageControl;  /* raw 16-bit register, zero-extended */
+    uint32_t tableSize;       /* entries the device implements */
+    uint32_t tableBir;
+    uint32_t pbaBir;
+    uint32_t tableOffset;     /* byte offset inside BAR[tableBir] */
+    uint32_t pbaOffset;       /* byte offset inside BAR[pbaBir] */
+    uint32_t entriesRead;     /* entries actually filled in below */
+    uint32_t pbaWords;        /* pba words actually filled in below */
+    uint32_t status;          /* kern_return_t of the first failing read */
+    uint32_t commandReg;      /* config 0x04: bus master and INTx-disable state */
+    uint32_t barIndexUsed;    /* memory index the DEXT read through */
+    /* MSI-X entry 0 address/data read BEFORE this DEXT's own ConfigureInterrupts
+     * (front A, the 'does the previous owner program the table' experiment).
+     * If the previous owner (AppleEthernetMLX5) programmed entry 0, addrLo holds
+     * the platform MSI doorbell (e.g. 0xfffff000) and data the vector; zero means
+     * the table was already empty before we touched it (or an intervening FLR
+     * cleared it). */
+    uint32_t preConfigureEntry0AddrLo;
+    uint32_t preConfigureEntry0Data;
+    struct mlx_msix_entry entry[MLX_MSIX_TABLE_SNAPSHOT];
+    uint32_t pba[MLX_MSIX_PBA_WORDS];
 };
 
 /* Read-only per-client diagnostic snapshot; no firmware command payloads or
@@ -170,7 +317,14 @@ struct mlx_health_resp {
  * Enforced by MlxUserClient. Every refusal happens BEFORE a firmware command
  * is issued, so a rejected request never leaves a partially-created resource.
  * These are per-UserClient ceilings; the DEXT-wide hardware tables (MlxQP /
- * MlxCQ / MlxMR) remain the ultimate bound shared by all clients. */
+ * MlxCQ / MlxMR) remain the ultimate bound shared by all clients.
+ *
+ * These constants are the DEFAULT policy, not the firmware limit: a client
+ * signed with the com.mlx5.rdma.entitlement entitlement has the ceilings for
+ * QP/CQ/MR/MW raised to the firmware capability (still bounded by the
+ * DEXT-wide tables and, for QP/CQ, the shared DB-record slot capacity). This
+ * is what lets one trusted client hold as many QPs as it needs without
+ * forcing parallel work into separate UserClients (front C, task 2). */
 #define MLX_UC_MAX_PD_PER_CLIENT   16u
 #define MLX_UC_MAX_QP_PER_CLIENT   64u
 #define MLX_UC_MAX_CQ_PER_CLIENT   64u
@@ -202,10 +356,31 @@ struct mlx_query_limits_resp {
     uint32_t fwCmdBurst;
     uint32_t fwCmdWindowNs;
     uint32_t maxDbRecords;     /* shared CQ+QP DB-record slots */
+    /* Posting-path capabilities. The kernel log channel is dead on the dev
+     * machine, so these are the only way to see what the card reported.
+     * bfSupported is the firmware's blue-flame bit; when it is clear, or
+     * logBfRegSize is zero, bfRegsPerUar is zero and writing a WQE into the
+     * doorbell register is not available at all, whatever the environment
+     * asks for. bfRegsPerUar is how many independent blue-flame registers a
+     * UAR page holds, i.e. how many QPs of one client can post without
+     * sharing a doorbell. */
+    uint32_t bfSupported;      /* 1 when firmware reports blue flame */
+    uint32_t logBfRegSize;     /* log2 of one blue-flame register, 0 = none */
+    uint32_t uarPageSize;      /* bytes */
+    uint32_t bfRegsPerUar;
+    uint32_t maxInlineData;    /* bytes this ABI accepts inline */
+    uint32_t maxSge;           /* SGEs this ABI accepts per WR */
+    /* Negotiated PCIe link, from the device's PCI Express Capability Link
+     * Status register. Gigabits mean nothing across machines; the fraction of
+     * this line that a transfer achieves transfers to any card, which is what
+     * front E is about. speed is the encoded generation (1=2.5, 2=5, 3=8,
+     * 4=16, 5=32 GT/s), width is lanes. Both zero when unreadable. */
+    uint32_t pcieLinkSpeed;
+    uint32_t pcieLinkWidth;
 };
 
 #if defined(__cplusplus)
-static_assert(sizeof(struct mlx_query_limits_resp) == 48,
+static_assert(sizeof(struct mlx_query_limits_resp) == 80,
               "mlx_query_limits_resp ABI mismatch");
 #endif
 
@@ -316,12 +491,23 @@ struct mlx_perf_resp {
     uint64_t copiedBytes;
     uint64_t cqEvents;
     uint64_t cqEventWakeups;
+    /* Firmware commands the DEXT issued, and how many of them outlived the
+     * command path's spin window and had to sleep a millisecond. Device-wide,
+     * like cqEvents. Every control operation goes through here — registering
+     * memory, creating a QP, programming a GID — so a high sleep ratio shows
+     * up as a flat millisecond added to all of them. */
+    uint64_t fwCommands;
+    uint64_t fwCommandSleeps;
 };
 
 #if defined(__cplusplus)
-static_assert(sizeof(struct mlx_interrupts_resp) == 104,
+static_assert(sizeof(struct mlx_interrupts_resp) == 288,
               "mlx_interrupts_resp ABI mismatch");
-static_assert(sizeof(struct mlx_perf_resp) == 136,
+static_assert(sizeof(struct mlx_msix_entry) == 16,
+              "mlx_msix_entry ABI mismatch");
+static_assert(sizeof(struct mlx_msix_state_resp) == 328,
+              "mlx_msix_state_resp ABI mismatch");
+static_assert(sizeof(struct mlx_perf_resp) == 152,
               "mlx_perf_resp ABI mismatch");
 static_assert(sizeof(struct mlx_query_abi_resp) == 8,
               "mlx_query_abi_resp ABI mismatch");
@@ -430,6 +616,33 @@ enum {
      * match the dispatch-source index". */
     kMlxUCMethodProbeCompletionVector = 0x1088,
 
+    /* Diagnostic: read back the device's MSI-X capability, the first entries
+     * of its table and the pending-bit array. Splits three causes apart that
+     * the counters alone cannot: MSI-X never enabled, the kernel programmed
+     * entries other than the ones firmware raises, or the card raised a vector
+     * that was lost after the controller. Raw config/BAR reads, so it sits
+     * behind the same privileged-diagnostics gate as AccessReg. */
+    kMlxUCMethodQueryMsixState = 0x1089,
+
+    /* Diagnostic: write one MSI-X table entry, or just flip its mask bit.
+     * The kernel programs this table from allocateDeviceInterrupts -> initDevice
+     * using an address and a data base it gets from the platform; on this
+     * machine that never happened and the table read back all zeroes, so the
+     * card had nowhere to send a vector. This lets the bring-up program it and
+     * calibrate the data base by experiment rather than by hardcoding it.
+     * Raw BAR writes, so it sits behind the privileged-diagnostics gate. */
+    kMlxUCMethodProgramMsix = 0x108a,
+
+    /* Diagnostic: ask firmware for an event queue's own state. This is the
+     * one fact that separates "the card never tried to raise the vector" from
+     * "it raised and the message went nowhere": an EQ that still reads ARMED
+     * after an entry was written to it never fired. QUERY_EQ needs a larger
+     * output mailbox than the raw debug exec path allows, hence its own
+     * selector rather than a passthrough. */
+    kMlxUCMethodQueryEqState = 0x108b,
+    /* Diagnostic-only: suspend EQ timer work while MSI-X delivery is tested. */
+    kMlxUCMethodSetEqTimerPaused = 0x108c,
+
     /* async events */
     kMlxUCMethodGetAsyncEvent = 0x1093,  /* get an async event (non-blocking) */
 
@@ -473,7 +686,79 @@ enum {
     kMlxUCMethodQueryGidTable    = 0x10b1,
     kMlxUCMethodArmCQ            = 0x10b2,
     kMlxUCMethodSyncQpTails      = 0x10b3,
+    /* Diagnostic: prove the RMP context layout before anything is built on it. */
+    kMlxUCMethodProbeRmpLayout   = 0x10b7,
+    kMlxUCMethodCreateSrq        = 0x10b8,
+    kMlxUCMethodDestroySrq       = 0x10b9,
+    kMlxUCMethodPostSrqRecv      = 0x10ba,
+    kMlxUCMethodQuerySrq         = 0x10bb,
+    kMlxUCMethodModifySrq        = 0x10bc,
+    /* Reads the recorded refusal straight from the QP context. Deliberately
+     * not folded into QueryQP: that one asks firmware, and a pair that never
+     * left RESET cannot be queried — which is exactly when the reason for a
+     * refused transition is wanted. */
+    kMlxUCMethodQpLastRefusal    = 0x10bd,
 };
+
+/* kMlxUCMethodProbeRmpLayout.
+ *
+ * Creates an RMP, reads it back with QUERY_RMP, and reports what firmware
+ * stored against what was written. Every offset below is recalled from
+ * mlx5_ifc rather than read out of a working path in this tree, which is
+ * exactly why it is checked instead of trusted: a wrong offset produces a
+ * silent queue, and that failure mode already cost this project an evening
+ * on the MSI-X table.
+ *
+ * create_rmp_in: opcode @0x00, rmpc @0x100.
+ * rmpc:          state @0x08 (4b), basic_cyclic_rcv_wqe @0x20 (1b), wq @0x180.
+ * wq (absolute = 0x280): wq_type @+0x00 (4b), page_offset @+0x2b (5b),
+ *                lwm @+0x30 (16b), pd @+0x48 (24b), uar_page @+0x68 (24b),
+ *                dbr_addr @+0x80 (64b), log_wq_stride @+0x10c (4b),
+ *                log_wq_pg_sz @+0x113 (5b), log_wq_sz @+0x11b (5b),
+ *                pas @+0x300.
+ */
+#define MLX_RMP_VARIANTS 6
+
+/* One CREATE_RMP attempt. Each rebuild costs the owner a cycle, so the probe
+ * walks several hypotheses in one call instead of one per cycle. */
+struct mlx_rmp_variant {
+    uint32_t inSize;        /* bytes handed to the firmware command */
+    uint32_t wqType;
+    uint32_t basicCyclic;
+    uint32_t logWqStride;   /* QPC uses log2(stride)-4; wq may use plain log2 */
+    uint32_t uarPage;       /* mlx5's set_wq leaves this zero for an RMP */
+    uint32_t status;        /* kIOReturnSuccess when firmware accepted it */
+    uint32_t syndrome;
+    uint32_t rsvd;
+};
+
+struct mlx_probe_rmp_layout_resp {
+    uint32_t status;        /* kIOReturnSuccess, or the stage that failed */
+    uint32_t stage;         /* 0 create, 1 query, 2 compare, 3 destroy */
+    uint32_t rmpn;
+    uint32_t fwStatus;      /* firmware syndrome of the failing command */
+    struct mlx_rmp_variant variant[MLX_RMP_VARIANTS];
+    uint32_t variantUsed;   /* index that firmware accepted, or 0xffffffff */
+    uint32_t rsvd2;
+
+    /* written / read back, one pair per field */
+    uint32_t setState,        gotState;
+    uint32_t setWqType,       gotWqType;
+    uint32_t setLogWqStride,  gotLogWqStride;
+    uint32_t setLogWqSz,      gotLogWqSz;
+    uint32_t setLogWqPgSz,    gotLogWqPgSz;
+    uint32_t setPd,           gotPd;
+    uint32_t setUarPage,      gotUarPage;
+    uint64_t setDbrAddr,      gotDbrAddr;
+    uint64_t setPas0,         gotPas0;
+
+    uint32_t mismatches;    /* bit per field, 0 = layout proven */
+    uint32_t rsvd;
+};
+#if defined(__cplusplus)
+static_assert(sizeof(struct mlx_probe_rmp_layout_resp) == 312,
+              "mlx_probe_rmp_layout_resp ABI mismatch");
+#endif
 
 struct mlx_wait_cq_event_req {
     uint64_t generation;
@@ -547,6 +832,10 @@ enum {
 
 enum {
     MLX_UC_WC_WITH_IMM    = 1u << 0,
+    /* A datagram receive lands 40 bytes of global routing header ahead of the
+     * payload. The flag says the header is there; the client must have posted
+     * room for it, and the driver refuses a receive too short to hold it. */
+    MLX_UC_WC_GRH         = 1u << 2,
     MLX_UC_WC_WITH_ATOMIC = 1u << 1,
 };
 
@@ -561,8 +850,22 @@ struct mlx_post_send_req {
     uint32_t opcode;
     uint64_t wrId;
     struct mlx_datapath_sge sge;
-    uint64_t remoteAddr;
-    uint32_t rkey;
+    /* A connected pair addresses memory; a datagram addresses a peer. The two
+     * never coexist in one request and need the same twelve bytes, so they
+     * overlap rather than grow the struct — a batch of 64 of these already
+     * sits close to the inline transfer limit. Anonymous members keep every
+     * existing use of remoteAddr and rkey untouched. */
+    union {
+        struct {
+            uint64_t remoteAddr;
+            uint32_t rkey;
+        };
+        struct {
+            uint32_t ahHandle;      /* address vector to copy into the WQE */
+            uint32_t remoteQpn;
+            uint32_t remoteQkey;
+        };
+    };
     uint32_t sendFlags;        /* MLX_UC_SEND_* */
 };
 
@@ -571,6 +874,71 @@ struct mlx_post_recv_req {
     uint32_t reserved;
     uint64_t wrId;
     struct mlx_datapath_sge sge;
+};
+
+/* ---- Shared receive queue ---------------------------------------------------
+ * A basic SRQ on this firmware is an RMP; see MlxSRQ.hpp for the layout and
+ * the two conventions that differ from the QPC. */
+#define MLX_SRQ_MAX_SGE 3       /* a 64-byte WQE holds a next segment plus 3 */
+
+struct mlx_create_srq_req {
+    uint32_t pd;
+    uint32_t maxWr;
+    uint32_t maxSge;
+    uint32_t limit;             /* MODIFY_RMP watermark, 0 to leave disarmed */
+};
+
+struct mlx_create_srq_resp {
+    uint32_t srqn;
+    uint32_t logSize;           /* granted, may exceed the request */
+    uint32_t maxWr;
+    uint32_t maxSge;
+};
+
+struct mlx_post_srq_recv_req {
+    uint32_t srqn;
+    uint32_t numSge;
+    uint64_t wrId;
+    struct mlx_datapath_sge sge[MLX_SRQ_MAX_SGE];
+};
+
+struct mlx_query_srq_resp {
+    uint32_t srqn;
+    uint32_t maxWr;
+    uint32_t maxSge;
+    uint32_t limit;
+    uint32_t freeCount;         /* WQEs still on the free list */
+    uint32_t posted;            /* mirrored into the DB record */
+    /* Observation of the completion path, so a receive that is not recognised
+     * as coming from this queue says so instead of surfacing later as an
+     * unattributable completion. Recorded for every receive CQE, whether or
+     * not it carried an srqn. */
+    uint32_t recvSeen;          /* receive CQEs observed */
+    uint32_t recvWithSrqn;      /* of those, carrying a non-zero srqn */
+    uint32_t lastCqeSrqn;
+    uint32_t lastCqeWqe;
+    uint32_t lastCqeOp;
+    /* Bitmap of WQE indices the completion path has seen. A field that is
+     * stuck at one value recycles a single WQE while the rest leak, and the
+     * symptom is a local protection error once firmware still owns the one
+     * being rewritten. One bit per index tells them apart at a glance. */
+    uint32_t wqeSeenMask;
+};
+#if defined(__cplusplus)
+static_assert(sizeof(struct mlx_query_srq_resp) == 48,
+              "mlx_query_srq_resp ABI mismatch");
+#endif
+
+struct mlx_qp_refusal_resp {
+    uint32_t qpn;
+    uint32_t fwStatus;
+    uint32_t syndrome;
+    uint32_t rsvd;
+};
+
+struct mlx_modify_srq_req {
+    uint32_t srqn;
+    uint32_t limit;
 };
 
 /* Phase 3 bounded posting ABI. One batch is validated as a unit, written to
@@ -653,17 +1021,22 @@ struct mlx_post_local_inv_req {
     uint32_t reserved;
 };
 
-/* Inline SEND / SEND_WITH_IMM. The payload travels in this request — the
- * DEXT never dereferences the caller's VA for inline (the NIC would DMA it
- * otherwise), so userspace copies the bytes across the boundary. */
+/* Inline SEND / SEND_WITH_IMM / RDMA_WRITE / RDMA_WRITE_WITH_IMM. The payload
+ * travels in this request — the DEXT never dereferences the caller's VA for
+ * inline (the NIC would DMA it otherwise), so userspace copies the bytes
+ * across the boundary. Inline is not a send-only trick: on a one-sided write
+ * it removes the NIC's DMA read of the payload, which is what a small KV
+ * update spends most of its time on. remoteAddr and rkey are required for the
+ * write opcodes and must be zero for the send ones. */
 struct mlx_post_send_inline_req {
     uint32_t qpn;
-    uint32_t opcode;            /* MLX_UC_WR_SEND or MLX_UC_WR_SEND_IMM */
+    uint32_t opcode;            /* MLX_UC_WR_SEND, _SEND_IMM, _WRITE, _WRITE_IMM */
     uint64_t wrId;
+    uint64_t remoteAddr;        /* write opcodes only */
     uint32_t inlineLen;         /* 1..MLX_UC_MAX_INLINE_DATA */
     uint32_t sendFlags;         /* MLX_UC_SEND_* */
-    uint32_t immData;           /* SEND_IMM only; device (network) byte order */
-    uint32_t reserved;
+    uint32_t immData;           /* _IMM only; device (network) byte order */
+    uint32_t rkey;              /* write opcodes only */
     uint8_t  inlineData[MLX_UC_MAX_INLINE_DATA];
 };
 
@@ -759,7 +1132,10 @@ struct mlx_poll_cq_resp {
 #if defined(__cplusplus)
 static_assert(sizeof(struct mlx_datapath_sge) == 16,
               "mlx_datapath_sge ABI mismatch");
-static_assert(sizeof(struct mlx_post_send_req) == 48,
+/* Grew from 48 to 56: the datagram destination overlaps the connected one,
+ * but a union holding a 64-bit address rounds to 16 bytes. A batch of 64
+ * therefore goes 3080 -> 3592, still inside the 4096-byte inline limit. */
+static_assert(sizeof(struct mlx_post_send_req) == 56,
               "mlx_post_send_req ABI mismatch");
 static_assert(sizeof(struct mlx_post_recv_req) == 32,
               "mlx_post_recv_req ABI mismatch");
@@ -767,13 +1143,13 @@ static_assert(sizeof(struct mlx_post_send_sge_req) == 296,
               "mlx_post_send_sge_req ABI mismatch");
 static_assert(sizeof(struct mlx_post_recv_sge_req) == 272,
               "mlx_post_recv_sge_req ABI mismatch");
-static_assert(sizeof(struct mlx_post_send_batch_req) == 3080,
+static_assert(sizeof(struct mlx_post_send_batch_req) == 3592,
               "mlx_post_send_batch_req ABI mismatch");
 static_assert(sizeof(struct mlx_post_recv_batch_req) == 2056,
               "mlx_post_recv_batch_req ABI mismatch");
 static_assert(sizeof(struct mlx_work_completion) == 48,
               "mlx_work_completion ABI mismatch");
-static_assert(sizeof(struct mlx_sync_fast_path_req) == 3080,
+static_assert(sizeof(struct mlx_sync_fast_path_req) == 3592,
               "mlx_sync_fast_path_req ABI mismatch");
 static_assert(sizeof(struct mlx_sync_recv_fast_path_req) == 2056,
               "mlx_sync_recv_fast_path_req ABI mismatch");
@@ -781,7 +1157,7 @@ static_assert(sizeof(struct mlx_sync_send_sge_req) == 296,
               "mlx_sync_send_sge_req ABI mismatch");
 static_assert(sizeof(struct mlx_sync_recv_sge_req) == 280,
               "mlx_sync_recv_sge_req ABI mismatch");
-static_assert(sizeof(struct mlx_post_send_inline_req) == 544,
+static_assert(sizeof(struct mlx_post_send_inline_req) == 552,
               "mlx_post_send_inline_req ABI mismatch");
 static_assert(sizeof(struct mlx_post_send_atomic_req) == 64,
               "mlx_post_send_atomic_req ABI mismatch");
@@ -958,7 +1334,19 @@ struct mlx_create_qp_req {
     uint32_t  bfOffset;         /* BF doorbell user offset */
     uint32_t  maxInlineData;    /* must be <= MLX_UC_MAX_INLINE_DATA */
     uint32_t  rsvd;             /* MLX_UC_QP_* flags (bit0: trusted fast path) */
+    /* Shared receive queue token, 0 for a QP that owns its receive ring. When
+     * set, the QPC carries rq_type = MLX5_SRQ_RQ and srqn_rmpn_xrqn, and no
+     * receive ring is allocated for this QP. */
+    uint32_t  srqn;
+    uint32_t  rsvd2;
 };
+#if defined(__cplusplus)
+/* Grew from 56 to 64 when srqn was added. There was no assertion here before,
+ * so the driver and the tools could disagree silently and a QP would simply
+ * fail to create. They must be rebuilt together. */
+static_assert(sizeof(struct mlx_create_qp_req) == 64,
+              "mlx_create_qp_req ABI mismatch");
+#endif
 struct mlx_create_qp_resp {
     uint32_t  qpn;              /* opaque client token (ABI v2) */
     uint32_t  hwQpn;            /* raw firmware QPN; direct-mode WQE control
@@ -969,10 +1357,11 @@ struct mlx_create_qp_resp {
     uint32_t  mappingVersion;
     uint32_t  uarPage;
     uint32_t  bfBufSize;        /* bytes in one of the two BF ping-pong buffers */
+    uint32_t  bfFlags;          /* MLX_QP_BF_SHARED when the register is shared */
 };
 
 #if defined(__cplusplus)
-static_assert(sizeof(struct mlx_create_qp_resp) == 32,
+static_assert(sizeof(struct mlx_create_qp_resp) == 36,
               "mlx_create_qp_resp ABI mismatch");
 #endif
 
@@ -1003,6 +1392,10 @@ struct mlx_modify_qp_req {
     uint32_t  rnrRetry;
     uint32_t  sl;              /* RoCEv2 VLAN priority / service level (0..7) */
     uint32_t  rsvd;
+    /* Unreliable datagram only: the queue key a receiver must match. UD has no
+     * path in the context, so this and the port are all RST->INIT carries. */
+    uint32_t  qkey;
+    uint32_t  qkeyRsvd;
 };
 
 struct mlx_query_qp_resp {
@@ -1014,7 +1407,27 @@ struct mlx_query_qp_resp {
     uint32_t sqPsn;
     uint32_t sendCq;
     uint32_t recvCq;
+    /* Traffic-marking readback from the firmware QPC primary path (front F,
+     * task 2): the values the card actually holds, not the values the client
+     * asked for. sl is the RoCEv2 VLAN priority 0..7, trafficClass the full
+     * 8-bit TOS (DSCP<<2 | ECN), dscp the 6-bit DSCP the switch sees. These
+     * are what both endpoints must agree on for ECN to behave as designed. */
+    uint32_t sl;
+    uint32_t trafficClass;
+    uint32_t dscp;
+    /* Why the last state transition was refused. Firmware answers a rejected
+     * MODIFY_QP with an outbox status that the driver maps to one coarse
+     * return code, and the syndrome behind it is the only thing that names
+     * the field. Keeping it here means a refusal can be diagnosed without a
+     * driver log, which on this machine does not reach userspace. */
+    uint32_t lastFwStatus;
+    uint32_t lastFwSyndrome;
 };
+
+#if defined(__cplusplus)
+static_assert(sizeof(struct mlx_query_qp_resp) == 52,
+              "mlx_query_qp_resp ABI mismatch");
+#endif
 
 /* regMR request/response */
 struct mlx_query_gid_resp {

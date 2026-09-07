@@ -1,7 +1,9 @@
 #!/bin/bash
 # Clean DEXT install with the one required reboot, then runtime takeover.
 # Run without sudo: ./scripts/mlx_cold_takeover.sh prepare
-# After macOS starts: ./scripts/mlx_cold_takeover.sh resume
+# After macOS starts:
+#   ./scripts/mlx_cold_takeover.sh resume-standard   # A4/G6: pure capture, no injection/kill
+#   ./scripts/mlx_cold_takeover.sh resume            # fallback: injected takeover
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -38,6 +40,42 @@ finalize() {
     ./scripts/mlx_dev.sh status
 }
 
+# Boot args both the standard and the injected takeover need. Separate so the
+# standard path fails with a clear message before touching anything.
+check_boot_args() {
+    args=$(nvram boot-args 2>/dev/null || true)
+    [[ "$args" == *dextrelaunch=1* ]] || fail "missing boot-arg dextrelaunch=1"
+    [[ "$args" == *daily_max_dext_crashes=1000* ]] || fail "missing boot-arg daily_max_dext_crashes=1000"
+}
+
+dump_capture_state() {
+    echo "  owner       = $(owner)" >&2
+    echo "  match_count = $(match_count)" >&2
+    pgrep -f "$APPLE" >/dev/null 2>&1 && echo "  AppleEthernetMLX5 still running (pid $(pgrep -f "$APPLE" | head -1))" >&2 || \
+        echo "  AppleEthernetMLX5 not running" >&2
+}
+
+# resume-standard: A4/G6 experiment. Activate the DEXT and let the card be
+# claimed purely by the Info.plist personality — no IOCatalogueSendData
+# injection, no kill of Apple's driver. This is the only path that can reveal
+# whether IOPCIFamily fills the MSI-X table on a normal capture (run
+# mlx_irq_probe after it). On failure it leaves the system untouched and
+# tells you to fall back to `resume`.
+resume_standard() {
+    [ -x "$ACT" ] || fail "$ACT is missing; run prepare first"
+    sudo -v
+    check_boot_args
+    "$ACT"
+    for ((i = 0; i < 40; i++)); do
+        [ "$(owner)" = ours ] && { echo "STANDARD CAPTURE OK: MlxPCIDriver owns the card without injection"; finalize; return 0; }
+        sleep 1
+    done
+    echo "STANDARD CAPTURE FAILED after 40s" >&2
+    dump_capture_state
+    echo "Fall back to the injected takeover:  ./scripts/mlx_cold_takeover.sh resume" >&2
+    return 1
+}
+
 prepare() {
     [ "$(id -u)" -ne 0 ] || fail "run as the login user, not root"
     [ -n "$TEAM" ] || fail "MLX_TEAM_ID is not set (Apple Developer Team ID, 10 chars)"
@@ -48,16 +86,15 @@ prepare() {
     # persona before card matching (otherwise Apple wins the first match).
     sudo ./scripts/install-to-libde.sh build/MlxRDMA.dext || true
     echo "Clean state prepared. Rebooting now; after login run:"
-    echo "  cd $ROOT && ./scripts/mlx_cold_takeover.sh resume"
+    echo "  cd $ROOT && ./scripts/mlx_cold_takeover.sh resume-standard   # try pure capture first"
+    echo "  (if that fails)  ./scripts/mlx_cold_takeover.sh resume"
     sudo reboot
 }
 
 resume() {
     [ -x "$ACT" ] || fail "$ACT is missing; run prepare first"
     sudo -v
-    args=$(nvram boot-args 2>/dev/null || true)
-    [[ "$args" == *dextrelaunch=1* ]] || fail "missing boot-arg dextrelaunch=1"
-    [[ "$args" == *daily_max_dext_crashes=1000* ]] || fail "missing boot-arg daily_max_dext_crashes=1000"
+    check_boot_args
 
     "$ACT"
     for _ in $(seq 1 30); do
@@ -96,5 +133,6 @@ resume() {
 case "${1:-}" in
     prepare) prepare ;;
     resume) resume ;;
-    *) echo "usage: $0 {prepare|resume}"; exit 2 ;;
+    resume-standard) resume_standard ;;
+    *) echo "usage: $0 {prepare|resume|resume-standard}"; exit 2 ;;
 esac

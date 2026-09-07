@@ -24,6 +24,11 @@ class MlxRoCE;
 class MlxPCIDriver;
 struct MlxClientDoorbellBundle;
 
+/* Maps an mlx5 error-CQE syndrome to a work-completion status. Shared with the
+ * completion path, which decodes shared-receive-queue errors without going
+ * through the QP decoder. */
+uint32_t MlxSyndromeToWcStatus(uint8_t syndrome);
+
 struct MlxQPContext {
     uint32_t    qpNum;
     uint32_t    state;
@@ -36,6 +41,16 @@ struct MlxQPContext {
     uint64_t    rqBufAddr;
     uint32_t    sqSize;
     uint32_t    rqSize;
+    /* Shared receive queue this QP draws from, 0 when it owns its ring. The
+     * CQE cannot be used to find it: srqn_uidx carries a user index in user
+     * mode and reads zero, which is why libmlx5 resolves the SRQ from the QP
+     * as well. */
+    uint32_t    srqn;
+    uint32_t    qkey;           /* UD only: the key a receiver must match */
+    uint32_t    lastFwStatus;   /* last refused transition, firmware status */
+    uint32_t    lastFwSyndrome;
+    uint32_t    udMaskTried;    /* how many masks the datagram walk tried */
+    uint32_t    udMaskUsed;     /* the one firmware accepted, 0 if none */
     uint32_t    dbRecordOffset;
     uint32_t    bfOffset;
     uint64_t    sqPhys;
@@ -106,6 +121,11 @@ public:
                               MlxClientDoorbellBundle *bundle = NULL);
     kern_return_t   ModifyQP(const struct mlx_modify_qp_req *req);
     kern_return_t   DestroyQP(uint32_t qpn);
+    /* 0 when the QP owns its receive ring. */
+    uint32_t        SrqnFor(uint32_t qpn);
+    /* Separate from QueryQP on purpose: see the note at the definition. */
+    kern_return_t   LastRefusal(uint32_t qpn, uint32_t *fwStatus, uint32_t *syndrome);
+
     kern_return_t   ResetQP(uint32_t qpn);
     kern_return_t   QueryQP(uint32_t qpn, void *out);
     kern_return_t   PostSend(const struct mlx_post_send_req *req);

@@ -20,6 +20,7 @@
 class MlxPCIDriver;
 class MlxQP;
 class MlxCQ;
+class MlxSRQ;
 class MlxMR;
 class MlxAH;
 class MlxGID;
@@ -98,6 +99,8 @@ public:
     MlxGID *        GetGID();
     MlxCC *         GetCC();
     MlxCQ *         GetCQ();
+    MlxSRQ *        GetSRQ();
+    MlxAH *         GetAH();
     MlxQP *         GetQP();
     MlxMR *         GetMR();
 

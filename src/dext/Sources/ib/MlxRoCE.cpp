@@ -13,6 +13,7 @@
 #include "MlxRoCE.hpp"
 #include "MlxQP.hpp"
 #include "MlxCQ.hpp"
+#include "MlxSRQ.hpp"
 #include "MlxMR.hpp"
 #include "MlxAH.hpp"
 #include "MlxGID.hpp"
@@ -36,6 +37,7 @@ struct MlxRoCE::State {
     MlxHCA        *hca;
     MlxQP         *qp;
     MlxCQ         *cq;
+    MlxSRQ        *srq;
     MlxMR         *mr;
     MlxAH         *ah;
     MlxGID        *gid;
@@ -86,6 +88,7 @@ MlxRoCE::Init(MlxPCIDriver *core, MlxHCA *hca)
 
     s->qp = new MlxQP();
     s->cq = new MlxCQ();
+    s->srq = new MlxSRQ();
     s->mr = new MlxMR();
     s->ah = new MlxAH();
     s->gid = new MlxGID();
@@ -93,6 +96,8 @@ MlxRoCE::Init(MlxPCIDriver *core, MlxHCA *hca)
     kern_return_t kr = s->qp->Init(this);
     if (kr != kIOReturnSuccess) { Free(); return kr; }
     kr = s->cq->Init(this);
+    if (kr != kIOReturnSuccess) { Free(); return kr; }
+    kr = s->srq->Init(this);
     if (kr != kIOReturnSuccess) { Free(); return kr; }
     kr = s->mr->Init(this);
     if (kr != kIOReturnSuccess) { Free(); return kr; }
@@ -119,6 +124,7 @@ MlxRoCE::QuiesceVerbsResources()
     if (s->qp)  { s->qp->Free(); delete s->qp; s->qp = NULL; }
     if (s->ah)  { s->ah->Free(); delete s->ah; s->ah = NULL; }
     if (s->mr)  { s->mr->Free(); delete s->mr; s->mr = NULL; }
+    if (s->srq) { s->srq->Free(); delete s->srq; s->srq = NULL; }
     if (s->cq)  { s->cq->Free(); delete s->cq; s->cq = NULL; }
     if (s->gid) { s->gid->Free(); delete s->gid; s->gid = NULL; }
 }
@@ -324,7 +330,10 @@ MlxRoCE::QueryPort(struct mlx_query_port_resp *resp)
     uint8_t admin = (uint8_t)mlxGetBits(out, 0x78, 4);
     uint32_t speed = (uint32_t)mlxGetBits(out, 0x60, 16);
     resp->portState = (state == 1) ? 1 : 0;
-    resp->activeSpeed = speed * 1000;      /* Gb/s → Mbps (MVP approximation) */
+    /* max_tx_speed in QUERY_VPORT_STATE is in units of 100 Mbps, not Gb/s.
+     * The raw value here is 320, i.e. 32 Gbit/s, which matches the Gen3 x4
+     * tunnel ceiling of 31.5 exactly; the old `* 1000` reported 320 Gbit/s. */
+    resp->activeSpeed = speed * 100;       /* 100 Mbps units → Mbps */
     resp->maxMtu = 5;                      /* 4 KiB (RoCEv2 max MTU) */
     MLX_LOG("QUERY_VPORT_STATE: state=%u (UP=%u) admin=%u maxTxSpeed=%u",
             state, resp->portState, admin, speed);
@@ -505,6 +514,8 @@ MlxHCA *      MlxRoCE::GetHCA() { return s ? s->hca : NULL; }
 MlxGID *      MlxRoCE::GetGID() { return s ? s->gid : NULL; }
 MlxCC *       MlxRoCE::GetCC()  { return s ? s->cc  : NULL; }
 MlxCQ *       MlxRoCE::GetCQ()  { return s ? s->cq  : NULL; }
+MlxSRQ *      MlxRoCE::GetSRQ() { return s ? s->srq : NULL; }
+MlxAH *       MlxRoCE::GetAH()  { return s ? s->ah  : NULL; }
 MlxQP *       MlxRoCE::GetQP()  { return s ? s->qp  : NULL; }
 MlxMR *       MlxRoCE::GetMR()  { return s ? s->mr  : NULL; }
 

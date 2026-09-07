@@ -90,6 +90,10 @@ public:
     bool            IsQuarantined() const;
     uint32_t        LastOpcode() const;
     uint32_t        LastSyndrome() const;
+    /* Firmware commands issued, and how many outlived the spin window and had
+     * to sleep a millisecond. A rising ratio means the spin budget is short
+     * for this firmware or command mix; both are device-wide. */
+    void            CommandStats(uint64_t *issued, uint64_t *slept) const;
     uint8_t         LastDeliveryStatus() const;
     uint8_t         LastFwStatus() const;
 

@@ -38,7 +38,12 @@ static std::atomic<uint64_t> nextAllocation{1}, nextSequence{1};
     _epoch = r.device_epoch; _allocation = nextAllocation.fetch_add(1);
     _pd = ibv_alloc_pd(context);
     if (!_pd) { if (error) *error = errno; return nil; }
-    _mr = ibv_reg_mr(_pd, buffer.contents, bytes * count, IBV_ACCESS_LOCAL_WRITE);
+    /* Named route rather than a bare ibv_reg_mr: this is the supported way to
+     * reach GPU memory here, and it should be findable by anyone who went
+     * looking for ibv_reg_dmabuf_mr and was refused. */
+    _mr = melon_reg_metal_mr(_pd, buffer.contents, bytes * count,
+                             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                             IBV_ACCESS_REMOTE_READ);
     if (!_mr) {
         if (error) *error = errno;
         /* An unsuccessful registration can have an ambiguous firmware result.
@@ -56,6 +61,9 @@ static std::atomic<uint64_t> nextAllocation{1}, nextSequence{1};
 - (NSUInteger)slotBytes { return _slotBytes; }
 - (uint64_t)allocationGeneration { return _allocation; }
 - (uint64_t)deviceEpoch { return _epoch; }
+- (uint64_t)remoteAddress { return _mr ? (uint64_t)(uintptr_t)_mr->addr : 0; }
+- (uint32_t)localKey { return _mr ? _mr->lkey : 0; }
+- (uint32_t)remoteKey { return _mr ? _mr->rkey : 0; }
 
 /* All private methods below require _lock. */
 - (int)check:(MlxMetalLease)lease {

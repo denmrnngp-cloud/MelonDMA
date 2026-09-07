@@ -79,13 +79,39 @@ struct MlxWqeAtomicSeg {
     uint64_t compare;
 };
 
+struct MlxAV {
+    union {
+        struct {
+            uint32_t qkey;      /* UD QKEY */
+            uint32_t reserved;
+        } qkey;
+        uint64_t dc_key;       /* for DC */
+    } key;                     /* 8 bytes */
+    uint32_t dqp_dct;          /* destination QPN (UD) */
+    uint8_t  stat_rate_sl;     /* [7:4]static_rate [3:0]SL (Ethernet priority) */
+    uint8_t  fl_mlid;          /* IB path bits */
+    union {
+        uint16_t rlid;         /* IB DLID */
+        uint16_t udp_sport;    /* RoCEv2 source UDP port ★ */
+    };                         /* 2 bytes */
+    uint8_t  reserved0[4];     /* alignment padding */
+    uint8_t  rmac[6];          /* destination MAC ★ */
+    uint8_t  tclass;           /* DSCP | ECN bits ★ */
+    uint8_t  hop_limit;        /* TTL ★ */
+    uint32_t grh_gid_fl;       /* [30]=GRH present [29:20]=sgid_index [19:0]=flow_label */
+    uint8_t  rgid[16];         /* destination GID (remote IP) ★ */
+};
+
 /*
  * WQE datagram segment — for UD, embeds mlx5_av
  * See: qp.h:388 struct mlx5_wqe_datagram_seg
  */
+/* The segment is the address vector itself, 48 bytes, not a pair of words:
+ * mlx5_wqe_datagram_seg is literally { struct mlx5_av av; }. The placeholder
+ * that used to stand here was eight bytes and would have shifted every data
+ * segment behind it. */
 struct MlxWqeDatagramSeg {
-    uint32_t dqp_dct;       /* destination QPN | MLX5_EXTENDED_UD_AV */
-    uint32_t av;
+    struct MlxAV av;
 };
 
 /*
@@ -150,28 +176,6 @@ struct MlxEthTxWqe {
  * Address Vector AV (28 bytes) — the core of RoCE addressing
  * See: qp.h:327 struct mlx5_av (exact replica, including qkey.reserved and reserved0)
  */
-struct MlxAV {
-    union {
-        struct {
-            uint32_t qkey;      /* UD QKEY */
-            uint32_t reserved;
-        } qkey;
-        uint64_t dc_key;       /* for DC */
-    } key;                     /* 8 bytes */
-    uint32_t dqp_dct;          /* destination QPN (UD) */
-    uint8_t  stat_rate_sl;     /* [7:4]static_rate [3:0]SL (Ethernet priority) */
-    uint8_t  fl_mlid;          /* IB path bits */
-    union {
-        uint16_t rlid;         /* IB DLID */
-        uint16_t udp_sport;    /* RoCEv2 source UDP port ★ */
-    };                         /* 2 bytes */
-    uint8_t  reserved0[4];     /* alignment padding */
-    uint8_t  rmac[6];          /* destination MAC ★ */
-    uint8_t  tclass;           /* DSCP | ECN bits ★ */
-    uint8_t  hop_limit;        /* TTL ★ */
-    uint32_t grh_gid_fl;       /* [30]=GRH present [29:20]=sgid_index [19:0]=flow_label */
-    uint8_t  rgid[16];         /* destination GID (remote IP) ★ */
-};
 
 /*
  * grh_gid_fl bit definitions (See ah.c:63)
@@ -261,6 +265,7 @@ static_assert(sizeof(struct MlxWqeDataSeg) == 16,  "data seg must be 16 bytes");
 static_assert(sizeof(struct MlxWqeRaddrSeg) == 16, "raddr seg must be 16 bytes");
 static_assert(sizeof(struct MlxWqeEthSeg) == 16,   "eth seg must be 16 bytes");
 static_assert(sizeof(struct MlxAV) == 48,          "AV must be 48 bytes");
+static_assert(sizeof(struct MlxWqeDatagramSeg) == 48, "datagram seg must be 48 bytes");
 static_assert(sizeof(struct MlxCqe64) == 64,       "CQE64 must be 64 bytes");
 #endif
 
@@ -386,23 +391,35 @@ mlxEncodeRcSendWqeImm(void *buffer, size_t bufferBytes, uint32_t qpn,
     return ds;
 }
 
-/* Encode an RC inline SEND / SEND_WITH_IMM WQE. The payload is copied into
- * the WQE itself (no NIC DMA fetch) — ctrl seg + inline seg, padded to the
- * 16-byte WQE granularity. `immData` is already in device (big-endian) order
- * and only used for SEND_IMM. Returns the WQE size in 16-byte units. */
+/* Encode an RC inline WQE: SEND, SEND_WITH_IMM, RDMA_WRITE or
+ * RDMA_WRITE_WITH_IMM. The payload is copied into the WQE itself, so the NIC
+ * never DMA-fetches it — which is the whole point, and it applies to a
+ * one-sided write exactly as it does to a send. A write additionally carries
+ * a remote address segment between the control and inline segments:
+ *
+ *   SEND :  ctrl(16) + inline_seg(4 + len)
+ *   WRITE:  ctrl(16) + raddr(16) + inline_seg(4 + len)
+ *
+ * rounded up to the 16-byte WQE granularity. `immData` is already in device
+ * (big-endian) order and only used by the _IMM opcodes. Returns the WQE size
+ * in 16-byte units, or 0 when the request is not encodable. */
 static inline uint32_t
-mlxEncodeRcInlineSendWqe(void *buffer, size_t bufferBytes, uint32_t qpn,
-                         uint16_t wqeCounter, uint8_t opcode,
-                         const void *inlineData, uint32_t inlineLen,
-                         uint32_t immData, bool signaled, bool fenced,
-                         bool solicited)
+mlxEncodeRcInlineWqe(void *buffer, size_t bufferBytes, uint32_t qpn,
+                     uint16_t wqeCounter, uint8_t opcode,
+                     const void *inlineData, uint32_t inlineLen,
+                     uint64_t remoteAddr, uint32_t rkey,
+                     uint32_t immData, bool signaled, bool fenced,
+                     bool solicited)
 {
+    const bool isWrite = opcode == MLX_OPCODE_RDMA_WRITE ||
+                         opcode == MLX_OPCODE_RDMA_WRITE_IMM;
     if (!buffer || !inlineData || !inlineLen ||
         inlineLen > MLX_WQE_MAX_INLINE ||
-        (opcode != MLX_OPCODE_SEND && opcode != MLX_OPCODE_SEND_IMM))
+        (opcode != MLX_OPCODE_SEND && opcode != MLX_OPCODE_SEND_IMM && !isWrite))
         return 0;
-    /* ctrl(16) + inline_seg(4 + len), rounded up to 16 B */
-    uint32_t ds = (16u + 4u + inlineLen + 15u) / 16u;
+    if (isWrite && (!remoteAddr || !rkey)) return 0;
+    const uint32_t head = isWrite ? 32u : 16u;   /* ctrl, plus raddr on a write */
+    uint32_t ds = (head + 4u + inlineLen + 15u) / 16u;
     uint32_t bytes = ds * 16u;
     if (bufferBytes < bytes) return 0;
     uint8_t *wqe = (uint8_t *)buffer;
@@ -413,11 +430,31 @@ mlxEncodeRcInlineSendWqe(void *buffer, size_t bufferBytes, uint32_t qpn,
     ctrl->fm_ce_se = (signaled ? MLX_WQE_CTRL_CQ_UPDATE : 0) |
                       (fenced ? MLX_WQE_CTRL_FENCE : 0) |
                       (solicited ? MLX_WQE_CTRL_SOLICIT : 0);
-    if (opcode == MLX_OPCODE_SEND_IMM) ctrl->imm = immData;
-    struct MlxWqeInlineSeg *seg = (struct MlxWqeInlineSeg *)(wqe + 16);
+    if (opcode == MLX_OPCODE_SEND_IMM || opcode == MLX_OPCODE_RDMA_WRITE_IMM)
+        ctrl->imm = immData;
+    if (isWrite) {
+        struct MlxWqeRaddrSeg *remote = (struct MlxWqeRaddrSeg *)(wqe + 16);
+        remote->raddr = MLX_BE64(remoteAddr);
+        remote->rkey = MLX_BE32(rkey);
+    }
+    struct MlxWqeInlineSeg *seg = (struct MlxWqeInlineSeg *)(wqe + head);
     seg->byte_count = MLX_BE32(inlineLen | MLX5_INLINE_SEG);
     __builtin_memcpy(seg->data, inlineData, inlineLen);
     return ds;
+}
+
+/* SEND-only spelling, kept so existing call sites read unchanged. */
+static inline uint32_t
+mlxEncodeRcInlineSendWqe(void *buffer, size_t bufferBytes, uint32_t qpn,
+                         uint16_t wqeCounter, uint8_t opcode,
+                         const void *inlineData, uint32_t inlineLen,
+                         uint32_t immData, bool signaled, bool fenced,
+                         bool solicited)
+{
+    if (opcode != MLX_OPCODE_SEND && opcode != MLX_OPCODE_SEND_IMM) return 0;
+    return mlxEncodeRcInlineWqe(buffer, bufferBytes, qpn, wqeCounter, opcode,
+                                inlineData, inlineLen, 0, 0, immData,
+                                signaled, fenced, solicited);
 }
 
 /* Encode an RC atomic WQE (CMP_SWAP 0x11 / FETCH_ADD 0x12). Layout:
@@ -486,6 +523,67 @@ mlxEncodeRcSendWqe64(void *buffer, uint32_t qpn, uint16_t wqeCounter,
     return mlxEncodeRcSendWqe64Ex(buffer, qpn, wqeCounter, opcode,
                                   localAddr, length, lkey, remoteAddr, rkey,
                                   true);
+}
+
+/* Marks the address vector in a datagram segment as the extended form, which
+ * is the one RoCE uses. From linux/mlx5/device.h. */
+#define MLX_EXTENDED_UD_AV 0x80000000u
+
+/*
+ * Datagram send.
+ *
+ * A connected send names a memory address; a datagram send names a peer, and
+ * carries that peer's whole 48-byte address vector inside the work request.
+ * So the layout is control segment, address vector, data — 80 bytes for one
+ * scatter entry, which spans two 64-byte slots where a connected send needs
+ * one. The caller must advance the send queue by the returned slot count, not
+ * by one, or the tail will run ahead of the hardware.
+ *
+ * Returns slots consumed, or 0 on a rejected request.
+ */
+static inline uint32_t
+mlxEncodeUdSendWqe(void *buffer, size_t bufferBytes, uint32_t qpn,
+                   uint16_t wqeCounter, uint8_t opcode,
+                   const struct MlxAV *av, uint32_t remoteQpn, uint32_t qkey,
+                   const struct MlxRcSge *sges, uint32_t numSge,
+                   bool signaled, bool solicited)
+{
+    if (!buffer || !qpn || !av || !sges || !numSge || !remoteQpn ||
+        numSge > MLX_RC_MAX_SGE ||
+        (opcode != MLX_OPCODE_SEND && opcode != MLX_OPCODE_SEND_IMM))
+        return 0;
+    /* control (1) + address vector (3) + one per scatter entry */
+    const uint32_t ds = 1 + 3 + numSge;
+    const size_t bytes = (size_t)ds * sizeof(struct MlxWqeDataSeg);
+    const size_t wqebbBytes = (bytes + 63u) & ~63u;
+    if (bufferBytes < wqebbBytes) return 0;
+
+    uint8_t *wqe = (uint8_t *)buffer;
+    __builtin_memset(wqe, 0, wqebbBytes);
+    struct MlxWqeCtrlSeg *ctrl = (struct MlxWqeCtrlSeg *)wqe;
+    ctrl->opmod_idx_opcode = MLX_BE32(((uint32_t)wqeCounter << 8) | opcode);
+    ctrl->qpn_ds = MLX_BE32((qpn << 8) | ds);
+    ctrl->fm_ce_se = (signaled ? MLX_WQE_CTRL_CQ_UPDATE : 0) |
+                     (solicited ? MLX_WQE_CTRL_SOLICIT : 0);
+
+    uint32_t offset = sizeof(*ctrl);
+    struct MlxWqeDatagramSeg *dgram = (struct MlxWqeDatagramSeg *)(wqe + offset);
+    dgram->av = *av;
+    /* Destination and key come from the request rather than the handle: one
+     * address vector serves many peers on a datagram queue, so pinning them
+     * into the handle would force a handle per peer. */
+    dgram->av.key.qkey.qkey = MLX_BE32(qkey);
+    dgram->av.dqp_dct = MLX_BE32(remoteQpn | MLX_EXTENDED_UD_AV);
+    offset += sizeof(*dgram);
+
+    for (uint32_t i = 0; i < numSge; i++) {
+        struct MlxWqeDataSeg *data = (struct MlxWqeDataSeg *)(wqe + offset);
+        data->byte_count = MLX_BE32(sges[i].length);
+        data->lkey = MLX_BE32(sges[i].lkey);
+        data->addr = MLX_BE64(sges[i].addr);
+        offset += sizeof(*data);
+    }
+    return (uint32_t)(wqebbBytes / 64);
 }
 
 static inline bool

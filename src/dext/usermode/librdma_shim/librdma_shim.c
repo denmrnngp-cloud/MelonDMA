@@ -57,6 +57,23 @@ static inline void rdma_dma_write_barrier(void)
 #endif
 }
 
+/* A blue-flame write goes to a page mapped write-combining, which is Normal-NC
+ * on arm64, not Device memory. A dmb orders stores against each other but does
+ * NOT push the combining buffer out, so a WQE written into the register can sit
+ * there past the point where the device was told to look. The buffer is flushed
+ * with dsb, and it is needed on BOTH sides of the write: before, so nothing
+ * still in flight merges into this register's buffer, and after, so the WQE
+ * actually reaches the device. This is rdma-core's mmio_wc_start /
+ * mmio_flush_writes on aarch64. */
+static inline void rdma_mmio_flush(void)
+{
+#if defined(__aarch64__)
+    __asm__ volatile("dsb st" ::: "memory");
+#else
+    __sync_synchronize();
+#endif
+}
+
 /* ---- internal object layouts ---- */
 
 struct rdma_device {
@@ -92,6 +109,12 @@ struct rdma_pd {
 
 struct rdma_cq {
     rdma_device *dev;
+    /* Set when a QP drawing from a shared receive queue is created on this CQ.
+     * That queue, its free list and its work-request ids live in the DEXT, so
+     * userspace cannot decode those completions. Falling back per CQE would
+     * interleave two decoders over one ring; taking the whole CQ through the
+     * kernel keeps a single reader. */
+    int          kernel_poll_only;
     uint32_t     cq_handle;
     volatile struct MlxCqe64 *cqe_buf;   /* mapped ring */
     uint32_t     log_size;
@@ -110,12 +133,18 @@ struct rdma_qp {
     rdma_pd     *pd;
     uint32_t     qpn;          /* opaque client token (ABI v2) */
     uint32_t     hw_qpn;       /* raw firmware QPN: peer exchange + WQE ctrl seg */
+    /* Non-zero when this QP draws receives from a shared queue. That queue and
+     * its free list live in the DEXT, like every other receive ring here, so
+     * the direct poll has no metadata for it and must defer to the kernel. */
+    uint32_t     srqn;
+    int          is_ud;   /* datagram queue pair */
     uint32_t     state;
     uint32_t     sq_size;
     uint32_t     rq_size;
     void        *sq_buf;
     void        *rq_buf;
     uint32_t     bf_offset;
+    int          bf_shared;   /* doorbell register shared with another QP */
     uint32_t     bf_buf_size;
     uint32_t     bf_toggle;
     uint32_t     db_record_offset;
@@ -156,12 +185,13 @@ static int rdma_blue_flame_post(rdma_qp *qp, const void *wqe, uint32_t bytes)
     volatile uint64_t *dst = (volatile uint64_t *)
         ((uint8_t *)qp->dev->uar_map + qp->bf_offset + qp->bf_toggle);
     const uint8_t *src = (const uint8_t *)wqe;
+    rdma_mmio_flush();
     for (uint32_t off = 0; off < bytes; off += sizeof(uint64_t)) {
         uint64_t word;
         memcpy(&word, src + off, sizeof(word));
         dst[off / sizeof(uint64_t)] = word;
     }
-    rdma_dma_write_barrier();
+    rdma_mmio_flush();
     qp->bf_toggle ^= qp->bf_buf_size;
     rdma_stat_add(&qp->dev->stats.blue_flame_wqes, 1);
     return 1;
@@ -171,7 +201,13 @@ static void rdma_ring_send_doorbell(rdma_qp *qp, uint64_t doorbell)
 {
     *(volatile uint64_t *)((uint8_t *)qp->dev->uar_map + qp->bf_offset +
                           qp->bf_toggle) = doorbell;
-    rdma_dma_write_barrier();
+    /* The barrier has to match the mapping, and the mapping follows blue
+     * flame: with it the UAR page is write-combining and the store can sit in
+     * a combining buffer, which only dsb pushes out; without it the page is
+     * Device memory, where the store is not buffered and dmb is both
+     * sufficient and materially cheaper on this hot path. */
+    if (qp->bf_buf_size) rdma_mmio_flush();
+    else                 rdma_dma_write_barrier();
     if (qp->bf_buf_size)
         qp->bf_toggle ^= qp->bf_buf_size;
 }
@@ -465,9 +501,13 @@ int rdma_map_fast_path(rdma_device *dev, struct rdma_fast_path *path)
     mach_vm_address_t uar = 0, db = 0;
     mach_vm_size_t uar_size = 0, db_size = 0;
     IOOptionBits uar_options = kIOMapAnywhere;
+    /* Write-combining is what makes a 64-byte doorbell write worth doing, so
+     * it follows blue flame. Measured on ConnectX-4 Lx behind Thunderbolt
+     * Gen3 x4: p50 8.4 -> 6.0 us end to end and 2.1 -> 0.6 us on the post
+     * itself, reproducible across three runs. Default on; MELONDMA_BLUE_FLAME=0
+     * is the kill switch. */
     if ((dev->abi_features & RDMA_FEATURE_BLUE_FLAME) &&
-        getenv("MELONDMA_BLUE_FLAME") &&
-        strcmp(getenv("MELONDMA_BLUE_FLAME"), "0") != 0)
+        rdma_env_default_on("MELONDMA_BLUE_FLAME"))
         uar_options |= kIOMapWriteCombineCache;
     kern_return_t kr = IOConnectMapMemory64(
         dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindUar, 0), mach_task_self(),
@@ -633,7 +673,32 @@ int rdma_query_perf(rdma_device *dev, struct rdma_perf *perf)
     perf->mr_bytes = resp.mrBytes;
     perf->copied_bytes = resp.copiedBytes;
     perf->cq_events = resp.cqEvents;
+    perf->fw_commands = resp.fwCommands;
+    perf->fw_command_sleeps = resp.fwCommandSleeps;
     perf->cq_event_wakeups = resp.cqEventWakeups;
+    return 0;
+}
+
+int rdma_query_stats(rdma_device *dev, struct rdma_stats *stats)
+{
+    if (!dev || !stats) return -EINVAL;
+    struct mlx_stats_resp resp = {};
+    size_t out = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodQueryStats, NULL, 0, &resp, &out);
+    if (kr != kIOReturnSuccess || out != sizeof(resp)) return -EIO;
+    stats->posted_send   = resp.postedSend;
+    stats->posted_write  = resp.postedWrite;
+    stats->posted_recv   = resp.postedRecv;
+    stats->completed_send   = resp.completedSend;
+    stats->completed_write  = resp.completedWrite;
+    stats->completed_recv   = resp.completedRecv;
+    stats->cqe_error     = resp.cqeError;
+    stats->cqe_retry_exc = resp.cqeRetryExc;
+    stats->cqe_rnr_retry = resp.cqeRnrRetry;
+    stats->cq_lost       = resp.cqLost;
+    stats->sq_occupancy  = resp.sqOccupancy;
+    stats->rq_occupancy  = resp.rqOccupancy;
     return 0;
 }
 
@@ -698,6 +763,291 @@ int rdma_query_interrupts(rdma_device *dev, struct rdma_interrupt_attr *attr)
     attr->completion_interrupts = resp.completionInterrupts;
     attr->eq_timer_ticks = resp.eqTimerTicks;
     attr->eq_timer_period_ms = resp.eqTimerPeriodMs;
+    attr->index_count = resp.indexCount;
+    attr->index_count_pre = resp.indexCountPre;
+    attr->msix_index_base = resp.msixIndexBase;
+    attr->async_index = resp.asyncIndex;
+    attr->completion_index = resp.completionIndex;
+    attr->index_probe_status = resp.indexProbeStatus;
+    for (int i = 0; i < RDMA_IRQ_INDEX_MAP; i++) {
+        attr->index_kind[i] = resp.indexKind[i];
+        attr->index_kind_pre[i] = resp.indexKindPre[i];
+        attr->index_type_raw[i] = resp.indexTypeRaw[i];
+    }
+    return 0;
+}
+
+int rdma_query_limits(rdma_device *dev, struct rdma_limits *limits)
+{
+    if (!dev || !limits) return -EINVAL;
+    struct mlx_query_limits_resp resp = {};
+    size_t out = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodQueryLimits, NULL, 0, &resp, &out);
+    if (kr == kIOReturnUnsupported) return -ENOTSUP;
+    if (kr != kIOReturnSuccess || out != sizeof(resp)) return -EIO;
+    limits->max_pd = resp.maxPd;
+    limits->max_qp = resp.maxQp;
+    limits->max_cq = resp.maxCq;
+    limits->max_mr = resp.maxMr;
+    limits->max_mw = resp.maxMw;
+    limits->max_ah = resp.maxAh;
+    limits->max_gid = resp.maxGid;
+    limits->max_sq_depth = resp.maxSqDepth;
+    limits->max_rq_depth = resp.maxRqDepth;
+    limits->fw_cmd_burst = resp.fwCmdBurst;
+    limits->fw_cmd_window_ns = resp.fwCmdWindowNs;
+    limits->max_db_records = resp.maxDbRecords;
+    limits->bf_supported = resp.bfSupported;
+    limits->log_bf_reg_size = resp.logBfRegSize;
+    limits->uar_page_size = resp.uarPageSize;
+    limits->bf_regs_per_uar = resp.bfRegsPerUar;
+    limits->max_inline_data = resp.maxInlineData;
+    limits->max_sge = resp.maxSge;
+    limits->pcie_link_speed = resp.pcieLinkSpeed;
+    limits->pcie_link_width = resp.pcieLinkWidth;
+    return 0;
+}
+
+double rdma_pcie_line_gbps(uint32_t speed, uint32_t width)
+{
+    if (!speed || !width) return 0.0;
+    double gt;         /* transfers per second, in giga */
+    double coding;     /* useful bits per transfer */
+    switch (speed) {
+    case 1: gt = 2.5;  coding = 8.0 / 10.0;   break;
+    case 2: gt = 5.0;  coding = 8.0 / 10.0;   break;
+    case 3: gt = 8.0;  coding = 128.0 / 130.0; break;
+    case 4: gt = 16.0; coding = 128.0 / 130.0; break;
+    case 5: gt = 32.0; coding = 128.0 / 130.0; break;
+    default: return 0.0;
+    }
+    return gt * coding * (double)width;
+}
+
+static int rdma_msix_call(rdma_device *dev, struct mlx_program_msix_req *req)
+{
+    size_t outsz = sizeof(*req);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodProgramMsix, req, sizeof(*req), req, &outsz);
+    if (kr == kIOReturnNotPermitted) return -EPERM;
+    if (kr == kIOReturnUnsupported) return -ENOTSUP;
+    if (kr == kIOReturnBadArgument) return -EINVAL;
+    return kr == kIOReturnSuccess ? 0 : -EIO;
+}
+
+int rdma_program_msix(rdma_device *dev, uint32_t vector, uint32_t addr_lo,
+                      uint32_t addr_hi, uint32_t data, int masked)
+{
+    if (!dev) return -EINVAL;
+    struct mlx_program_msix_req req = {
+        .op = MLX_MSIX_OP_PROGRAM, .vector = vector, .addrLo = addr_lo,
+        .addrHi = addr_hi, .data = data, .masked = masked ? 1u : 0u,
+    };
+    return rdma_msix_call(dev, &req);
+}
+
+int rdma_mask_msix(rdma_device *dev, uint32_t vector, int masked)
+{
+    if (!dev) return -EINVAL;
+    struct mlx_program_msix_req req = {
+        .op = MLX_MSIX_OP_MASK, .vector = vector,
+        .masked = masked ? 1u : 0u,
+    };
+    return rdma_msix_call(dev, &req);
+}
+
+int rdma_set_eq_timer_paused(rdma_device *dev, int paused)
+{
+    if (!dev) return -EINVAL;
+    uint32_t value = paused ? 1u : 0u;
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodSetEqTimerPaused,
+        &value, sizeof(value), NULL, 0);
+    if (kr == kIOReturnNotPermitted) return -EPERM;
+    if (kr == kIOReturnUnsupported) return -ENOTSUP;
+    return kr == kIOReturnSuccess ? 0 : -EIO;
+}
+
+int rdma_msix_poke(rdma_device *dev, uint32_t region, uint32_t index,
+                   uint32_t value)
+{
+    if (!dev) return -EINVAL;
+    struct mlx_program_msix_req req = {
+        .op = MLX_MSIX_OP_POKE, .vector = index, .addrLo = region,
+        .data = value,
+    };
+    return rdma_msix_call(dev, &req);
+}
+
+int rdma_msix_peek(rdma_device *dev, uint32_t region, uint32_t index,
+                   uint32_t *value)
+{
+    if (!dev || !value) return -EINVAL;
+    struct mlx_program_msix_req req = {
+        .op = MLX_MSIX_OP_PEEK, .vector = index, .addrLo = region,
+    };
+    int rc = rdma_msix_call(dev, &req);
+    if (!rc) *value = req.dataOut;
+    return rc;
+}
+
+struct rdma_srq { rdma_device *dev; uint32_t srqn; };
+
+rdma_srq *rdma_create_srq(rdma_pd *pd, uint32_t max_wr, uint32_t max_sge,
+                          uint32_t limit, struct rdma_srq_attr *out)
+{
+    if (!pd || !max_wr || !max_sge) { errno = EINVAL; return NULL; }
+    rdma_device *dev = pd->dev;
+    if (!dev) { errno = EINVAL; return NULL; }
+    struct mlx_create_srq_req req = { .pd = pd->pd, .maxWr = max_wr,
+                                      .maxSge = max_sge, .limit = limit };
+    struct mlx_create_srq_resp resp = {};
+    size_t outsz = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(dev->conn, kMlxUCMethodCreateSrq,
+                                                 &req, sizeof(req), &resp, &outsz);
+    if (kr != kIOReturnSuccess || outsz != sizeof(resp)) {
+        errno = (kr == kIOReturnUnsupported) ? ENOTSUP : EIO;
+        return NULL;
+    }
+    rdma_srq *srq = calloc(1, sizeof(*srq));
+    if (!srq) { errno = ENOMEM; return NULL; }
+    srq->dev = dev;
+    srq->srqn = resp.srqn;
+    if (out) { out->max_wr = resp.maxWr; out->max_sge = resp.maxSge;
+               out->srq_limit = limit; out->free_count = resp.maxWr; out->posted = 0; }
+    return srq;
+}
+
+int rdma_destroy_srq(rdma_srq *srq)
+{
+    if (!srq) return -EINVAL;
+    uint32_t token = srq->srqn;
+    kern_return_t kr = IOConnectCallStructMethod(srq->dev->conn,
+        kMlxUCMethodDestroySrq, &token, sizeof(token), NULL, NULL);
+    if (kr != kIOReturnSuccess) return -EIO;
+    free(srq);
+    return 0;
+}
+
+int rdma_post_srq_recv(rdma_srq *srq, uint64_t wr_id, uint32_t num_sge,
+                       const struct rdma_sge *sge)
+{
+    if (!srq || !sge || !num_sge || num_sge > MLX_SRQ_MAX_SGE) return -EINVAL;
+    struct mlx_post_srq_recv_req req = { .srqn = srq->srqn, .numSge = num_sge,
+                                         .wrId = wr_id };
+    for (uint32_t i = 0; i < num_sge; i++) {
+        req.sge[i].lkey = sge[i].lkey;
+        req.sge[i].addr = sge[i].addr;
+        req.sge[i].length = sge[i].length;
+    }
+    kern_return_t kr = IOConnectCallStructMethod(srq->dev->conn,
+        kMlxUCMethodPostSrqRecv, &req, sizeof(req), NULL, NULL);
+    if (kr == kIOReturnNoSpace) return -ENOMEM;
+    return kr == kIOReturnSuccess ? 0 : -EIO;
+}
+
+int rdma_query_srq(rdma_srq *srq, struct rdma_srq_attr *out)
+{
+    if (!srq || !out) return -EINVAL;
+    uint32_t token = srq->srqn;
+    struct mlx_query_srq_resp resp = {};
+    size_t outsz = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(srq->dev->conn,
+        kMlxUCMethodQuerySrq, &token, sizeof(token), &resp, &outsz);
+    if (kr != kIOReturnSuccess || outsz != sizeof(resp)) return -EIO;
+    out->max_wr = resp.maxWr; out->max_sge = resp.maxSge;
+    out->srq_limit = resp.limit; out->free_count = resp.freeCount;
+    out->posted = resp.posted;
+    out->recv_seen = resp.recvSeen; out->recv_with_srqn = resp.recvWithSrqn;
+    out->last_cqe_srqn = resp.lastCqeSrqn; out->last_cqe_wqe = resp.lastCqeWqe;
+    out->last_cqe_op = resp.lastCqeOp;
+    out->wqe_seen_mask = resp.wqeSeenMask;
+    return 0;
+}
+
+int rdma_modify_srq(rdma_srq *srq, uint32_t limit)
+{
+    if (!srq) return -EINVAL;
+    struct mlx_modify_srq_req req = { .srqn = srq->srqn, .limit = limit };
+    kern_return_t kr = IOConnectCallStructMethod(srq->dev->conn,
+        kMlxUCMethodModifySrq, &req, sizeof(req), NULL, NULL);
+    return kr == kIOReturnSuccess ? 0 : -EIO;
+}
+
+uint32_t rdma_srq_number(rdma_srq *srq) { return srq ? srq->srqn : 0; }
+
+int rdma_probe_rmp_layout(rdma_device *dev,
+                          struct mlx_probe_rmp_layout_resp *out)
+{
+    if (!dev || !out) return -EINVAL;
+    size_t outsz = sizeof(*out);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodProbeRmpLayout, NULL, 0, out, &outsz);
+    if (kr == kIOReturnNotPermitted) return -EPERM;
+    if (kr == kIOReturnUnsupported) return -ENOTSUP;
+    if (kr != kIOReturnSuccess || outsz != sizeof(*out)) return -EIO;
+    return 0;
+}
+
+int rdma_query_eq_state(rdma_device *dev, uint32_t eqn,
+                        struct rdma_eq_state *out)
+{
+    if (!dev || !out) return -EINVAL;
+    struct mlx_query_eq_req req = { .eqn = eqn };
+    struct mlx_query_eq_resp resp = {};
+    size_t outsz = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodQueryEqState, &req, sizeof(req), &resp, &outsz);
+    if (kr == kIOReturnNotPermitted) return -EPERM;
+    if (kr == kIOReturnUnsupported) return -ENOTSUP;
+    if (kr != kIOReturnSuccess || outsz != sizeof(resp)) return -EIO;
+    out->status = resp.status;
+    out->state = resp.state;
+    out->intr = resp.intr;
+    out->uar_page = resp.uarPage;
+    out->consumer_index = resp.consumerIndex;
+    out->producer_index = resp.producerIndex;
+    out->log_eq_size = resp.logEqSize;
+    out->fw_status = resp.fwStatus;
+    out->syndrome = resp.syndrome;
+    return 0;
+}
+
+int rdma_query_msix_state(rdma_device *dev, struct rdma_msix_state *state)
+{
+    if (!dev || !state) return -EINVAL;
+    struct mlx_msix_state_resp resp = {};
+    size_t out = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodQueryMsixState, NULL, 0, &resp, &out);
+    if (kr == kIOReturnNotPermitted) return -EPERM;
+    if (kr == kIOReturnUnsupported) return -ENOTSUP;
+    if (kr != kIOReturnSuccess || out != sizeof(resp)) return -EIO;
+    memset(state, 0, sizeof(*state));
+    state->cap_offset      = resp.capOffset;
+    state->message_control = resp.messageControl;
+    state->table_size      = resp.tableSize;
+    state->table_bir       = resp.tableBir;
+    state->pba_bir         = resp.pbaBir;
+    state->table_offset    = resp.tableOffset;
+    state->pba_offset      = resp.pbaOffset;
+    state->entries_read    = resp.entriesRead;
+    state->pba_words       = resp.pbaWords;
+    state->status          = resp.status;
+    state->command_reg     = resp.commandReg;
+    state->bar_index_used  = resp.barIndexUsed;
+    state->pre_configure_entry0_addr_lo = resp.preConfigureEntry0AddrLo;
+    state->pre_configure_entry0_data    = resp.preConfigureEntry0Data;
+    for (uint32_t i = 0; i < resp.entriesRead &&
+                         i < RDMA_MSIX_TABLE_SNAPSHOT; i++) {
+        state->entry[i].addr_lo        = resp.entry[i].addrLo;
+        state->entry[i].addr_hi        = resp.entry[i].addrHi;
+        state->entry[i].data           = resp.entry[i].data;
+        state->entry[i].vector_control = resp.entry[i].vectorControl;
+    }
+    for (uint32_t i = 0; i < resp.pbaWords && i < RDMA_MSIX_PBA_WORDS; i++)
+        state->pba[i] = resp.pba[i];
     return 0;
 }
 
@@ -1140,6 +1490,14 @@ static int rdma_poll_cq_direct(rdma_cq *cq, struct rdma_wc *wc, int num)
                 }
             }
         } else {   /* recv completion */
+            /* Belt and braces: a CQ carrying an SRQ-bound QP is marked
+             * kernel_poll_only at creation and never reaches this decoder.
+             * If one ever does, refuse rather than read a ring that has no
+             * metadata here. */
+            if (qp->srqn) {
+                if (count) break;
+                return RDMA_DIRECT_FALLBACK_METADATA;
+            }
             if (!qp->direct_rq || !qp->rq_wrid) {
                 if (count) break;
                 return RDMA_DIRECT_FALLBACK_METADATA;
@@ -1184,7 +1542,8 @@ static int rdma_poll_cq_direct(rdma_cq *cq, struct rdma_wc *wc, int num)
 int rdma_poll_cq(rdma_cq *cq, struct rdma_wc *wc, int num)
 {
     if (!cq || !wc || num <= 0) return -EINVAL;
-    const int direct_requested = rdma_env_default_on("MELONDMA_DIRECT_CQ");
+    const int direct_requested = rdma_env_default_on("MELONDMA_DIRECT_CQ") &&
+                                 !cq->kernel_poll_only;
     if (cq->cqe_buf && direct_requested) {
         rdma_stat_add(&cq->dev->stats.direct_poll_calls, 1);
         int n = rdma_poll_cq_direct(cq, wc, num);
@@ -1237,6 +1596,21 @@ int rdma_poll_cq(rdma_cq *cq, struct rdma_wc *wc, int num)
         wc[i].vendor_err = resp.wc[i].vendorError;
         wc[i].wqe_counter = resp.wc[i].wqeCounter;
         wc[i].atomic_result = resp.wc[i].atomicResult;
+        /* Ownership is split on this path and each side fills what it owns.
+         * The DEXT owns the shared receive queue, so it resolved the receive.
+         * A trusted fast-path send queue is mapped into this process, so its
+         * per-slot work-request ids live here and the DEXT can only guess;
+         * its own decoder says as much. Supply the send id from the shadow. */
+        if (resp.wc[i].opcode != RDMA_WC_RECV) {
+            rdma_qp *sqp = rdma_find_qp_token(cq->dev, resp.wc[i].qpNum);
+            if (sqp) {
+                wc[i].qp_num = sqp->hw_qpn;
+                if (sqp->direct_sq && sqp->sq_wrid && sqp->sq_size) {
+                    uint32_t sidx = resp.wc[i].wqeCounter & (sqp->sq_size - 1);
+                    wc[i].wr_id = sqp->sq_wrid[sidx];
+                }
+            }
+        }
         if (resp.wc[i].opcode == RDMA_WC_RECV) {
             rdma_qp *qp = rdma_find_qp_token(cq->dev, resp.wc[i].qpNum);
             if (qp) {
@@ -1254,6 +1628,27 @@ int rdma_poll_cq(rdma_cq *cq, struct rdma_wc *wc, int num)
                 wc[i].qp_num = qp->hw_qpn;
                 if (qp->direct_sq) {
                     uint32_t idx = resp.wc[i].wqeCounter & (qp->sq_size - 1);
+                    /* The DEXT decodes this CQE without per-slot metadata
+                     * (a trusted fast-path SQ posts without SyncFastPath, so
+                     * the shared shadow carries counters only), which makes
+                     * its wr_id/opcode best-effort. The shim posted the WQE
+                     * itself and still holds the real values here — use them
+                     * instead of the DEXT's guess. */
+                    if (qp->sq_wrid && qp->sq_opcode) {
+                        uint8_t wrop = qp->sq_opcode[idx];
+                        wc[i].wr_id = qp->sq_wrid[idx];
+                        wc[i].opcode =
+                            (wrop == RDMA_WR_RDMA_WRITE ||
+                             wrop == RDMA_WR_RDMA_WRITE_IMM)
+                                ? RDMA_WC_RDMA_WRITE
+                            : (wrop == RDMA_WR_RDMA_READ)
+                                ? RDMA_WC_RDMA_READ
+                            : (wrop == RDMA_WR_ATOMIC_CS)
+                                ? RDMA_WC_COMP_SWAP
+                            : (wrop == RDMA_WR_ATOMIC_FA)
+                                ? RDMA_WC_FETCH_ADD
+                                : RDMA_WC_SEND;
+                    }
                     uint64_t done = (qp->sq_head & ~0xffffULL) |
                                     resp.wc[i].wqeCounter;
                     if (done > qp->sq_head) done -= 0x10000ULL;
@@ -1360,6 +1755,7 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
     req.qpType        = init->qp_type;
     req.sqSize        = init->cap_sq;
     req.rqSize        = init->cap_rq;
+    req.srqn          = init->srqn;
     /* Option B: user buffers are never exposed as hardware WQs. */
     req.sqBufAddr     = 0;
     req.rqBufAddr     = 0;
@@ -1397,6 +1793,17 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
     }
     qp->dev = pd->dev; qp->pd = pd;
     qp->qpn = resp.qpn; qp->hw_qpn = resp.hwQpn; qp->state = RDMA_QPS_RESET;
+    qp->srqn = init->srqn;
+    qp->is_ud = (init->qp_type == RDMA_QPT_UD);
+    if (init->srqn || init->qp_type == RDMA_QPT_UD) {
+        /* One owner for this pair's state. A datagram posts through the driver
+         * because its address vector lives there, so its completions must be
+         * decoded there too: otherwise the driver never sees the send retire
+         * and refuses to destroy the pair, and the routing-header flag the
+         * driver sets never reaches the caller. */
+        if (init->send_cq) init->send_cq->kernel_poll_only = 1;
+        if (init->recv_cq) init->recv_cq->kernel_poll_only = 1;
+    }
     qp->sq_size = init->cap_sq; qp->rq_size = init->cap_rq;
     qp->sq_buf = NULL; qp->rq_buf = NULL;
     qp->sq_wrid = calloc(qp->sq_size, sizeof(*qp->sq_wrid));
@@ -1420,6 +1827,17 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
     }
     qp->bf_offset = resp.bfOffset;
     qp->bf_buf_size = resp.bfBufSize;
+    qp->bf_shared = (resp.bfFlags & MLX_QP_BF_SHARED) != 0;
+    /* Asking for blue flame on a card that reports none is silent otherwise:
+     * bf_buf_size stays zero, every post falls back to the plain doorbell, and
+     * the run looks identical to one that never asked. */
+    if (!resp.bfBufSize && rdma_env_default_on("MELONDMA_BLUE_FLAME"))
+        SHIM_LOG("QP[%u] blue flame requested but the card reports no BF "
+                 "register; posts use the plain doorbell", resp.qpn);
+    if (qp->bf_shared)
+        SHIM_LOG("QP[%u] shares blue-flame register 0x%x with another QP of "
+                 "this client; concurrent posts serialise on it",
+                 resp.qpn, resp.bfOffset);
     qp->db_record_offset = resp.dbRecordOffset;
     qp->sq_stride = resp.sqStrideSize;
 
@@ -1439,7 +1857,13 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
         if (mapkr == kIOReturnSuccess && sq_size >=
             (mach_vm_size_t)init->cap_sq * 64) {
             qp->sq_buf = (void *)(uintptr_t)sq;
-            qp->direct_sq = 1;
+            /* A datagram request carries a 48-byte address vector taken from
+             * the handle, and those handles live in the DEXT. Encoding one
+             * here would mean mapping them into an untrusted client, which is
+             * what this whole design avoids, so such a pair posts through the
+             * driver where the encoder already is. The receive ring is still
+             * mapped: only the send side needs the vector. */
+            qp->direct_sq = (init->qp_type == RDMA_QPT_UD) ? 0 : 1;
             mach_vm_address_t rq = 0;
             mach_vm_size_t rq_size = 0;
             kern_return_t rqkr = IOConnectMapMemory64(
@@ -1455,22 +1879,36 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
                     mach_task_self(), rq);
             }
             rdma_stat_add(&pd->dev->stats.mapped_qps, 1);
-            qp->trusted_fast_path = want_trusted;
+            qp->trusted_fast_path = want_trusted && init->qp_type != RDMA_QPT_UD;
             rdma_qp_publish_shadow_force(qp);
+            /* Zeroing bf_buf_size is what disables blue flame for this QP:
+             * every post then falls back to the plain 64-bit doorbell. The
+             * bounds check stays mandatory — a register that does not fit in
+             * the client's own UAR mapping must never be written. */
             if (!(pd->dev->abi_features & RDMA_FEATURE_BLUE_FLAME) ||
-                !getenv("MELONDMA_BLUE_FLAME") ||
-                strcmp(getenv("MELONDMA_BLUE_FLAME"), "0") == 0 ||
+                !rdma_env_default_on("MELONDMA_BLUE_FLAME") ||
                 !qp->bf_buf_size || qp->bf_buf_size > 2048u ||
                 resp.bfOffset + 2u * qp->bf_buf_size > pd->dev->uar_map_size)
                 qp->bf_buf_size = 0;
             SHIM_LOG("QP[%u] direct SQ mapped size=%llu uar=%u bf=0x%x bf_buf=%u db=0x%x",
                      qp->qpn, (unsigned long long)sq_size, resp.uarPage,
                      resp.bfOffset, qp->bf_buf_size, resp.dbRecordOffset);
-        } else if (mapkr == kIOReturnSuccess) {
-            (void)IOConnectUnmapMemory(
-                pd->dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindSq, resp.qpn),
-                mach_task_self(), sq);
+        } else {
+            SHIM_LOG("QP[%u] direct SQ NOT mapped: kr=0x%x size=%llu need=%llu",
+                     resp.qpn, mapkr, (unsigned long long)sq_size,
+                     (unsigned long long)init->cap_sq * 64);
+            if (mapkr == kIOReturnSuccess)
+                (void)IOConnectUnmapMemory(
+                    pd->dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindSq, resp.qpn),
+                    mach_task_self(), sq);
         }
+    } else {
+        SHIM_LOG("QP[%u] direct SQ skipped: uar=%p db=%p mappingVersion=%u "
+                 "stride=%u bfOffset=0x%x dbOffset=0x%x uar_size=%zu db_size=%zu",
+                 resp.qpn, pd->dev->uar_map, pd->dev->db_map,
+                 resp.mappingVersion, resp.sqStrideSize, resp.bfOffset,
+                 resp.dbRecordOffset, pd->dev->uar_map_size,
+                 pd->dev->db_map_size);
     }
     qp->next = pd->dev->qps;
     pd->dev->qps = qp;
@@ -1567,6 +2005,7 @@ int rdma_modify_qp(rdma_qp *qp, const struct rdma_qp_attr *attr)
     req.rqPsn          = attr->rq_psn;
     req.sqPsn          = attr->sq_psn;
     req.pkeyIndex      = attr->pkey_index;
+    req.qkey           = attr->qkey;
     req.portNum        = attr->port_num;
     memcpy(req.ahDmac, attr->ah_dmac, 6);
     memcpy(req.ahDgid, attr->ah_dgid, 16);
@@ -1583,7 +2022,14 @@ int rdma_modify_qp(rdma_qp *qp, const struct rdma_qp_attr *attr)
     req.sl             = attr->sl;
     kern_return_t kr = IOConnectCallStructMethod(
         qp->dev->conn, kMlxUCMethodModifyQP, &req, sizeof(req), NULL, 0);
-    if (kr != kIOReturnSuccess) return -EIO;
+    if (kr != kIOReturnSuccess) {
+        /* Collapsing every driver refusal into one errno hides which check
+         * fired; the transition that failed is rarely guessable without it. */
+        SHIM_LOG("modify_qp %u->%u refused: kr=0x%x mask=0x%x qkey=0x%x",
+                 attr->cur_state, attr->new_state, kr, attr->attr_mask,
+                 attr->qkey);
+        return -EIO;
+    }
     qp->state = attr->new_state;
     return 0;
 }
@@ -1605,6 +2051,41 @@ int rdma_query_qp(rdma_qp *qp, uint32_t *state)
     if (kr != kIOReturnSuccess || out != sizeof(resp) || resp.qpn != qp->qpn)
         return -EIO;
     *state = resp.state;
+    return 0;
+}
+
+/* Why the last state transition on this pair was refused. The driver maps
+ * several firmware outbox statuses onto one return code, so the syndrome is
+ * the only value that names the field, and the driver's log does not reach
+ * userspace on this machine. */
+int rdma_qp_last_refusal(rdma_qp *qp, uint32_t *fw_status, uint32_t *syndrome)
+{
+    if (!qp || !fw_status || !syndrome) return -EINVAL;
+    struct mlx_qp_refusal_resp resp = {};
+    size_t out = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        qp->dev->conn, kMlxUCMethodQpLastRefusal, &qp->qpn, sizeof(qp->qpn),
+        &resp, &out);
+    if (kr != kIOReturnSuccess || out != sizeof(resp)) return -EIO;
+    *fw_status = resp.fwStatus;
+    *syndrome = resp.syndrome;
+    return 0;
+}
+
+int rdma_query_qp_marking(rdma_qp *qp, struct rdma_qp_marking *marking)
+{
+    if (!qp || !marking) return -EINVAL;
+    rdma_qp_publish_shadow_force(qp);
+    struct mlx_query_qp_resp resp = {};
+    size_t out = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        qp->dev->conn, kMlxUCMethodQueryQP, &qp->qpn, sizeof(qp->qpn),
+        &resp, &out);
+    if (kr != kIOReturnSuccess || out != sizeof(resp) || resp.qpn != qp->qpn)
+        return -EIO;
+    marking->sl = resp.sl;
+    marking->traffic_class = resp.trafficClass;
+    marking->dscp = resp.dscp;
     return 0;
 }
 
@@ -2019,6 +2500,10 @@ int rdma_dbg_exec(rdma_device *dev, uint32_t opcode, const void *in,
     size_t outsz = sizeof(resp);
     kern_return_t kr = IOConnectCallStructMethod(
         dev->conn, kMlxUCMethodDbgExec, &req, sizeof(req), &resp, &outsz);
+    /* DbgsExec sits behind the com.mlx5.rdma.diagnostic entitlement; a
+     * refusal is a client-permission answer, not a firmware verdict, and the
+     * caller must be able to tell the two apart. */
+    if (kr == kIOReturnNotPermitted) return -EPERM;
     if (kr != kIOReturnSuccess || outsz != sizeof(resp) ||
         resp.kr != kIOReturnSuccess)
         return -EIO;
@@ -2140,6 +2625,11 @@ rdma_ah *rdma_create_ah(rdma_pd *pd, const struct rdma_ah_attr *attr)
     }
     ah->dev = pd->dev; ah->ah_handle = resp.ahHandle;
     return ah;
+}
+
+uint32_t rdma_ah_handle(rdma_ah *ah)
+{
+    return ah ? ah->ah_handle : 0;
 }
 
 int rdma_destroy_ah(rdma_ah *ah)
@@ -2357,6 +2847,7 @@ static int rdma_post_send_direct_sge(rdma_qp *qp,
             .remoteAddr = wr->remote_addr, .rkey = wr->rkey,
             .immData = wr->imm_data
         };
+
         for (uint32_t i = 0; i < (uint32_t)wr->num_sge; i++) {
             sync.sge[i].addr = wr->sg_list[i].addr;
             sync.sge[i].length = wr->sg_list[i].length;
@@ -2409,13 +2900,22 @@ static int rdma_post_send_direct_mixed(rdma_qp *qp,
             return -EINVAL;
         uint32_t ds = 0;
         if (cur->send_flags & RDMA_SEND_INLINE) {
+            const int inline_write = cur->opcode == RDMA_WR_RDMA_WRITE ||
+                                     cur->opcode == RDMA_WR_RDMA_WRITE_IMM;
             if ((cur->opcode != RDMA_WR_SEND &&
-                 cur->opcode != RDMA_WR_SEND_IMM) || cur->num_sge != 1 ||
+                 cur->opcode != RDMA_WR_SEND_IMM && !inline_write) ||
+                cur->num_sge != 1 ||
                 !cur->sg_list || !cur->sg_list[0].addr ||
                 !cur->sg_list[0].length ||
-                cur->sg_list[0].length > RDMA_MAX_INLINE_DATA)
+                cur->sg_list[0].length > RDMA_MAX_INLINE_DATA ||
+                (inline_write && (!cur->remote_addr || !cur->rkey)))
                 return -EINVAL;
-            ds = (16u + 4u + cur->sg_list[0].length + 15u) / 16u;
+            /* ctrl(16), plus the remote address segment on a write, plus the
+             * inline segment header and payload, rounded to 16 bytes. Must
+             * match mlxEncodeRcInlineWqe or the span reserved here and the
+             * WQE written later disagree. */
+            ds = ((inline_write ? 32u : 16u) + 4u +
+                  cur->sg_list[0].length + 15u) / 16u;
         } else if (cur->num_sge == 1 &&
                    cur->opcode != RDMA_WR_SEND_IMM &&
                    cur->opcode != RDMA_WR_RDMA_WRITE_IMM) {
@@ -2457,12 +2957,23 @@ static int rdma_post_send_direct_mixed(rdma_qp *qp,
         uint8_t flat[MLX_WQE_MAX_INLINE + 64] = {};
         uint32_t ds = 0;
         if (cur->send_flags & RDMA_SEND_INLINE) {
-            ds = mlxEncodeRcInlineSendWqe(
-                flat, sizeof(flat), qp->hw_qpn, (uint16_t)producer,
-                cur->opcode == RDMA_WR_SEND_IMM ? MLX_OPCODE_SEND_IMM :
-                                                  MLX_OPCODE_SEND,
+            /* Inline applies to one-sided writes too, and that is where it
+             * pays: the NIC skips the DMA read of the payload. A write also
+             * carries the remote address segment, which the encoder adds. */
+            uint8_t hw_opcode =
+                cur->opcode == RDMA_WR_SEND_IMM       ? MLX_OPCODE_SEND_IMM :
+                cur->opcode == RDMA_WR_RDMA_WRITE     ? MLX_OPCODE_RDMA_WRITE :
+                cur->opcode == RDMA_WR_RDMA_WRITE_IMM ? MLX_OPCODE_RDMA_WRITE_IMM :
+                                                        MLX_OPCODE_SEND;
+            const int is_write = hw_opcode == MLX_OPCODE_RDMA_WRITE ||
+                                 hw_opcode == MLX_OPCODE_RDMA_WRITE_IMM;
+            ds = mlxEncodeRcInlineWqe(
+                flat, sizeof(flat), qp->hw_qpn, (uint16_t)producer, hw_opcode,
                 (const void *)(uintptr_t)cur->sg_list[0].addr,
-                cur->sg_list[0].length, cur->imm_data,
+                cur->sg_list[0].length,
+                is_write ? cur->remote_addr : 0,
+                is_write ? cur->rkey : 0,
+                cur->imm_data,
                 (cur->send_flags & RDMA_SEND_SIGNALED) != 0,
                 (cur->send_flags & RDMA_SEND_FENCE) != 0,
                 (cur->send_flags & RDMA_SEND_SOLICITED) != 0);
@@ -2518,7 +3029,13 @@ static int rdma_post_send_direct_mixed(rdma_qp *qp,
         qp->sq_span[idx] = spans[i];
         producer += spans[i];
         memcpy(&final_doorbell, flat, sizeof(final_doorbell));
-        if (count == 1 && (cur->send_flags & RDMA_SEND_INLINE))
+        /* Stage the WQE for blue flame whenever there is exactly one of them
+         * and it fits in one half of the register. Inline is not the point:
+         * blue flame saves the card the DMA read of the WQE itself, and a
+         * non-inline WQE still has to be fetched otherwise. The payload is
+         * fetched by DMA either way. */
+        if (count == 1 && qp->bf_buf_size &&
+            (uint32_t)spans[i] * 64u <= qp->bf_buf_size)
             memcpy(bf_wqe, flat, (uint32_t)spans[i] * 64u);
     }
 
@@ -2527,7 +3044,8 @@ static int rdma_post_send_direct_mixed(rdma_qp *qp,
         ((uint8_t *)qp->dev->db_map + qp->db_record_offset);
     db[1] = __builtin_bswap32((uint32_t)producer & 0xffffu);
     rdma_dma_write_barrier();
-    if (!(count == 1 && (wr[0].send_flags & RDMA_SEND_INLINE) &&
+    if (!(count == 1 && qp->bf_buf_size &&
+          (uint32_t)spans[0] * 64u <= qp->bf_buf_size &&
           rdma_blue_flame_post(qp, bf_wqe, (uint32_t)spans[0] * 64u)))
         rdma_ring_send_doorbell(qp, final_doorbell);
     qp->sq_head = producer;
@@ -2567,15 +3085,28 @@ int rdma_post_local_inv(rdma_qp *qp, uint64_t wr_id, uint32_t rkey)
 
 int rdma_post_send_inline(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
                           const void *data, uint32_t len,
+                          uint64_t remote_addr, uint32_t rkey,
                           uint32_t imm_data, uint32_t send_flags)
 {
+    const int is_write = opcode == RDMA_WR_RDMA_WRITE ||
+                         opcode == RDMA_WR_RDMA_WRITE_IMM;
     if (!qp || !data || !len || len > RDMA_MAX_INLINE_DATA ||
-        (opcode != RDMA_WR_SEND && opcode != RDMA_WR_SEND_IMM) ||
+        (opcode != RDMA_WR_SEND && opcode != RDMA_WR_SEND_IMM && !is_write) ||
         (send_flags & ~(RDMA_SEND_SIGNALED | RDMA_SEND_FENCE |
                         RDMA_SEND_SOLICITED | RDMA_SEND_INLINE)))
         return -EINVAL;
-    uint32_t native_opcode = opcode == RDMA_WR_SEND_IMM ?
-                             MLX_UC_WR_SEND_IMM : MLX_UC_WR_SEND;
+    if (is_write ? (!remote_addr || !rkey) : (remote_addr || rkey))
+        return -EINVAL;
+    uint32_t native_opcode =
+        opcode == RDMA_WR_SEND_IMM       ? MLX_UC_WR_SEND_IMM :
+        opcode == RDMA_WR_RDMA_WRITE     ? MLX_UC_WR_RDMA_WRITE :
+        opcode == RDMA_WR_RDMA_WRITE_IMM ? MLX_UC_WR_RDMA_WRITE_IMM :
+                                           MLX_UC_WR_SEND;
+    uint8_t hw_opcode =
+        opcode == RDMA_WR_SEND_IMM       ? MLX_OPCODE_SEND_IMM :
+        opcode == RDMA_WR_RDMA_WRITE     ? MLX_OPCODE_RDMA_WRITE :
+        opcode == RDMA_WR_RDMA_WRITE_IMM ? MLX_OPCODE_RDMA_WRITE_IMM :
+                                           MLX_OPCODE_SEND;
     uint32_t native_flags =
         ((send_flags & RDMA_SEND_SIGNALED) ? MLX_UC_SEND_SIGNALED : 0) |
         ((send_flags & RDMA_SEND_FENCE) ? MLX_UC_SEND_FENCE : 0) |
@@ -2586,10 +3117,9 @@ int rdma_post_send_inline(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
         qp->dev->uar_map && qp->dev->db_map && qp->state == RDMA_QPS_RTS) {
         uint8_t flat[MLX_WQE_MAX_INLINE + 64] = {};
         uint64_t head = qp->sq_head;
-        uint32_t ds = mlxEncodeRcInlineSendWqe(
-            flat, sizeof(flat), qp->hw_qpn, (uint16_t)head,
-            opcode == RDMA_WR_SEND_IMM ? MLX_OPCODE_SEND_IMM : MLX_OPCODE_SEND,
-            data, len, imm_data,
+        uint32_t ds = mlxEncodeRcInlineWqe(
+            flat, sizeof(flat), qp->hw_qpn, (uint16_t)head, hw_opcode,
+            data, len, remote_addr, rkey, imm_data,
             (send_flags & RDMA_SEND_SIGNALED) != 0,
             (send_flags & RDMA_SEND_FENCE) != 0,
             (send_flags & RDMA_SEND_SOLICITED) != 0);
@@ -2627,9 +3157,11 @@ int rdma_post_send_inline(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
         .qpn = qp->qpn,
         .opcode = native_opcode,
         .wrId = wr_id,
+        .remoteAddr = remote_addr,
         .inlineLen = len,
         .sendFlags = native_flags,
         .immData = imm_data,
+        .rkey = rkey,
     };
     memcpy(req.inlineData, data, len);
     kern_return_t kr = IOConnectCallStructMethod(qp->dev->conn,
@@ -2640,10 +3172,9 @@ int rdma_post_send_inline(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
          * advances the DEXT's sqHead but not the shim's).  Same span math,
          * same (uint16_t) wqe counter. */
         uint8_t scratch[MLX_WQE_MAX_INLINE + 64] = {};
-        uint32_t ds = mlxEncodeRcInlineSendWqe(
+        uint32_t ds = mlxEncodeRcInlineWqe(
             scratch, sizeof(scratch), qp->hw_qpn, (uint16_t)qp->sq_head,
-            opcode == RDMA_WR_SEND_IMM ? MLX_OPCODE_SEND_IMM : MLX_OPCODE_SEND,
-            data, len, imm_data,
+            hw_opcode, data, len, remote_addr, rkey, imm_data,
             (send_flags & RDMA_SEND_SIGNALED) != 0,
             (send_flags & RDMA_SEND_FENCE) != 0,
             (send_flags & RDMA_SEND_SOLICITED) != 0);
@@ -2815,8 +3346,16 @@ int rdma_post_send_batch(rdma_qp *qp, const struct rdma_send_wr *wr,
             req.wr[i].sge.addr = wr[index].sg_list[0].addr;
             req.wr[i].sge.length = wr[index].sg_list[0].length;
             req.wr[i].sge.lkey = wr[index].sg_list[0].lkey;
-            req.wr[i].remoteAddr = wr[index].remote_addr;
-            req.wr[i].rkey = wr[index].rkey;
+            if (qp->is_ud) {
+                /* A datagram names a peer, not a memory address; the two sets
+                 * of fields overlap, so exactly one is written. */
+                req.wr[i].ahHandle = wr[index].ah_handle;
+                req.wr[i].remoteQpn = wr[index].remote_qpn;
+                req.wr[i].remoteQkey = wr[index].remote_qkey;
+            } else {
+                req.wr[i].remoteAddr = wr[index].remote_addr;
+                req.wr[i].rkey = wr[index].rkey;
+            }
             req.wr[i].sendFlags = wr[index].send_flags;
         }
         if (getenv("MELONDMA_DEBUG_WQE")) {
@@ -2844,6 +3383,15 @@ static int rdma_post_recv_direct_sge(rdma_qp *qp,
 
 int rdma_post_recv_sge(rdma_qp *qp, const struct rdma_recv_wr *wr)
 {
+    /* A datagram receive begins with 40 bytes of global routing header, so a
+     * buffer with no room for it truncates the payload. The check lives here
+     * rather than only in the driver because the direct path below never
+     * reaches the driver at all. */
+    if (qp && wr && qp->is_ud) {
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < wr->num_sge; i++) total += wr->sg_list[i].length;
+        if (total <= RDMA_GRH_BYTES) return -EINVAL;
+    }
     if (qp && wr && qp->direct_rq && wr->num_sge >= 2)
         return rdma_post_recv_direct_sge(qp, wr);
     if (!qp || !wr || !wr->sg_list || !wr->num_sge ||
@@ -2913,6 +3461,18 @@ int rdma_post_recv_batch(rdma_qp *qp, const struct rdma_recv_wr *wr,
 {
     if (!qp || !wr || !count || count > RDMA_MAX_POST_BATCH)
         return -EINVAL;
+    /* Same contract as the single-request entry: a datagram receive begins
+     * with 40 bytes of routing header, and a buffer without room for it
+     * truncates the payload. Checked here as well because the trusted fast
+     * path posts batches and never reaches the other entry. */
+    if (qp->is_ud) {
+        for (uint32_t b = 0; b < count; b++) {
+            uint32_t total = 0;
+            for (uint32_t i = 0; i < wr[b].num_sge; i++)
+                total += wr[b].sg_list[i].length;
+            if (total <= RDMA_GRH_BYTES) return -EINVAL;
+        }
+    }
     if (qp->direct_rq && count == 1 && wr->num_sge >= 2)
         return rdma_post_recv_direct_sge(qp, wr);
     if (qp->direct_rq) {

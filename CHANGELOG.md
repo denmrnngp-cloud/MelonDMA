@@ -1,196 +1,228 @@
-# Changelog
+# MelonDMA — Changelog
 
-MelonDMA is a macOS **DriverKit (DEXT)** RoCEv2 RC provider for Mellanox/NVIDIA
-ConnectX, with a libibverbs-compatible userspace layer (`libibverbs_compat` +
-`librdma_shim`). The project is pre-1.0, so this file describes the current
-tree as a single snapshot — **done**, **known gaps**, and **measured
-performance** — rather than dated releases.
+A chronological record of what was implemented, decided and measured, consolidated from
+`dev/CHANGELOG.md`, `git-prod/CHANGELOG.md` and the dated notes in `dev/docs/*`
+(2026-09-02 → 2026-09-07). Dates follow the source files; within a day the order follows the
+original notes. Numbers are measured on one bench: Mac Studio M2 Ultra + ConnectX-4 Lx
+`15b3:1015` (PCIe Gen3 x4 over Thunderbolt, ~31.5 Gbit/s/direction ceiling) ⇄ NVIDIA DGX Spark
+(ConnectX-7, rdma-core 50.0), RoCEv2, MTU 4096.
 
-## Hardware behind every result
+## 2026-09-02 — bring-up, first benchmarks
 
-- Mac Studio M2 Ultra
-- Mellanox **ConnectX-4 Lx EN `MCX4131A-BCAT`**, PCI `15b3:1015` (subsystem `15b3:0005`)
-- QSFP+ 40G DAC on an **ADT-Link PCIe Gen3 adapter** board
-- Peer: NVIDIA DGX Spark (ConnectX-7), stock rdma-core (`ibv_rc_pingpong`)
+**Automatic card takeover at cold boot (dev path).** `kernelmanagerd` guess-scans flat
+`.dext` bundles in `/Library/DriverExtensions`; the DEXT wins the first match on IOProbeScore
+**5000 vs 1000** (Apple). `install-to-libde.sh` flattens the `.systemextension` into a flat
+bundle; `mlx_cold_takeover.sh` stages/refreshes it. Production verification (after
+`installer -pkg` + reboot: `ioreg` shows `MlxPCIDriver` as owner + `IODEXTMatchCount >= 2`
+without a manual takeover) was left for later.
 
-The card supports PCIe **Gen3 x8**, but the ADT-Link Gen3 adapter negotiates
-**PCIe Gen3 x4** (8 GT/s × 4 on the Mac side). Every bandwidth number below is
-capped by that Gen3 x4 link (~31.5 Gbit/s theoretical).
+**Full cluster benchmark (RDMA vs TCP-10G).** `bench_rdma_cluster.py`, models Qwen3.8-27B and
+Qwen3.6-35B-A3B, 2 modes (disagg / split), contexts 512–65536. RDMA wins bulk: prefill
+**+2–12 %** (grows with context), TTFT **up to −10.7 %** at 65K. The KV handoff is confirmed
+byte-exact by NIC counters (`tx_vport_rdma_unicast_bytes` Δ ≈ 2×KV — it is transferred twice:
+prefetch chunks + the final `get(net)`). The cost: **~45 % of a Mac core on busy-poll
+`ibv_poll_cq`** in disagg; split decode is **−12 %** on RDMA (small activations).
+
+**RDMA vs TCP-10G vs TCP-40G.** TCP-40G (AppleEthernetMLX5, MTU 2034) is **on par** with RDMA
+on speed (Δ ≤ 1–2 %), but burns 3–8 % CPU vs 48 %. Conclusion: the disagg bottleneck is compute,
+not transport; the cheapest +10 % is moving the RPC from 10GbE to 40GbE without RDMA at all.
+
+## 2026-09-03 — blocking poll, direct path, shared-page fast path
+
+**Track A: busy-poll → blocking poll.** llama.cpp `rdma_poll()` moved to a completion channel
+(`ibv_req_notify_cq` → `poll(cc->fd)` → drain → re-arm). Driver side: the comp-channel worker
+reads the mapped CQE ring directly (`rdma_cq_pending_local`, ~30 µs). **mac_cpu 48 → 8.5–10 %**;
+the cost is TTFT +1–4 % and prefill −1–4 %.
+
+**Direct path.** `MELONDMA_DIRECT_UAR=1` + `MELONDMA_DIRECT_CQ=1` recovered the TTFT
+(65K: 137.5 → 137.0 → 139.5 s). After direct + one-sided + blocking poll: macCPU 48 → 9.1 %;
+RDMA no longer loses to TCP-40G on speed/latency.
+
+**Shared-page fast path (design).** QP shadow state (`sq_head/sq_tail/rq_head/rq_tail`, a
+seqlock) in the already-shared DB-record page — so post/poll never cross into DriverKit.
+Capability `MLX_UC_FEATURE_TRUSTED_FAST_PATH` + `MLX_UC_QP_TRUSTED` (`rsvd[0]` bit).
+
+## 2026-09-04 — performance audit, GPUDirect reverse-engineering, Metal UMA
+
+**Performance audit (applied).** Removed unconditional `IOLog` from the hot path (was 5×/CQE +
+3×/SEND; now `MLX_DBGLOG` compiles to nothing at `MLX_DEBUG=0`). O(1) lkey→slot hash index (was
+an O(512) scan per SGE; 27× on the host). Narrowed `fMethodLock` (data-path selectors under
+`fOwnedLock`). Per-QP/per-CQ locks + O(1) QPN/CQN index. CQ-depth validation.
+Capability-driven sizing of the QP/CQ/MR tables (`min(firmware caps, 4096)`),
+`MLX_UC_MAX_SGE` 4→16.
+
+**GPUDirect on Apple Silicon — reverse-engineering.** The GPU (AGX) uses unified memory; there
+is no "separate VRAM behind BAR" and none is needed. DMA "NIC → MTLBuffer pages" is purely a
+matter of DART registration through `IODMACommand` from the NIC's PCI function. Apple's TN3205
+RDMA is send/recv-only, UC, TB5-only — not a competitor. A GPU-issued doorbell is impossible.
+DEXT **0.359**: `MLX_UC_FEATURE_COHERENT_UMA_MR` on by default; `run_metal_dma_gate.sh` verified
+GPU→Spark, Spark→GPU, and a 4 MiB indirect MR (MTU 4096, 0 mismatches). Indirect-MR children
+32 → **240** (`MLX_UC_MAX_INDIRECT_CHILDREN`).
+
+## 2026-09-05 — entitlements, direct-UAR gate, KV batch, TTFT analysis
+
+**Security/entitlements.** `IOUserClient::CopyClientEntitlements`; diagnostic key
+`com.mlx5.rdma.diagnostic` (`tools/diagnostic.entitlements`). Live DEXT authorization still
+returns `0xe00002e2` until an Apple-approved path exists.
+
+**Direct-UAR gate PASS** (`run_phase3_direct_uar_gate.sh`): direct SQ mapped,
+`DIRECT_UAR_STATS`, non-zero `mapped_qps/direct_wrs/direct_doorbells/direct_recv_wrs`,
+`fallback_send=0/fallback_recv=0`.
+
+**Metal contract.** `MTLResourceStorageModeShared`, stable `MTLBuffer.contents`, `.untracked`
+only with external NIC/GPU ordering; `.private` and a GPU UAR are closed.
+`MlxRegisteredMetalBuffer` protects MR/PD + allocation generation + device epoch + slot leasing.
+
+**Final-KV path.** `GGML_RPC_RDMA_WRITE_KV=1` + `GGML_RPC_RDMA_FINAL_DEST=metal`; marker
+`GGML_RPC_FINAL_DEST_ACTIVE ... rdma_write=1 trailing_copy=0`. Live Metal acceptance:
+32×1 MiB GPU→peer, 32×1 MiB reverse, 4 MiB indirect, 0 mismatches. Gates `PHASE3_WRITE_GATE`,
+`PHASE3_REVERSE_WRITE_GATE`, `METAL_DMA_GATE` PASS.
+
+**Hardware support policy** (`SUPPORTED_HARDWARE.md`): only CX-4 Lx PF `15b3:1015`
+(match `0x101515b3`); CX4 PF/VF variants and CX5–CX8 are not claimed.
+
+**TTFT 7–15 % target analysis.** Baseline TTFT (Qwen3.6-35B, disagg, 2048 ctx) **1.9120 s**;
+targets −7 % = 1.7782 s, −15 % = 1.6252 s. Found: 80 sequential `submit_rpc_sync` instead of
+one batch; Spark does `ggml_backend_tensor_get()` → temp → memcpy → TX slot; `rdma_write`
+drains before returning (no overlap). KV ≈ 40 KiB/token; client quota 512 MiB.
+
+**KV batch + Spark→Mac pipeline (llama.cpp, opt-in).** New `GET_TENSOR_RDMA_BATCH` (up to 256
+descriptors): one request for 80 KV spans, one final `WRITE_WITH_IMM`. Spark reads backend data
+**directly into registered TX slots** (temp vector removed), 2 generations × 8 WR overlap. The
+key delivery fix: `MELONDMA_COMPLETION_POLICY=latency` removed the wait tail (Mac waited ~105 ms
+with the batch ready in ~60 ms). Result: wait_ms **81.9 → 56.9 (−30.5 %)**, full get
+**88.5 → 57.9 (−34.6 %)**, TTFT −28 ms (−1.77 %). DEXT in the run — **0.396**.
+
+## 2026-09-06 — prefetch dedup, WRITE tuning, inbound ceiling, prod rollout
+
+**Prefetch dedup.** In KV_BATCH mode the duplicate attention-KV download is skipped
+(`GGML_RPC_RDMA_KV_PREFETCH=1` re-enables for A/B). The naive "drop the whole call" version was
+rejected: TTFT −75 ms, but Mac CPU 11 % → **63 %** (blocking on RQ credits → SQ spin).
+
+**WRITE tuning.** `GGML_RPC_RDMA_WRITE_CHUNK` (256/512/1024 KiB), `_WINDOW` (2/4), `_DEPTH`
+(4/8), max 32 WR in flight (SQ 64), the last WR of a generation signaled + a final
+`WRITE_WITH_IMM`. On this hardware the geometry **does not matter** — defaults.
+
+**Mac inbound ceiling.** Spark→Mac **1.68 GB/s (13.4 Gbit/s)** vs Mac→Spark 2.62 GB/s
+(21 Gbit/s); loopback through the card ~2.03 GB/s/direction (~4.06 GB/s total). More QPs do not
+help (2 QPs share the same bandwidth); message size and MTU do not matter; no PAUSE/loss. MPEIN:
+the line is **PCIe Gen3 x4**. The flip: the bottleneck is on the Spark side — `ib_write_bw`
+loopback on Spark gives the same 12.6 Gbit/s (port-to-port 13.25).
+
+**"One model over RDMA" — our mistake, not the driver.** The driver gives each client its own
+GID slot (`GetGidIndex`/`SetGid`/`QueryGid` only to the owner). The transport always used
+`GGML_RDMA_GID=0` (someone else's slot) → the second client failed. `transport.cpp` fix: without
+an explicit index, take the client's own slot. Added `GGML_RDMA_GID_ADDR` (select GID by address,
+survives reboots).
+
+**`iommu.passthrough=1` on Spark.** SMMU translation was throttling the NIC's memory reads on
+transmit. Spark loopback `ib_write_bw`: **12.6 → 100.8 Gbit/s**; port-to-port 13.25 → 103.8;
+Spark→Mac 13.2 → **23.0**; Mac→Spark 21.0 (unchanged). TTFT at 16k: 5548.9 → 5385.9 ms (−2.9 %);
+KV in the wild 62.84 MiB: 45.2 → 25.1 ms. Huge pages for the source: +7 % only on a large buffer
+(zero on reused rings).
+
+**Prod rollout (the production router).** `CLUSTER_KV_BATCH=1` (+ `KV_BATCH`, `FINAL_DEST=host`,
+`DEST_ARENA_MAX=96`, `COMPLETION_POLICY=latency`, `KV_FENCE=0`), 5 RDMA env vars,
+`GGML_RPC_RDMA_RX_DEPTH=160` (40 MiB receives). It surfaced that **the router had not been
+working over RDMA at all** (it silently fell back to TCP; the cause was the auto-select looking
+for a GID matching the TCP socket address 192.168.100.1 + missing IP/MAC). Result: prefill
+**+8–10 %**, TTFT **−7–9 %** vs TCP40G, **−21–26 %** vs the old RDMA. Split decode: 55.2 vs
+46.9 tok/s (35B, 512 ctx); the only loss is split TTFT at 32–65k (−0.6–1.7 %).
+`GGML_RPC_REQUIRE_RDMA=1` is now honoured (it used to silently fall back to TCP).
+
+**Driver: PortStats + AccessReg.** Both selectors were declared but not implemented.
+`PortStats` — PPCNT group 0 (IEEE 802.3: packets/bytes/errors/pause) + group 1 (RFC 2863:
+discards) + link state (QUERY_VPORT_STATE); `rxPause`/`txPause` fields. `AccessReg` — ACCESS_REG
+passthrough (MPEIN for the PCIe link), payload 256 → 512 B. `tools/mlx_port_counters --watch
+--pcie`. Inbound through the card's own counters is clean: 24 × 90.18 MB, 0 errors/0 discards/0
+pause.
+
+**Changelog updated (git-prod).** Added `PortStats`/`AccessReg`; added the re-measure of
+Qwen3.6-35B: disagg TTFT 0.974→0.909 of TCP, prefill 1.03→1.10; TP-decode 55.2 vs 46.9 (512) and
+22.1 vs 21.2 (65536). The remaining split TTFT at 32–65k is 0.6–1.7 % behind.
+
+## 2026-09-07 — MSI-X delivery (resolved), SRQ, UD, compatibility, standard capture
+
+**MSI-X is delivered — closed.** The earlier "platform limit" verdict was overturned; the defect
+was ours. Root cause: exactly one place in IOPCIFamily writes the MSI-X table
+(`IOPCIMessagedInterruptController::initDevice`, reachable from `allocateDeviceInterrupts` /
+`restoreDeviceState`); `IOPCIDevice::Reset()` restores the table, but a **manual FLR-bit write is
+invisible to the kernel** — the driver was wiping the table the kernel had just filled.
+`PerformFlr()` now calls `Reset(kIOPCIDeviceResetTypeFunctionReset)` first, with a manual FLR as
+the fallback. The second cause: the table was written with `data = 1834 + V` (the global AIC
+number) instead of the index inside the controller's 32-vector map (1..9). Two vectors:
+`MLX_SINGLE_MSIX_VECTOR=0`, async → host 0, completion → host 1 (`ConfigureInterrupts(2,9)`).
+Verified: loopback 800 iterations — exactly 1 IRQ per iteration; two machines
+`irq_eqes=20 timer_eqes=0 lost=0`; wakeup median **80 µs / p99 88**. Platform remainder:
+rdar://118153788 (vectors are not reset on re-match; the vector count changes only via
+re-enumeration).
+
+**CQ moderation — closed negatively.** `events/iter = 1.00` for batches 1..32 and any
+moderation: one event already covers the whole batch. The win is grouping signaled operations
+(p50 per operation: 114 µs(1) → 5.95(8) → 2.20(32)).
+
+**Blue-flame per QP — works.** 1.00×/2.01×/3.62×/4.63× (previously ~1.5×); the hardware limit
+is `bf_regs_per_uar = 4`, from the 5th QP the registers are shared. WQE shapes: inline 3.79 µs,
+1 SGE 6.04, 4 SGE 6.25, 16 SGE 9.58. Units bug: `max_tx_speed` is in ×100 Mbit/s, the driver
+multiplied by 1000 (320 instead of 32.0 Gbit/s).
+
+**Compatibility with external clients.** Method — `objdump -T` over `ib_write_bw`/`ib_send_lat`/
+`rping`/`libuct_ib.so`: **44 symbols** needed, 28 present, 16 missing. All 44 are now exported.
+Principle: never a missing symbol, never a lie; unimplemented things return `EOPNOTSUPP` with a
+reason so the consumer falls back instead of crashing. `ibv_qp_to_qp_ex` is real
+(`wr_start`/`wr_complete` — a chain in one call).
+
+**SRQ — implemented and gated.** The modern `CREATE_SRQ` is the **RMP** object (the receive
+queue is a linked list, not a ring). `MlxSRQ` (create/destroy/`post_srq_recv`/query/
+`MODIFY_RMP`/WQE return), 5 selectors, QP binding `rq_type=1` + `srqn_rmpn_xrqn`@0x568,
+6 shim functions, real `ibv_create_srq`/`ibv_destroy_srq`/`ibv_post_srq_recv`/`ibv_modify_srq`/
+`ibv_query_srq`/`ibv_get_srq_num`. `mlx_srq_gate` PASS: 40 circular exchanges, depth 16, 48
+receives, 52 completions. 5 defects found by measurement (queue lookup via CQE is a dead end —
+`srqn_uidx=0`; the QPC cannot declare both an SRQ and its own ring; two decoders on one ring;
+split wr_id ownership; the free list is a circular chain). Methodological takeaway: "check
+whether the data path goes through the driver at all" (a repeat of the SRQ mistake).
+
+**UD (datagram) — implemented and gated.** `mlx_ud_gate` PASS: all three transitions, AH, refuse
+a receive without header space, the header flag in the CQE, and the payload after 40 bytes
+verified byte-exact. 6 defects (the RST→INIT optional-parameter mask for datagram; the service
+type hardcoded; `MlxWqeDatagramSeg` was an 8-byte stub instead of a 48-byte address vector; the
+receive-length check only in the driver while receive runs direct in userspace; datagram post
+went through the direct path without an address vector — now through the driver; CQE flags
+translated one-by-one).
+
+**Standard capture without injection.** `mlx_cold_takeover.sh resume-standard` three times in a
+row — `STANDARD CAPTURE OK: MlxPCIDriver owns the card without injection` (no IOCatalogue
+injection). This item was listed as requiring the Apple entitlement — it needs to be rewritten
+per the evidence.
+
+**Remaining (as of this date):** a registration cache keyed by "owner + generation"
+(registration costs 1.18–1.75 ms — the largest item; the current "cache" looks up by VA *after*
+registration), several UAR pages per client (lift the 4-QP ceiling), disabling the QP's own RQ
+buffer under SRQ, SRQ/UD checks against a peer; DCQCN (needs a switched fabric), moving to
+another card, re-validating the standard capture on a SIP-on machine.
 
 ---
 
-## Done — live-verified on hardware
-
-### Driver & firmware bring-up
-- PCIDriverKit DEXT takes PCI ownership from Apple's `AppleEthernetMLX5` at
-  runtime (dev configuration), maps BAR0, reads firmware `0x0016000e` / 14.22.2560.
-- Full firmware lifecycle: `ENABLE_HCA → SET_ISSI → QUERY/GIVE pages (6 boot,
-  4465 init, 3332 runtime) → SET_HCA_CAP → INIT_HCA → QUERY_HCA_CAP`.
-- Self-triggered FLR resets firmware to a clean state without a power cycle.
-
-### Verbs / datapath
-- RoCEv2 RC QP lifecycle `RESET → INIT → RTR → RTS` with `QUERY_QP` verification;
-  `ERR/RESET` path.
-- PD, MR, CQ, QP, AH, and Type-2 MW (`CREATE_MKEY`, `BIND_MW` UMR, `LOCAL_INV`,
-  rkey rotation, stale-rkey rejection).
-- SEND/RECV, RDMA READ/WRITE, immediate data, FENCE/SOLICITED, multi-SGE.
-- Pinned host MR with fragmented 4 KiB PAS/MTT; GID program/readback, MTU,
-  UDP destination port 4791.
-- Versioned `IOUserClient` ABI + feature negotiation; `libibverbs_compat` +
-  `librdma_shim` userspace stack.
-
-### Production gates — all PASS on an active DEXT
-- **P0.1 PASS** — 1,000,000 bidirectional SEND/RECV (1/64/256/4096 B), 10 recreate
-  cycles, forward/reverse READ + WRITE, hardware RNR/retry, recovery + reconnect.
-- **P0.2 PASS** — multi-client isolation (ownership denial, concurrent traffic,
-  client-A teardown without affecting client B).
-- **P0.3 PASS** — lifetime/stale-handle hardening (generation tokens, in-flight
-  busy, deterministic double-destroy).
-- **P1.1 PASS** — per-client quotas and DoS limits.
-- **P2.1** — `QueryStats` observability (per-opcode / posted / completed / error /
-  occupancy counters).
-- **P2.2 PASS** — ABI fuzz/property gate: 24/24 refusals with exact `kIOReturn*`.
-- **P2.3** — authenticated control channel (HMAC-SHA256, nonce/expiry/replay,
-  GID/rkey/addr binding).
-- **P3 PASS** — inline SEND (`max_inline_data=512`), RC atomics (FETCH_ADD /
-  CMP_SWAP with `atomic_result` verified), SL=3, `solicited_only` CQ arming,
-  GID-table enumeration, DCQCN `QUERY/MODIFY_CONG_PARAMS` roundtrip.
-
-### Performance work — applied
-- Removed unconditional `IOLog` from the hot path (5×/CQE + 3×/SEND); verbose
-  logs now compile out at `MLX_DEBUG=0`.
-- O(1) lkey→slot hash index in `MlxMR` (was an O(512) scan per SGE).
-- Narrowed `fMethodLock`; per-QP/per-CQ locks + O(1) QPN/CQN index.
-- CQ-depth validation; capability-driven QP/CQ/MR table sizing
-  (`min(firmware caps, 4096)`); `MLX_UC_MAX_SGE` raised 4 → 16.
-- Blocking completion delivery: a client blocks in the DEXT until the
-  completion generation advances instead of scanning the mapped CQE ring on a
-  timer. An idle armed channel costs 0.190 % of a core against 2.950 %.
-  `MELONDMA_HW_CQ_EVENT=0` keeps the poller; `MELONDMA_HW_WAIT_MS` bounds what a
-  missed event costs (default 50 ms).
-- Hardware completion moderation (`MODIFY_CQ` with `cq_period` /
-  `cq_max_count`), as `ibv_mlx5_modify_cq_moderation` and as
-  `MELONDMA_CQ_MODERATION="<period_us>:<max_count>"`. Off by default.
-- EQ timer rate is three-tier — 100 ms with no CQ allocated, 10 ms with one,
-  50 ms once any interrupt vector proves itself. Idle DEXT cost fell from
-  0.750 % to 0.150 % of a core.
-- Four completion-path defects fixed: the CQ arm sequence number was advanced
-  per arm instead of per delivered event (only ~1/3 of re-arms produced one);
-  `MlxEQ::Poll` published the consumer index without the arm bit, so a timer
-  drain left the ring disarmed; the compat worker blocked on an already
-  disarmed CQ and consumed the next generation edge; and a wait timeout arrived
-  with a zeroed output struct, losing the client's generation snapshot.
-- `QueryPerf` fills the `doorbells` / `cqeConsumed` / `cqeErrors` fields it had
-  always declared and never written, plus device-wide completion-event and
-  wakeup counters. `QueryInterrupts` reports the whole interrupt path: granted
-  vectors, failing setup step, both EQ numbers, per-vector interrupt counts, the
-  EQ timer period, and the completion EQ's bring-up verdict with per-variant
-  firmware syndromes.
-- Gates added: `mlx_cq_idle_cpu` (idle cost of an armed channel on either
-  worker path) and `mlx_irq_probe` (rebind the completion EQ to a chosen
-  interrupt index).
-- `PortStats` and `AccessReg` implemented. Both selectors had been declared in
-  the ABI header and in the privilege check for a long time with no method table
-  entry and no handler. `PortStats` reads PPCNT groups 0 and 1 (packets, bytes,
-  errors, discards, pause frames) plus link state; `AccessReg` is a
-  diagnostics-only ACCESS_REG passthrough, its payload raised 256 → 512 bytes so
-  PPCNT's 264 fits. On a host where the DEXT owns the port and no netif exists,
-  this is the only receive-side view of the wire.
-- `tools/mlx_port_counters` reads them: `--watch <seconds>` prints the delta over
-  an interval, `--pcie` adds the PCIe link behind the Thunderbolt tunnel (MPEIN)
-  and the device's own stall counters (MPCNT).
-
----
-
-## Not implemented / not tested
-
-### Blocking production release (external dependency)
-- **Apple DriverKit PCI + UserClient entitlements are still pending.**
-  Developer ID signing, notarization, and a SIP-on clean-machine install are
-  blocked until Apple grants
-  `com.apple.developer.driverkit.transport.pci` +
-  `com.apple.developer.driverkit.userclient-access`.
-- No clean-machine (SIP-on) install / update / activate / deactivate / uninstall
-  validation. Note: the bundle ID registered with Apple is
-  `com.melondma.rdma.dext`; the repo still uses `com.mlx5.rdma.dext` — to align
-  after the grant.
-
-### Untested or partially working
-- **no-FLR re-init does not pass on this firmware** (ConnectX-4 Lx 14.22.2560):
-  `TEARDOWN_HCA → INIT_HCA` runs, but the vport `roce_en` readback stays 0 after
-  `MODIFY_NIC_VPORT_CONTEXT(roce_en=1)` (fw status 0, syndrome 0). FLR recovery
-  (`recovered_flr=1`) is the working fallback. `mlx_stable_gate --cycles 1..100`
-  exists but fails on cycle 1 for this reason.
-- Negative `TAKE` during teardown/reinit — not exercised.
-- Repeated `INIT_HCA` within one firmware session (zeroed `sw_owner_id`) — not exercised.
-- Boot-time takeover `LaunchDaemon` — not re-validated across an actual cold reboot.
-- **MSI-X is configured but never delivered.** Two vectors are granted, the
-  dispatch sources are created and enabled, the setup is ordered after the FLR
-  that used to wipe it, and firmware accepts `CREATE_EQ` on either interrupt
-  index — yet the driver's per-vector counters stay at zero through real traffic
-  (32 CQ arms, 64 CQEs), and rebinding the completion EQ to index 0 with
-  `mlx_irq_probe` leaves them at zero too, so it is not an index mismatch. The
-  EQ timer is the actual delivery path and its period is the latency floor.
-  Suspected cause is outside the driver: the card is claimed through IOCatalogue
-  injection rather than a normal match, so interrupt routing is probably never
-  established. Re-test on a clean-machine install once the entitlements land.
-- **Blue-flame** doorbell not used.
-- No userspace **MR cache** in the shim (large-buffer registration is 5–20 ms).
-- `MlxHealth` health monitor is a skeleton.
-
-### Explicitly out of scope / deferred
-- **ConnectX-5/6/7/8** — capability-driven sizing is preparation, not support;
-  each generation needs its own backend + capability validation + live gate.
-  Only ConnectX-4 Lx (`15b3:1015`) is tested.
-- NetworkingDriverKit integration (native `enX`, route, ARP/NDP, automatic
-  endpoint discovery) — the DEXT uses explicit GID/MAC config, and the peer needs
-  a static neighbour entry.
-- UD/DC/XRC/SRQ/multicast, raw Ethernet QP, InfiniBand link layer, software RoCE.
-- **GPUDirect RDMA** — N/A on macOS + M2 Ultra (no CUDA / peer-memory path).
-- PFC and `QUERY_CONG_STATISTICS` — need switch-side fabric validation.
-- Consumer integrations (`llama.cpp` RoCE transport, MLX backend, `mlx-cuda`):
-  the MLX backend passed `MELON_MLX_GATE PASS` on two machines, but the reference
-  consumer implementations were removed from the repo (consumer layer, not the DEXT).
-
----
-
-## Real measured performance — ConnectX-4 Lx over PCIe Gen3 x4
+## Performance summary (ConnectX-4 Lx, PCIe Gen3 x4)
 
 | Metric | Value |
 |---|---|
-| Kernel-mediated RTT (synchronous ping-pong) | **~73 µs / ~13,700 msg/s** — flat across 1/64/256/1024 B (latency-bound) |
-| Single-QP RDMA WRITE, 1 MiB | **20.1–20.7 Gbit/s** |
-| P0.1 forward RDMA WRITE, 1024 × 1 MiB | **19.74 Gbit/s** |
-| 8-QP aggregate | **21.16 Gbit/s** |
-| Pipelined all-gather 4/16 MiB | **23.15 Gbit/s** |
-| Practical host-link ceiling | **~25–28 Gbit/s** (theoretical ~31.5 Gbit/s for Gen3 x4) |
-| TCP baseline (`AppleEthernetMLX5`) | 15–20 Gbit/s one-way, up to ~27.8 Gbit/s aggregate |
+| Kernel-mediated RTT (synchronous ping-pong) | ~73 µs / ~13,700 msg/s (latency-bound) |
+| Direct UAR+CQ RTT (mlx_rtt_bench, 64 B) | p50 **8.67 µs**, p99 12.08 (kernel fallback p50 53.92) |
+| Single-QP RDMA WRITE, 1 MiB | 20.1–20.7 Gbit/s |
+| 8-QP aggregate | 21.16 Gbit/s |
+| Pipelined all-gather 4/16 MiB | 23.15 Gbit/s |
+| Mac → Spark transmit | 21.0 Gbit/s |
+| Mac ← Spark receive (before `iommu.passthrough=1`) | 13.4 Gbit/s |
+| Mac ← Spark receive (after `iommu.passthrough=1`) | **23.0 Gbit/s** |
+| MSI-X wakeup (two machines) | median 80 µs / p99 88 µs |
+| Practical host-link ceiling | ~25–28 Gbit/s (theory ~31.5) |
 
-**Reading these numbers honestly:**
+Production gates P0/P1/P2/P3 (live-verified): P0.1 1M SEND/RECV + recreate + READ/WRITE +
+RNR/retry + reconnect; P0.2 multi-client isolation; P0.3 lifetime/stale-handle; P1.1 quotas;
+P2.1 QueryStats; P2.2 ABI-fuzz 24/24; P2.3 authentication (HMAC-SHA256); P3 inline (512 B) +
+atomics + SL=3 + solicited_only + GID-table + DCQCN roundtrip — all PASS.
 
-- The ~73 µs RTT is the current **kernel-mediated posting** path (correctness-first,
-  "Option B"). More than 95% of it is software-path overhead, not the wire. Phase 3
-  (direct UAR mapping + request pipelining) is the step expected to move below it.
-- The 25–28 Gbit/s ceiling is the **PCIe Gen3 x4 host link (ADT-Link adapter)**, not the
-  driver and not the 40G link. The card itself supports Gen3 x8, so a faster
-  adapter/slot lifts this ceiling.
-- The `Mbit/s` figures in the Phase-2 gate output are `size × 2 × 8 / 73µs` — a
-  restatement of the fixed message rate, **not** a bandwidth measurement. Cite the
-  73 µs RTT as latency, never as throughput.
-- Application-layer (LLM inference) RDMA-vs-TCP was re-measured on 2026-09-06
-  after the client-side work below, and RDMA now wins on both inference layouts.
-  Against a stored 40G TCP baseline on the same hardware, 3 repetitions per
-  point, Qwen3.6-35B-A3B: disaggregated TTFT 0.974 → 0.909 of TCP as context
-  grows from 512 to 65536 tokens, prefill 1.03 → 1.10; tensor-parallel decode
-  55.2 vs 46.9 tok/s at 512 and 22.1 vs 21.2 at 65536. Qwen3.8-27B is smaller
-  but the same direction. The one remaining loss is split-mode TTFT at 32k–65k,
-  0.6–1.7 % behind. Details and the settings that produce it are in
-  `docs/llama-rdma-tuning.md`; raw CSVs stay in the dev tree.
-- Three findings from that work belong to the host, not to this driver, and
-  dominate anything the transport does. The peer's IOMMU in translation mode
-  held one-sided WRITE to 12.6 Gbit/s in loopback; `iommu.passthrough=1` took it
-  to 100.8, and across the wire from 13.2 to 23.0. RoCE path MTU is capped at
-  4096 by the protocol, so a 9000-byte Ethernet MTU only exists to let 4096 fit
-  in a frame. And the KV handoff carries a fixed 65.9 MB per request regardless
-  of prompt length plus 10.6 KiB per token, which bounds what any further
-  transport work can win.
+External blockers: Apple entitlements (`com.apple.developer.driverkit.transport.pci` +
+`...userclient-access`) — pending; no-FLR re-init does not pass on this firmware (FLR recovery
+is the working fallback); `MlxHealth` is a skeleton.

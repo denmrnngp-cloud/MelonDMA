@@ -29,6 +29,7 @@
 #include "MlxPCIDriver.h"
 
 #include <DriverKit/IOLib.h>
+#include <time.h>
 #include <DriverKit/IOMemoryDescriptor.h>
 #include <DriverKit/IOBufferMemoryDescriptor.h>
 #include <DriverKit/IODMACommand.h>
@@ -48,6 +49,11 @@ xor8(const void *buf, size_t off, size_t len)
     return acc;
 }
 
+/* Bounded spin before falling back to a 1 ms sleep. Long enough to cover a
+ * normal firmware command, short enough that a stalled one does not burn a
+ * core for meaningful time. */
+#define MLX_CMD_SPIN_NS 400000ull   /* 400 us */
+
 struct MlxCmd::State {
     MlxPCIDriver              *core;
     IOPCIDevice               *pci;
@@ -65,6 +71,11 @@ struct MlxCmd::State {
     uint32_t                  lastOpcode;
     uint32_t                  lastSyndrome;
     uint8_t                   lastDeliveryStatus;
+    /* How many commands were issued, and how many of them outlived the spin
+     * window and had to sleep. A rising ratio says the spin budget is too
+     * short for this firmware or this command mix. */
+    uint64_t                  commandsIssued;
+    uint64_t                  spinFellThrough;
     uint8_t                   lastFwStatus;
     IOLock                   *execLock;
 
@@ -462,12 +473,26 @@ MlxCmd::ExecLocked(uint32_t opcode, const void *in, uint32_t inSize,
     mlxMMIOWrite32BE(s->pci, s->barIndex,
                      offsetof(struct MlxInitSeg, cmd_dbell), 1u << slot);
 
-    /* Poll for completion (cmd.c:237). */
+    /* Poll for completion (cmd.c:237).
+     *
+     * Firmware answers most commands in tens of microseconds, but IOSleep
+     * cannot wait less than a millisecond, so sleeping on the first miss put
+     * a hard millisecond floor under EVERY command: measured, registering a
+     * 4 KiB region cost 1.31 ms and deregistering it 1.18 ms, essentially all
+     * of it this sleep. Spin for a bounded window first and only then sleep,
+     * so the common case is measured in microseconds while a slow or stuck
+     * command still yields the CPU rather than burning it.
+     *
+     * The spin budget is deliberately short: a command slot is serialised, so
+     * the caller is blocked either way, and the cost of overshooting is CPU
+     * burnt on a core that has nothing else to do for this client. */
     uint32_t waited = 0;
+    const uint64_t spinDeadline =
+        clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + MLX_CMD_SPIN_NS;
     while (true) {
         mlxMemoryBarrier();
         if (!(*(volatile uint8_t *)&lay->status_own & MLX_CMD_OWNER_HW)) break;
-        if (timeoutMs && waited++ >= timeoutMs) {
+        if (timeoutMs && waited >= timeoutMs) {
             s->quarantined = true;
             MLX_LOG("opcode 0x%x timed out; quarantined", opcode);
             /* The firmware may still own both mailboxes and the command
@@ -475,8 +500,14 @@ MlxCmd::ExecLocked(uint32_t opcode, const void *in, uint32_t inSize,
             s->core->EnterDmaQuarantine(0x434d4454u);
             return kIOReturnTimeout;
         }
+        /* Spinning does not advance `waited`, so the timeout still counts
+         * milliseconds actually slept and its meaning is unchanged. */
+        if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < spinDeadline) continue;
+        waited++;
+        s->spinFellThrough++;
         IOSleep(1);
     }
+    s->commandsIssued++;
 
     mlxDmaReadBarrier();
     s->lastDeliveryStatus = (lay->status_own >> 1) & 0x7f;
@@ -579,6 +610,12 @@ MlxCmd::IsQuarantined() const
 
 uint32_t MlxCmd::LastOpcode() const { return s ? s->lastOpcode : 0; }
 uint32_t MlxCmd::LastSyndrome() const { return s ? s->lastSyndrome : 0; }
+void
+MlxCmd::CommandStats(uint64_t *issued, uint64_t *slept) const
+{
+    if (issued) *issued = s ? s->commandsIssued : 0;
+    if (slept)  *slept  = s ? s->spinFellThrough : 0;
+}
 uint8_t MlxCmd::LastDeliveryStatus() const
 { return s ? s->lastDeliveryStatus : 0; }
 uint8_t MlxCmd::LastFwStatus() const { return s ? s->lastFwStatus : 0; }

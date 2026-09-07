@@ -64,6 +64,21 @@ struct MlxInitSeg {
  * See: include/linux/mlx5/doorbell.h
  */
 #define MLX_BF_OFFSET           0x800   /* BF register (user-space doorbell) */
+
+/* A UAR page holds one blue-flame register per bfRegSize bytes from
+ * MLX_BF_OFFSET to the end of the page. All QPs of one client share that
+ * client's UAR page, so this is how many of them can post without sharing a
+ * doorbell register and its ping-pong toggle. The cap bounds the counting
+ * array in CreateQP; a page can hold at most (4096-0x800)/64 = 32 registers
+ * at the smallest legal register size, so 64 is headroom, not a limit. */
+#define MLX_BF_MAX_REGS         64u
+
+static inline uint32_t mlxBfRegsPerUar(uint32_t uarPageSize, uint32_t bfRegSize)
+{
+    if (!bfRegSize || uarPageSize <= MLX_BF_OFFSET) return 0;
+    uint32_t n = (uarPageSize - MLX_BF_OFFSET) / bfRegSize;
+    return n > MLX_BF_MAX_REGS ? MLX_BF_MAX_REGS : n;
+}
 #define MLX_CQ_DOORBELL         0x20    /* CQ doorbell */
 #define MLX_EQ_DOORBELL         0x40    /* EQ doorbell */
 
@@ -140,8 +155,15 @@ enum {
     MLX_CMD_OP_DEALLOC_XRCD            = 0x80f,
     MLX_CMD_OP_CREATE_SRQ              = 0x700,
     MLX_CMD_OP_DESTROY_SRQ             = 0x701,
+    /* A basic SRQ on firmware with ISSI set is an RMP, not a CREATE_SRQ object:
+     * mlx5 dispatches IB_SRQT_BASIC to create_rmp_cmd whenever issi is non-zero.
+     * Its receive queue is a linked list, so it does not share the QP's cyclic
+     * RQ machinery. MODIFY_RMP arms the limit watermark; QUERY_RMP is what
+     * proves the context layout before anything is built on it. */
     MLX_CMD_OP_CREATE_RMP              = 0x90c,
+    MLX_CMD_OP_MODIFY_RMP              = 0x90d,
     MLX_CMD_OP_DESTROY_RMP             = 0x90e,
+    MLX_CMD_OP_QUERY_RMP               = 0x90f,
     MLX_CMD_OP_ALLOC_TRANSPORT_DOMAIN  = 0x816,
     MLX_CMD_OP_DEALLOC_TRANSPORT_DOMAIN = 0x817,
     MLX_CMD_OP_CREATE_TIR              = 0x900,
@@ -196,6 +218,19 @@ enum {
 
 /* Transport type st field (QPC) — mlx5_ifc.h: MLX5_QPC_ST_* */
 enum {
+    /* Bit offsets inside the QP context, and the optional-parameter bit that
+     * makes firmware read the queue key. q_key sits immediately after the
+     * doorbell address and immediately before rq_type, which this driver
+     * already writes at 0x565 — a useful cross-check on the layout. The send
+     * PSN offset is the one mlxEncodeRtr2RtsQpc already uses. */
+    /* Global routing header carried ahead of every datagram payload. */
+    MLX_GRH_BYTES             = 40,
+    MLX_QPC_QKEY_BIT_OFFSET   = 0x540,
+    MLX_QPC_SQ_PSN_BIT_OFFSET = 0x3c8,
+    MLX_QP_OPTPAR_Q_KEY       = 1u << 5,
+    MLX_QP_OPTPAR_PKEY_INDEX  = 1u << 4,
+    MLX_QP_OPTPAR_PRI_PORT    = 1u << 16,
+
     MLX_QP_ST_RC   = 0x0,
     MLX_QP_ST_UC   = 0x1,
     MLX_QP_ST_UD   = 0x2,

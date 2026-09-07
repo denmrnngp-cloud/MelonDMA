@@ -32,6 +32,10 @@ class MlxFwPages;
 class MlxRoCE;
 struct mlx_stable_init_cycle_resp;
 struct mlx_runtime_resp;
+struct mlx_msix_state_resp;
+struct mlx_program_msix_req;
+struct mlx_query_eq_req;
+struct mlx_query_eq_resp;
 
 class MlxPCIDriver : public IOService
 {
@@ -107,6 +111,32 @@ public:
     void            GetEqServiceStats(uint64_t *asyncIrq, uint64_t *completionIrq,
                                       uint64_t *timerTicks,
                                       uint32_t *timerPeriodMs) const LOCALONLY;
+    kern_return_t   SetEqTimerPaused(bool paused) LOCALONLY;
+    /* Host interrupt index map, filled by ProbeInterruptIndices(). kindPre is
+     * the same probe run before ConfigureInterrupts, so a caller can see
+     * whether the messaged indices only appear once vectors are allocated. */
+    void            GetInterruptIndexMap(uint32_t *count, uint32_t *countPre,
+                                         uint32_t *msixBase, uint32_t *asyncIndex,
+                                         uint32_t *completionIndex,
+                                         uint32_t *probeStatus,
+                                         uint8_t *kind, uint8_t *kindPre,
+                                         uint64_t *typeRaw) const LOCALONLY;
+    /* Reads the device's MSI-X capability, table head and pending bits. */
+    kern_return_t   ReadMsixState(struct mlx_msix_state_resp *out) LOCALONLY;
+    /* Negotiated PCIe generation and lane count from the Link Status
+     * register. Both zero when the capability cannot be read. */
+    void            GetPcieLink(uint32_t *speed, uint32_t *width) LOCALONLY;
+    /* Writes one MSI-X table entry, or flips only its mask bit. */
+    kern_return_t   ProgramMsix(struct mlx_program_msix_req *req) LOCALONLY;
+    /* Asks firmware for an EQ's own state; see mlx_query_eq_resp. */
+    kern_return_t   QueryEqState(const struct mlx_query_eq_req *req,
+                                 struct mlx_query_eq_resp *resp) LOCALONLY;
+    /* Diagnostic: creates an RMP, reads it back and reports field by field
+     * whether firmware stored what was written. Proves the context layout
+     * before the SRQ object model is built on top of it. */
+    kern_return_t   ProbeRmpLayout(struct mlx_probe_rmp_layout_resp *resp) LOCALONLY;
+    uint64_t        MsixEntryOffset(uint32_t vector,
+                                    uint32_t *tableSizeOut) LOCALONLY;
 
 private:
     kern_return_t StartEqPoller() LOCALONLY;
@@ -151,6 +181,13 @@ private:
                                      kern_return_t kr) LOCALONLY;
     void    SignalCompletionEvent(uint32_t completions) LOCALONLY;
     void    BringUpCompletionEq() LOCALONLY;
+    void    ProbeInterruptIndices(uint8_t *kind, uint64_t *typeRaw,
+                                  uint32_t *count,
+                                  kern_return_t *firstFailure) LOCALONLY;
+    void    SelectInterruptIndices() LOCALONLY;
+    /* Claims the MSI-X vectors before firmware initialization; see the body. */
+    kern_return_t EnableMsixEarly() LOCALONLY;
+    void    LogMsixEnable(const char *stage) LOCALONLY;
     kern_return_t ProbeCompletionVector(uint32_t intr,
                                         uint32_t *outEqn) LOCALONLY;
     bool    DisableBusMasterAndVerify() LOCALONLY;

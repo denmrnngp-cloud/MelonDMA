@@ -11,6 +11,8 @@
 #include <time.h>
 #include <unistd.h>
 
+struct melondma_mr_cache;
+
 struct ibv_context {
     struct ibv_device *device;
     rdma_device *dev;
@@ -24,7 +26,8 @@ struct ibv_context {
     uint16_t udp_sport;
     int remote_mac_valid;
     struct rdma_fast_path fast_path;
-    int fast_path_enabled;
+    int fast_path_enabled;   /* the UAR/DB pages are mapped right now */
+    int fast_path_known;     /* EnableFastPath has succeeded at least once */
     uint64_t cq_arm_requests;
     uint64_t cq_arm_cached;
     uint64_t completion_waits;
@@ -40,6 +43,8 @@ struct ibv_context {
     struct ibv_cq *cq_list;
     struct ibv_qp *qp_list;
     uint64_t live_objects; /* PD/CQ/channels retain the context */
+    pthread_mutex_t mr_cache_lock;
+    struct melondma_mr_cache *mr_cache;
 };
 
 static inline void context_stat_add(uint64_t *counter, uint64_t value)
@@ -52,17 +57,82 @@ static inline uint64_t context_stat_get(const uint64_t *counter)
     return __atomic_load_n(counter, __ATOMIC_RELAXED);
 }
 
+/* Batch built by the extended posting interface between wr_start and
+ * wr_complete. Errors are deferred to wr_complete, which is the rdma-core
+ * contract: the setters return void and must not fail visibly. */
+#define MELONDMA_WR_BATCH 16
+
+struct melondma_wr_builder {
+    int      active;
+    int      nwr;                                   /* WRs built so far */
+    int      err;                                   /* deferred error */
+    struct ibv_send_wr wr[MELONDMA_WR_BATCH];
+    struct ibv_sge     sge[MELONDMA_WR_BATCH][RDMA_MAX_SGE];
+    int                nsge[MELONDMA_WR_BATCH];
+};
+
 struct melondma_qp_priv {
     rdma_qp *qp;
     int sq_sig_all;
+    struct melondma_wr_builder wrb;
 };
+
+static void melondma_qp_ex_init(struct ibv_qp_ex *qpx);
 
 /* Large-buffer MR: an indirect (KLM) MR over its chunked direct children. */
 struct melondma_mr_priv {
     rdma_mr  *mr;            /* direct MR, or the indirect MR for large buffers */
     rdma_mr **children;      /* child direct MRs (only when indirect) */
     uint32_t  nchildren;
+    uint32_t  access;
+    uint32_t  handle, lkey, rkey;
+    uint32_t  leases;
+    int       active;
+    struct ibv_pd *pd;
+    struct melondma_mr_cache *cache;
 };
+
+struct melondma_mr_cache {
+    struct melondma_mr_cache *next;
+    struct ibv_pd *pd;
+    void *addr;
+    size_t length;
+    int access;
+    struct melondma_mr_priv *priv;
+};
+
+static struct melondma_mr_cache *mr_cache_find(struct ibv_context *context,
+                                                 struct ibv_pd *pd, void *addr,
+                                                 size_t length, int access)
+{
+    for (struct melondma_mr_cache *entry = context->mr_cache; entry; entry = entry->next)
+        if (entry->pd == pd && entry->addr == addr && entry->length == length &&
+            entry->access == access)
+            return entry;
+    return NULL;
+}
+
+static int activate_cached_mrs(struct ibv_qp *qp)
+{
+    struct ibv_context *context = qp->context;
+    pthread_mutex_lock(&context->mr_cache_lock);
+    if (qp->state != IBV_QPS_RTS) {
+        pthread_mutex_unlock(&context->mr_cache_lock);
+        return 0;
+    }
+    for (struct melondma_mr_cache *entry = context->mr_cache; entry; entry = entry->next) {
+        struct melondma_mr_priv *priv = entry->priv;
+        if (!priv || priv->pd != qp->pd || !priv->nchildren || priv->active) continue;
+        pthread_mutex_unlock(&context->mr_cache_lock);
+        int rc = rdma_activate_indirect_mr(((struct melondma_qp_priv *)qp->priv)->qp,
+            (rdma_cq *)qp->send_cq->priv, priv->mr, priv->children, priv->nchildren);
+        if (rc) return rc;
+        pthread_mutex_lock(&context->mr_cache_lock);
+        priv->active = 1;
+    }
+    pthread_mutex_unlock(&context->mr_cache_lock);
+    return 0;
+}
 
 struct melondma_comp_channel {
     int write_fd;
@@ -393,6 +463,7 @@ struct ibv_context *ibv_open_device(struct ibv_device *device)
     if (!context) { rdma_close_device(rdma); errno = ENOMEM; return NULL; }
     context->device = device;
     context->dev = rdma;
+    pthread_mutex_init(&context->mr_cache_lock, NULL);
 
     /* Legacy environment configuration is deliberately optional. New clients
      * call ibv_mlx5_configure_roce() after resolving their control endpoint. */
@@ -408,6 +479,24 @@ int ibv_close_device(struct ibv_context *context)
         (void)rdma_clear_roce_address(context->dev, context->gid_index);
     if (context->fast_path_enabled)
         rdma_unmap_fast_path(context->dev);
+    pthread_mutex_lock(&context->mr_cache_lock);
+    struct melondma_mr_cache *entry = context->mr_cache;
+    context->mr_cache = NULL;
+    pthread_mutex_unlock(&context->mr_cache_lock);
+    while (entry) {
+        struct melondma_mr_cache *next = entry->next;
+        struct melondma_mr_priv *priv = entry->priv;
+        if (priv) {
+            if (priv->mr) (void)rdma_dereg_mr(priv->mr);
+            for (uint32_t i = 0; i < priv->nchildren; i++)
+                if (priv->children && priv->children[i]) (void)rdma_dereg_mr(priv->children[i]);
+            free(priv->children);
+            free(priv);
+        }
+        free(entry);
+        entry = next;
+    }
+    pthread_mutex_destroy(&context->mr_cache_lock);
     rdma_close_device(context->dev);
     free(context);
     return 0;
@@ -441,6 +530,8 @@ int ibv_mlx5_query_perf(struct ibv_context *context,
     perf->mr_bytes = native.mr_bytes;
     perf->copied_bytes = native.copied_bytes;
     perf->cq_events = native.cq_events;
+    perf->fw_commands = native.fw_commands;
+    perf->fw_command_sleeps = native.fw_command_sleeps;
     perf->cq_event_wakeups = native.cq_event_wakeups;
     return 0;
 }
@@ -482,6 +573,98 @@ const char *ibv_mlx5_cqeq_stage_name(uint32_t stage)
     }
 }
 
+int ibv_mlx5_query_posting_caps(struct ibv_context *context,
+                                struct ibv_mlx5_posting_caps *caps)
+{
+    if (!context || !caps) return EINVAL;
+    struct rdma_limits native = {};
+    int rc = rdma_query_limits(context->dev, &native);
+    if (rc == -ENOTSUP) return ENOTSUP;
+    if (rc != 0) return EIO;
+    caps->bf_supported    = native.bf_supported;
+    caps->log_bf_reg_size = native.log_bf_reg_size;
+    caps->uar_page_size   = native.uar_page_size;
+    caps->bf_regs_per_uar = native.bf_regs_per_uar;
+    caps->max_inline_data = native.max_inline_data;
+    caps->max_sge         = native.max_sge;
+    caps->max_sq_depth    = native.max_sq_depth;
+    caps->max_qp          = native.max_qp;
+    caps->pcie_link_speed = native.pcie_link_speed;
+    caps->pcie_link_width = native.pcie_link_width;
+    return 0;
+}
+
+double ibv_mlx5_pcie_line_gbps(uint32_t speed, uint32_t width)
+{
+    return rdma_pcie_line_gbps(speed, width);
+}
+
+static int msix_rc(int rc)
+{
+    return rc == -EPERM ? EPERM : rc == -ENOTSUP ? ENOTSUP :
+           rc == -EINVAL ? EINVAL : rc ? EIO : 0;
+}
+
+int ibv_mlx5_query_msix_state(struct ibv_context *context,
+                              struct ibv_mlx5_msix_state *state)
+{
+    if (!context || !state) return EINVAL;
+    struct rdma_msix_state native = {};
+    int rc = rdma_query_msix_state(context->dev, &native);
+    if (rc) return msix_rc(rc);
+    memset(state, 0, sizeof(*state));
+    state->cap_offset = native.cap_offset;
+    state->message_control = native.message_control;
+    state->table_size = native.table_size;
+    state->table_bir = native.table_bir;
+    state->pba_bir = native.pba_bir;
+    state->table_offset = native.table_offset;
+    state->pba_offset = native.pba_offset;
+    state->entries_read = native.entries_read;
+    state->pba_words = native.pba_words;
+    state->status = native.status;
+    state->command_reg = native.command_reg;
+    state->bar_index_used = native.bar_index_used;
+    for (uint32_t i = 0; i < native.entries_read &&
+                         i < IBV_MLX5_MSIX_TABLE_SNAPSHOT; i++) {
+        state->entry[i].addr_lo = native.entry[i].addr_lo;
+        state->entry[i].addr_hi = native.entry[i].addr_hi;
+        state->entry[i].data = native.entry[i].data;
+        state->entry[i].vector_control = native.entry[i].vector_control;
+    }
+    for (uint32_t i = 0; i < native.pba_words &&
+                         i < IBV_MLX5_MSIX_PBA_WORDS; i++)
+        state->pba[i] = native.pba[i];
+    return 0;
+}
+
+int ibv_mlx5_program_msix(struct ibv_context *context, uint32_t vector,
+                          uint32_t addr_lo, uint32_t addr_hi, uint32_t data,
+                          int masked)
+{
+    if (!context) return EINVAL;
+    return msix_rc(rdma_program_msix(context->dev, vector, addr_lo, addr_hi,
+                                     data, masked));
+}
+
+int ibv_mlx5_mask_msix(struct ibv_context *context, uint32_t vector, int masked)
+{
+    if (!context) return EINVAL;
+    return msix_rc(rdma_mask_msix(context->dev, vector, masked));
+}
+
+const char *ibv_mlx5_irq_kind_name(uint8_t kind)
+{
+    switch (kind) {
+    case IBV_MLX5_IRQ_KIND_ABSENT: return "-";
+    case IBV_MLX5_IRQ_KIND_LEVEL:  return "level/INTx";
+    case IBV_MLX5_IRQ_KIND_EDGE:   return "edge";
+    case IBV_MLX5_IRQ_KIND_MSI:    return "MSI";
+    case IBV_MLX5_IRQ_KIND_MSIX:   return "MSI-X";
+    default:                       return "other";
+    }
+}
+
 int ibv_mlx5_query_interrupts(struct ibv_context *context,
                               struct ibv_mlx5_interrupts *irq)
 {
@@ -490,6 +673,17 @@ int ibv_mlx5_query_interrupts(struct ibv_context *context,
     int rc = rdma_query_interrupts(context->dev, &native);
     if (rc == -ENOTSUP) return ENOTSUP;
     if (rc != 0) return EIO;
+    irq->index_count = native.index_count;
+    irq->index_count_pre = native.index_count_pre;
+    irq->msix_index_base = native.msix_index_base;
+    irq->async_index = native.async_index;
+    irq->completion_index = native.completion_index;
+    irq->index_probe_status = native.index_probe_status;
+    for (int i = 0; i < IBV_MLX5_IRQ_INDEX_MAP; i++) {
+        irq->index_kind[i] = native.index_kind[i];
+        irq->index_kind_pre[i] = native.index_kind_pre[i];
+        irq->index_type_raw[i] = native.index_type_raw[i];
+    }
     irq->vectors = native.vectors;
     irq->setup_status = native.setup_status;
     irq->setup_stage = native.setup_stage;
@@ -817,12 +1011,23 @@ struct ibv_pd *ibv_alloc_pd(struct ibv_context *context)
 
     /* DEXT allocates the isolated client bundle only after PD creation.
      * Keep an explicit opt-out for bring-up and old DEXTs; a failed enable
-     * still falls back to the kernel-mediated posting path. */
+     * still falls back to the kernel-mediated posting path.
+     *
+     * Enable and map are separate steps on purpose. The DEXT keeps its
+     * doorbell bundle for the life of the connection, so a second
+     * EnableFastPath is REFUSED rather than being a failure — chaining the
+     * two with && meant that once the mapping had been dropped it could
+     * never come back, and every QP created afterwards silently fell back to
+     * the kernel path at roughly a sixth of the speed. */
     const char *fast = getenv("MELONDMA_FAST_PATH");
-    if ((!fast || strcmp(fast, "0") != 0) &&
-        rdma_enable_fast_path(context->dev, &context->fast_path) == 0 &&
-        rdma_map_fast_path(context->dev, &context->fast_path) == 0)
-        context->fast_path_enabled = 1;
+    if (!fast || strcmp(fast, "0") != 0) {
+        if (!context->fast_path_known &&
+            rdma_enable_fast_path(context->dev, &context->fast_path) == 0)
+            context->fast_path_known = 1;
+        if (context->fast_path_known && !context->fast_path_enabled &&
+            rdma_map_fast_path(context->dev, &context->fast_path) == 0)
+            context->fast_path_enabled = 1;
+    }
     return pd;
 }
 
@@ -830,13 +1035,30 @@ int ibv_dealloc_pd(struct ibv_pd *pd)
 {
     if (!pd) return EINVAL;
     struct ibv_context *context = pd->context;
+    pthread_mutex_lock(&context->mr_cache_lock);
+    for (struct melondma_mr_cache *entry = context->mr_cache; entry; entry = entry->next)
+        if (entry->pd == pd && entry->priv->leases) {
+            pthread_mutex_unlock(&context->mr_cache_lock);
+            return EBUSY;
+        }
+    struct melondma_mr_cache **cursor = &context->mr_cache;
+    while (*cursor) {
+        struct melondma_mr_cache *entry = *cursor;
+        if (entry->pd != pd) { cursor = &entry->next; continue; }
+        *cursor = entry->next;
+        struct melondma_mr_priv *priv = entry->priv;
+        (void)rdma_dereg_mr(priv->mr);
+        for (uint32_t i = 0; i < priv->nchildren; i++)
+            if (priv->children && priv->children[i]) (void)rdma_dereg_mr(priv->children[i]);
+        free(priv->children); free(priv); free(entry);
+    }
+    pthread_mutex_unlock(&context->mr_cache_lock);
     int rc = rdma_dealloc_pd((rdma_pd *)pd->priv);
     if (rc) return rc == -EBUSY ? EBUSY : EIO;
-    if (context->fast_path_enabled &&
-        __atomic_load_n(&context->live_objects, __ATOMIC_RELAXED) == 1) {
-        rdma_unmap_fast_path(context->dev);
-        context->fast_path_enabled = 0;
-    }
+    /* The UAR and DB pages belong to the device context, not to any PD, and
+     * cost two pages. Dropping them when the last PD went away was the
+     * mechanism behind the silent fallback described in ibv_alloc_pd; they
+     * now live until ibv_close_device. */
     __atomic_fetch_sub(&context->live_objects, 1, __ATOMIC_RELEASE);
     free(pd);
     return 0;
@@ -1112,7 +1334,8 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
                              struct ibv_qp_init_attr *init)
 {
     if (!pd || !init || !init->send_cq || !init->recv_cq ||
-        init->qp_type != IBV_QPT_RC || init->cap.max_send_sge > RDMA_MAX_SGE ||
+        (init->qp_type != IBV_QPT_RC && init->qp_type != IBV_QPT_UD) ||
+        init->cap.max_send_sge > RDMA_MAX_SGE ||
         init->cap.max_recv_sge > RDMA_MAX_RECV_SGE) {
         errno = EINVAL;
         return NULL;
@@ -1120,19 +1343,26 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
     struct rdma_qp_init_attr native = {
         .send_cq = (rdma_cq *)init->send_cq->priv,
         .recv_cq = (rdma_cq *)init->recv_cq->priv,
-        .qp_type = RDMA_QPT_RC,
+        .qp_type = init->qp_type == IBV_QPT_UD ? RDMA_QPT_UD : RDMA_QPT_RC,
         .cap_sq = round_queue_depth(init->cap.max_send_wr),
         .cap_rq = round_queue_depth(init->cap.max_recv_wr),
         .max_inline_data = init->cap.max_inline_data,
+        /* With a shared receive queue this QP allocates no receive ring. */
+        .srqn = init->srq ? rdma_srq_number((rdma_srq *)init->srq->priv) : 0,
     };
     rdma_qp *rdma = rdma_create_qp((rdma_pd *)pd->priv, &native);
     if (!rdma) { errno = EIO; return NULL; }
-    struct ibv_qp *qp = calloc(1, sizeof(*qp));
+    /* Allocate the extended handle and hand back its qp_base. That member is
+     * first, so every free(qp) and cast in this file stays correct, and
+     * ibv_qp_to_qp_ex becomes a container cast rather than a refusal. */
+    struct ibv_qp_ex *qpx = calloc(1, sizeof(*qpx));
+    struct ibv_qp *qp = qpx ? &qpx->qp_base : NULL;
     struct melondma_qp_priv *priv = calloc(1, sizeof(*priv));
     if (!qp || !priv) {
-        free(qp); free(priv); (void)rdma_destroy_qp(rdma); errno = ENOMEM;
+        free(qpx); free(priv); (void)rdma_destroy_qp(rdma); errno = ENOMEM;
         return NULL;
     }
+    melondma_qp_ex_init(qpx);
     priv->qp = rdma;
     priv->sq_sig_all = init->sq_sig_all;
     qp->context = pd->context;
@@ -1144,7 +1374,7 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
     qp->recv_cq = init->recv_cq;
     qp->qp_num = rdma_qp_number(rdma);
     qp->state = IBV_QPS_RESET;
-    qp->qp_type = IBV_QPT_RC;
+    qp->qp_type = init->qp_type;
     qp->priv = priv;
     init->cap.max_send_wr = native.cap_sq;
     init->cap.max_recv_wr = native.cap_rq;
@@ -1172,6 +1402,7 @@ int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr, int attr_mask)
         .rq_psn = attr->rq_psn,
         .sq_psn = attr->sq_psn,
         .pkey_index = attr->pkey_index,
+        .qkey = (attr_mask & IBV_QP_QKEY) ? attr->qkey : 0,
         .port_num = attr->port_num ? attr->port_num : 1,
         .ah_sgid_index = qp->context->gid_programmed ? qp->context->gid_index :
                           attr->ah_attr.grh.sgid_index,
@@ -1194,6 +1425,8 @@ int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr, int attr_mask)
         memcpy(native.ah_dgid, attr->ah_attr.grh.dgid.raw, 16);
     }
     int modify_rc = rdma_modify_qp(priv->qp, &native);
+    if (modify_rc == 0 && attr->qp_state == IBV_QPS_RTS)
+        modify_rc = activate_cached_mrs(qp);
     if (modify_rc != 0) {
         fprintf(stderr, "libibverbs_compat: modify_qp %u->%u failed rc=%d sgid=%u dmac=%02x:%02x:%02x:%02x:%02x:%02x\n",
                 qp->state, attr->qp_state, modify_rc, native.ah_sgid_index,
@@ -1306,6 +1539,22 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
         }
     }
 
+    pthread_mutex_lock(&pd->context->mr_cache_lock);
+    struct melondma_mr_cache *cached = mr_cache_find(pd->context, pd, addr, length, access);
+    if (cached) {
+        cached->priv->leases++;
+        pthread_mutex_unlock(&pd->context->mr_cache_lock);
+        struct ibv_mr *mr = calloc(1, sizeof(*mr));
+        if (!mr) { errno = ENOMEM; return NULL; }
+        mr->context = pd->context; mr->pd = pd; mr->addr = addr; mr->length = length;
+        mr->handle = cached->priv->handle;
+        mr->lkey = cached->priv->lkey;
+        mr->rkey = cached->priv->rkey;
+        mr->priv = cached->priv;
+        return mr;
+    }
+    pthread_mutex_unlock(&pd->context->mr_cache_lock);
+
     struct ibv_mr *mr = calloc(1, sizeof(*mr));
     struct melondma_mr_priv *priv = calloc(1, sizeof(*priv));
     if (!mr || !priv) {
@@ -1319,6 +1568,40 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
     priv->mr = native;
     priv->children = children;
     priv->nchildren = nchildren;
+    priv->access = (uint32_t)access;
+    priv->handle = info.mr_handle;
+    priv->lkey = info.lkey;
+    priv->rkey = info.rkey;
+    priv->leases = 1;
+    priv->active = nchildren == 0;
+    priv->pd = pd;
+    priv->cache = calloc(1, sizeof(*priv->cache));
+    if (!priv->cache) {
+        (void)rdma_dereg_mr(native);
+        for (uint32_t j = 0; j < nchildren; j++) (void)rdma_dereg_mr(children[j]);
+        free(children); free(mr); free(priv); errno = ENOMEM; return NULL;
+    }
+    priv->cache->pd = pd; priv->cache->addr = addr; priv->cache->length = length;
+    priv->cache->access = access; priv->cache->priv = priv;
+    pthread_mutex_lock(&pd->context->mr_cache_lock);
+    struct melondma_mr_cache *race = mr_cache_find(pd->context, pd, addr, length, access);
+    if (race) {
+        race->priv->leases++;
+        pthread_mutex_unlock(&pd->context->mr_cache_lock);
+        (void)rdma_dereg_mr(priv->mr);
+        for (uint32_t i = 0; i < priv->nchildren; i++)
+            if (priv->children && priv->children[i]) (void)rdma_dereg_mr(priv->children[i]);
+        free(priv->children); free(priv->cache); free(priv); free(mr);
+        mr = calloc(1, sizeof(*mr));
+        if (!mr) { errno = ENOMEM; return NULL; }
+        mr->context = pd->context; mr->pd = pd; mr->addr = addr; mr->length = length;
+        mr->handle = race->priv->handle; mr->lkey = race->priv->lkey; mr->rkey = race->priv->rkey;
+        mr->priv = race->priv;
+        return mr;
+    }
+    priv->cache->next = pd->context->mr_cache;
+    pd->context->mr_cache = priv->cache;
+    pthread_mutex_unlock(&pd->context->mr_cache_lock);
     mr->context = pd->context;
     mr->pd = pd;
     mr->addr = addr;
@@ -1366,26 +1649,46 @@ int ibv_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
     return rc;
 }
 
+int ibv_mlx5_retarget_mr(struct ibv_qp *qp, struct ibv_mr *mr,
+                         struct ibv_mr *const *children, uint32_t child_count)
+{
+    if (!qp || !mr || qp->pd != mr->pd || !children || !child_count ||
+        child_count > RDMA_MAX_INDIRECT_MR_CHILDREN || qp->state != IBV_QPS_RTS)
+        return EINVAL;
+    struct melondma_mr_priv *priv = (struct melondma_mr_priv *)mr->priv;
+    if (!priv || !priv->nchildren || child_count != priv->nchildren) return EINVAL;
+    rdma_mr **native = calloc(child_count, sizeof(*native));
+    if (!native) return ENOMEM;
+    for (uint32_t i = 0; i < child_count; i++) {
+        if (!children[i] || children[i]->pd != qp->pd) { free(native); return EINVAL; }
+        struct melondma_mr_priv *child = (struct melondma_mr_priv *)children[i]->priv;
+        if (!child || child->nchildren) { free(native); return EINVAL; }
+        native[i] = child->mr;
+    }
+    int rc = rdma_activate_indirect_mr(((struct melondma_qp_priv *)qp->priv)->qp,
+        (rdma_cq *)qp->send_cq->priv, priv->mr, native, child_count);
+    if (!rc) {
+        pthread_mutex_lock(&qp->context->mr_cache_lock);
+        memcpy(priv->children, native, child_count * sizeof(*native));
+        priv->active = 1;
+        pthread_mutex_unlock(&qp->context->mr_cache_lock);
+    }
+    free(native);
+    return rc == -EAGAIN ? EBUSY : (rc ? EIO : 0);
+}
+
 int ibv_dereg_mr(struct ibv_mr *mr)
 {
     if (!mr) return EINVAL;
     struct melondma_mr_priv *priv = (struct melondma_mr_priv *)mr->priv;
-    int rc = EINVAL;
-    if (priv) {
-        rc = priv->mr ? rdma_dereg_mr(priv->mr) : 0;
-        if (rc) return rc == -EBUSY ? EBUSY : EIO;
-        priv->mr = NULL;
-        for (uint32_t i = 0; i < priv->nchildren; i++)
-            if (priv->children && priv->children[i]) {
-                rc = rdma_dereg_mr(priv->children[i]);
-                if (rc) return rc == -EBUSY ? EBUSY : EIO;
-                priv->children[i] = NULL;
-            }
-        free(priv->children);
-        free(priv);
-    }
+    if (!priv) { free(mr); return 0; }
+    struct ibv_context *context = mr->context;
+    pthread_mutex_lock(&context->mr_cache_lock);
+    if (priv->leases) priv->leases--;
+    pthread_mutex_unlock(&context->mr_cache_lock);
+    /* The cache owns the native registration until the context is closed. */
     free(mr);
-    return rc ? EIO : 0;
+    return 0;
 }
 
 static int native_send_opcode(enum ibv_wr_opcode opcode, uint32_t *native)
@@ -1407,6 +1710,7 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
                   struct ibv_send_wr **bad_wr)
 {
     if (bad_wr) *bad_wr = NULL;
+    if (!qp || activate_cached_mrs(qp) != 0) return EIO;
     if (!qp || !wr) { if (bad_wr) *bad_wr = wr; return EINVAL; }
     struct melondma_qp_priv *priv = qp->priv;
     while (wr) {
@@ -1448,7 +1752,9 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
                     (inline_wr &&
                      (cursor->num_sge != 1 || !cursor->sg_list ||
                       (cursor->opcode != IBV_WR_SEND &&
-                       cursor->opcode != IBV_WR_SEND_WITH_IMM) ||
+                       cursor->opcode != IBV_WR_SEND_WITH_IMM &&
+                       cursor->opcode != IBV_WR_RDMA_WRITE &&
+                       cursor->opcode != IBV_WR_RDMA_WRITE_WITH_IMM) ||
                       !cursor->sg_list[0].addr || !cursor->sg_list[0].length ||
                       cursor->sg_list[0].length > RDMA_MAX_INLINE_DATA)) ||
                     (!inline_wr && !zero_write_imm &&
@@ -1469,8 +1775,15 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
                 batch[count].opcode = opcode;
                 batch[count].num_sge = (uint32_t)cursor->num_sge;
                 batch[count].sg_list = cursor->num_sge ? sges[count] : NULL;
-                batch[count].remote_addr = cursor->wr.rdma.remote_addr;
-                batch[count].rkey = cursor->wr.rdma.rkey;
+                if (qp->qp_type == IBV_QPT_UD) {
+                    batch[count].ah_handle = cursor->wr.ud.ah ?
+                        rdma_ah_handle((rdma_ah *)cursor->wr.ud.ah->priv) : 0;
+                    batch[count].remote_qpn = cursor->wr.ud.remote_qpn;
+                    batch[count].remote_qkey = cursor->wr.ud.remote_qkey;
+                } else {
+                    batch[count].remote_addr = cursor->wr.rdma.remote_addr;
+                    batch[count].rkey = cursor->wr.rdma.rkey;
+                }
                 batch[count].imm_data = cursor->imm_data;
                 batch[count].send_flags =
                     (((cursor->send_flags & IBV_SEND_SIGNALED) || priv->sq_sig_all) ?
@@ -1490,14 +1803,23 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
             continue;
         }
         if (wr->send_flags & IBV_SEND_INLINE) {
+            /* Inline is not send-only: on a one-sided write it removes the
+             * NIC's DMA read of the payload, which is most of what a small
+             * write costs. Reads and atomics have no payload to inline. */
+            const int inline_write = wr->opcode == IBV_WR_RDMA_WRITE ||
+                                     wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM;
             if (wr->num_sge != 1 || !wr->sg_list ||
-                (wr->opcode != IBV_WR_SEND && wr->opcode != IBV_WR_SEND_WITH_IMM) ||
+                (wr->opcode != IBV_WR_SEND &&
+                 wr->opcode != IBV_WR_SEND_WITH_IMM && !inline_write) ||
                 wr->sg_list[0].length > RDMA_MAX_INLINE_DATA) {
                 if (bad_wr) *bad_wr = wr;
                 return EINVAL;
             }
-            uint32_t opcode = wr->opcode == IBV_WR_SEND_WITH_IMM ?
-                              RDMA_WR_SEND_IMM : RDMA_WR_SEND;
+            uint32_t opcode =
+                wr->opcode == IBV_WR_SEND_WITH_IMM ? RDMA_WR_SEND_IMM :
+                wr->opcode == IBV_WR_RDMA_WRITE ? RDMA_WR_RDMA_WRITE :
+                wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM ?
+                    RDMA_WR_RDMA_WRITE_IMM : RDMA_WR_SEND;
             uint32_t sflags =
                 ((wr->send_flags & IBV_SEND_SIGNALED) || priv->sq_sig_all ?
                  RDMA_SEND_SIGNALED : 0) |
@@ -1506,7 +1828,10 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
                 RDMA_SEND_INLINE;
             int rc = rdma_post_send_inline(priv->qp, wr->wr_id, opcode,
                 (const void *)(uintptr_t)wr->sg_list[0].addr,
-                wr->sg_list[0].length, wr->imm_data, sflags);
+                wr->sg_list[0].length,
+                inline_write ? wr->wr.rdma.remote_addr : 0,
+                inline_write ? wr->wr.rdma.rkey : 0,
+                wr->imm_data, sflags);
             if (rc) { if (bad_wr) *bad_wr = wr; return rc == -EAGAIN ? EAGAIN : EIO; }
             wr = wr->next;
             continue;
@@ -1596,8 +1921,15 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
             batch[count].opcode = opcode;
             batch[count].num_sge = 1;
             batch[count].sg_list = &sge[count];
-            batch[count].remote_addr = cursor->wr.rdma.remote_addr;
-            batch[count].rkey = cursor->wr.rdma.rkey;
+            if (qp->qp_type == IBV_QPT_UD) {
+                batch[count].ah_handle = cursor->wr.ud.ah ?
+                    rdma_ah_handle((rdma_ah *)cursor->wr.ud.ah->priv) : 0;
+                batch[count].remote_qpn = cursor->wr.ud.remote_qpn;
+                batch[count].remote_qkey = cursor->wr.ud.remote_qkey;
+            } else {
+                batch[count].remote_addr = cursor->wr.rdma.remote_addr;
+                batch[count].rkey = cursor->wr.rdma.rkey;
+            }
             batch[count].send_flags =
                 ((cursor->send_flags & IBV_SEND_SIGNALED) || priv->sq_sig_all ?
                 RDMA_SEND_SIGNALED : 0) |
@@ -1620,6 +1952,7 @@ int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
                   struct ibv_recv_wr **bad_wr)
 {
     if (bad_wr) *bad_wr = NULL;
+    if (!qp || activate_cached_mrs(qp) != 0) return EIO;
     if (!qp || !wr) { if (bad_wr) *bad_wr = wr; return EINVAL; }
     struct melondma_qp_priv *priv = qp->priv;
     while (wr) {
@@ -1741,9 +2074,13 @@ static void copy_native_wc(struct ibv_wc *out, const struct rdma_wc *native)
     out->opcode = wc_opcode(native->opcode);
     out->byte_len = native->byte_len;
     out->imm_data = native->imm_data;
+    /* Translated one flag at a time rather than copied, so a flag added on the
+     * native side is inert until it is mapped here on purpose. That is why the
+     * routing-header flag went missing after the driver started setting it. */
     out->wc_flags =
         (native->wc_flags & RDMA_WC_WITH_IMM ? IBV_WC_WITH_IMM : 0) |
-        (native->wc_flags & RDMA_WC_WITH_ATOMIC ? IBV_WC_WITH_ATOMIC : 0);
+        (native->wc_flags & RDMA_WC_WITH_ATOMIC ? IBV_WC_WITH_ATOMIC : 0) |
+        (native->wc_flags & RDMA_WC_GRH ? IBV_WC_GRH : 0);
     out->qp_num = native->qp_num;
     out->atomic_result = native->atomic_result;
     out->vendor_err = native->status == RDMA_WC_SUCCESS ? 0 :
@@ -1839,4 +2176,457 @@ const char *ibv_wc_status_str(enum ibv_wc_status status)
     case IBV_WC_RNR_RETRY_EXC_ERR: return "RNR retry exceeded";
     default: return "general error";
     }
+}
+
+/* ---- Surface required by stock rdma-core consumers -------------------------
+ *
+ * A consumer that cannot resolve a symbol does not start, even when it would
+ * never have called it, so everything perftest, rping, UCX and NCCL look up
+ * is defined here. Implemented where the hardware and this driver can honour
+ * it; otherwise a clean EOPNOTSUPP, never a lie and never a missing symbol.
+ */
+
+const char *ibv_event_type_str(enum ibv_event_type event)
+{
+    switch (event) {
+    case IBV_EVENT_CQ_ERR:       return "CQ error";
+    case IBV_EVENT_QP_FATAL:     return "local work queue catastrophic error";
+    case IBV_EVENT_DEVICE_FATAL: return "local catastrophic error";
+    case IBV_EVENT_PORT_ACTIVE:  return "port active";
+    case IBV_EVENT_PORT_ERR:     return "port error";
+    case IBV_EVENT_GID_CHANGE:   return "GID table change";
+    default:                     return "unknown";
+    }
+}
+
+const char *ibv_node_type_str(enum ibv_node_type node_type)
+{
+    switch (node_type) {
+    case IBV_NODE_CA:          return "InfiniBand channel adapter";
+    case IBV_NODE_SWITCH:      return "InfiniBand switch";
+    case IBV_NODE_ROUTER:      return "InfiniBand router";
+    case IBV_NODE_RNIC:        return "iWARP NIC";
+    case IBV_NODE_USNIC:       return "usNIC";
+    case IBV_NODE_USNIC_UDP:   return "usNIC UDP";
+    case IBV_NODE_UNSPECIFIED: return "unspecified";
+    default:                   return "unknown";
+    }
+}
+
+/* Linux needs this because fork() would let a child inherit pages the card is
+ * still writing into, and rdma-core arms MADV_DONTFORK to prevent it. There is
+ * no equivalent hazard here: the DEXT pins client pages through IOKit and the
+ * mapping is not inherited across fork on Darwin. Succeeding is the honest
+ * answer, and refusing would stop consumers that always call it. */
+int ibv_fork_init(void) { return 0; }
+
+/* RoCEv2 has no subnet manager and no partitioning: one trivial full-member
+ * P_Key at index 0. The value is endian-neutral, so no byte swap is needed. */
+int ibv_query_pkey(struct ibv_context *context, uint8_t port_num, int index,
+                   __be16 *pkey)
+{
+    if (!context || !pkey || port_num != 1) return EINVAL;
+    if (index != 0) return EINVAL;
+    *pkey = 0xffff;
+    return 0;
+}
+
+/* The remote-facing address of a region is assigned by the DEXT, so an
+ * arbitrary IOVA cannot be honoured. rdma-core's own ibv_reg_mr dispatches
+ * here with iova equal to the virtual address, which is the whole normal path,
+ * and that case is served exactly. Anything else is refused rather than
+ * silently registered at a different address than the caller asked for. */
+struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
+                                uint64_t iova, unsigned int access)
+{
+    if (!pd || !addr || !length) { errno = EINVAL; return NULL; }
+    if (iova != (uint64_t)(uintptr_t)addr) { errno = EOPNOTSUPP; return NULL; }
+    return ibv_reg_mr(pd, addr, length, (int)access);
+}
+
+/* dma-buf is a Linux kernel export mechanism with no counterpart on Darwin.
+ * The supported route to GPU memory is melon_reg_metal_mr below; refusing here
+ * is correct, and a consumer that falls back to host memory still works, it
+ * just gives up the direct path. */
+struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
+                                 size_t length, uint64_t iova, int fd, int access)
+{
+    (void)pd; (void)offset; (void)length; (void)iova; (void)fd; (void)access;
+    errno = EOPNOTSUPP;
+    return NULL;
+}
+
+struct ibv_mr *melon_reg_metal_mr(struct ibv_pd *pd, void *contents,
+                                  size_t length, int access)
+{
+    /* A private-storage MTLBuffer has no contents pointer, which is exactly
+     * the case that must not reach registration. */
+    if (!pd || !contents || !length) { errno = EINVAL; return NULL; }
+    /* A peer writing into a GPU slot needs remote write; refuse a request that
+     * asks for the GPU path without it rather than handing back a region the
+     * peer cannot address. */
+    if (!(access & IBV_ACCESS_REMOTE_WRITE)) { errno = EINVAL; return NULL; }
+    return ibv_reg_mr(pd, contents, length, access);
+}
+
+/* Shared receive queue, backed by an RMP in the driver. The queue and its free
+ * list live there; this layer only carries handles and work requests. */
+struct ibv_srq *ibv_create_srq(struct ibv_pd *pd,
+                               struct ibv_srq_init_attr *srq_init_attr)
+{
+    if (!pd || !srq_init_attr) { errno = EINVAL; return NULL; }
+    uint32_t max_wr = srq_init_attr->attr.max_wr ? srq_init_attr->attr.max_wr : 16;
+    uint32_t max_sge = srq_init_attr->attr.max_sge ? srq_init_attr->attr.max_sge : 1;
+    if (max_sge > RDMA_SRQ_MAX_SGE) max_sge = RDMA_SRQ_MAX_SGE;
+    struct rdma_srq_attr got = {};
+    rdma_srq *native = rdma_create_srq((rdma_pd *)pd->priv, max_wr, max_sge,
+                                       srq_init_attr->attr.srq_limit, &got);
+    if (!native) return NULL;
+    struct ibv_srq *srq = calloc(1, sizeof(*srq));
+    if (!srq) { (void)rdma_destroy_srq(native); errno = ENOMEM; return NULL; }
+    srq->context = pd->context;
+    srq->pd = pd;
+    srq->srq_context = srq_init_attr->srq_context;
+    srq->handle = rdma_srq_number(native);
+    srq->priv = native;
+    /* Report what was granted, not what was asked for. */
+    srq_init_attr->attr.max_wr = got.max_wr;
+    srq_init_attr->attr.max_sge = got.max_sge;
+    return srq;
+}
+
+int ibv_destroy_srq(struct ibv_srq *srq)
+{
+    if (!srq) return EINVAL;
+    int rc = rdma_destroy_srq((rdma_srq *)srq->priv);
+    if (rc) return rc == -EINVAL ? EINVAL : EIO;
+    free(srq);
+    return 0;
+}
+
+int ibv_post_srq_recv(struct ibv_srq *srq, struct ibv_recv_wr *recv_wr,
+                      struct ibv_recv_wr **bad_recv_wr)
+{
+    if (!srq || !recv_wr) return EINVAL;
+    for (struct ibv_recv_wr *wr = recv_wr; wr; wr = wr->next) {
+        if (wr->num_sge < 1 || wr->num_sge > RDMA_SRQ_MAX_SGE || !wr->sg_list) {
+            if (bad_recv_wr) *bad_recv_wr = wr;
+            return EINVAL;
+        }
+        struct rdma_sge sge[RDMA_SRQ_MAX_SGE];
+        for (int i = 0; i < wr->num_sge; i++) {
+            sge[i].lkey = wr->sg_list[i].lkey;
+            sge[i].addr = wr->sg_list[i].addr;
+            sge[i].length = wr->sg_list[i].length;
+        }
+        int rc = rdma_post_srq_recv((rdma_srq *)srq->priv, wr->wr_id,
+                                    (uint32_t)wr->num_sge, sge);
+        if (rc) {
+            if (bad_recv_wr) *bad_recv_wr = wr;
+            return rc == -ENOMEM ? ENOMEM : EIO;
+        }
+    }
+    return 0;
+}
+
+int ibv_modify_srq(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr,
+                   int srq_attr_mask)
+{
+    if (!srq || !srq_attr) return EINVAL;
+    /* Resizing is not supported; the watermark is. */
+    if (srq_attr_mask & IBV_SRQ_MAX_WR) return EOPNOTSUPP;
+    if (!(srq_attr_mask & IBV_SRQ_LIMIT)) return EINVAL;
+    int rc = rdma_modify_srq((rdma_srq *)srq->priv, srq_attr->srq_limit);
+    return rc ? EIO : 0;
+}
+
+int ibv_query_srq(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr)
+{
+    if (!srq || !srq_attr) return EINVAL;
+    struct rdma_srq_attr got = {};
+    int rc = rdma_query_srq((rdma_srq *)srq->priv, &got);
+    if (rc) return EIO;
+    srq_attr->max_wr = got.max_wr;
+    srq_attr->max_sge = got.max_sge;
+    srq_attr->srq_limit = got.srq_limit;
+    return 0;
+}
+
+int ibv_get_srq_num(struct ibv_srq *srq, uint32_t *srq_num)
+{
+    if (!srq || !srq_num) return EINVAL;
+    *srq_num = rdma_srq_number((rdma_srq *)srq->priv);
+    return 0;
+}
+
+/* Multicast needs a UD queue pair, and only RC is implemented. */
+int ibv_attach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid)
+{
+    (void)qp; (void)gid; (void)lid;
+    return EOPNOTSUPP;
+}
+
+int ibv_detach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid)
+{
+    (void)qp; (void)gid; (void)lid;
+    return EOPNOTSUPP;
+}
+
+/* Builds an address handle from the GRH of a UD receive. There are no UD
+ * receives here, so there is never a work completion to build one from. */
+struct ibv_ah *ibv_create_ah_from_wc(struct ibv_pd *pd, struct ibv_wc *wc,
+                                     struct ibv_grh *grh, uint8_t port_num)
+{
+    (void)pd; (void)wc; (void)grh; (void)port_num;
+    errno = EOPNOTSUPP;
+    return NULL;
+}
+
+/* Flow steering rules are programmed into firmware steering tables, which this
+ * driver does not drive. */
+struct ibv_flow *ibv_create_flow(struct ibv_qp *qp, struct ibv_flow_attr *flow)
+{
+    (void)qp; (void)flow;
+    errno = EOPNOTSUPP;
+    return NULL;
+}
+
+int ibv_destroy_flow(struct ibv_flow *flow_id)
+{
+    if (!flow_id) return EINVAL;
+    return EOPNOTSUPP;
+}
+
+/* qp_base is the first member of the allocation ibv_create_qp made, so this is
+ * a container cast, and the wr_* pointers were filled in at creation. */
+struct ibv_qp_ex *ibv_qp_to_qp_ex(struct ibv_qp *qp)
+{
+    if (!qp) { errno = EINVAL; return NULL; }
+    return (struct ibv_qp_ex *)qp;
+}
+
+/* Enhanced Connection Establishment is a vendor option exchanged during
+ * connection setup. UCX probes for it and proceeds without it when refused. */
+int ibv_query_ece(struct ibv_qp *qp, struct ibv_ece *ece)
+{
+    if (!qp || !ece) return EINVAL;
+    return EOPNOTSUPP;
+}
+
+int ibv_set_ece(struct ibv_qp *qp, struct ibv_ece *ece)
+{
+    if (!qp || !ece) return EINVAL;
+    return EOPNOTSUPP;
+}
+
+/* ---- Extended posting interface (ibv_wr_*) --------------------------------
+ *
+ * Builds a chain between wr_start and wr_complete and hands it to the ordinary
+ * post path in one call, so a batch costs one doorbell rather than N. The
+ * setters return void by contract, so every failure is deferred and surfaces
+ * from wr_complete, which is what rdma-core consumers expect.
+ */
+
+static struct melondma_wr_builder *wrb_of(struct ibv_qp_ex *qpx)
+{
+    struct melondma_qp_priv *priv = qpx ? qpx->qp_base.priv : NULL;
+    return priv ? &priv->wrb : NULL;
+}
+
+static struct ibv_send_wr *wrb_begin(struct ibv_qp_ex *qpx, enum ibv_wr_opcode op)
+{
+    struct melondma_wr_builder *b = wrb_of(qpx);
+    if (!b) return NULL;
+    if (!b->active) { if (!b->err) b->err = EINVAL; return NULL; }
+    if (b->err) return NULL;
+    if (b->nwr == MELONDMA_WR_BATCH) { b->err = ENOMEM; return NULL; }
+    int i = b->nwr++;
+    struct ibv_send_wr *wr = &b->wr[i];
+    memset(wr, 0, sizeof(*wr));
+    b->nsge[i] = 0;
+    wr->wr_id = qpx->wr_id;
+    wr->opcode = op;
+    wr->send_flags = qpx->wr_flags;
+    wr->sg_list = b->sge[i];
+    return wr;
+}
+
+/* The WR the setters apply to: the one most recently begun. */
+static struct ibv_send_wr *wrb_current(struct ibv_qp_ex *qpx)
+{
+    struct melondma_wr_builder *b = wrb_of(qpx);
+    if (!b) return NULL;
+    if (b->err) return NULL;
+    if (!b->active || !b->nwr) { b->err = EINVAL; return NULL; }
+    return &b->wr[b->nwr - 1];
+}
+
+static void wrb_add_sge(struct ibv_qp_ex *qpx, uint32_t lkey, uint64_t addr,
+                        uint32_t length)
+{
+    struct melondma_wr_builder *b = wrb_of(qpx);
+    if (!wrb_current(qpx) || !b) return;
+    int i = b->nwr - 1;
+    if (b->nsge[i] >= (int)RDMA_MAX_SGE) { b->err = E2BIG; return; }
+    b->sge[i][b->nsge[i]++] = (struct ibv_sge){ addr, length, lkey };
+}
+
+static void melondma_wr_start(struct ibv_qp_ex *qpx)
+{
+    struct melondma_wr_builder *b = wrb_of(qpx);
+    if (!b) return;
+    b->active = 1; b->nwr = 0; b->err = 0;
+}
+
+static void melondma_wr_abort(struct ibv_qp_ex *qpx)
+{
+    struct melondma_wr_builder *b = wrb_of(qpx);
+    if (!b) return;
+    b->active = 0; b->nwr = 0; b->err = 0;
+}
+
+static int melondma_wr_complete(struct ibv_qp_ex *qpx)
+{
+    struct melondma_wr_builder *b = wrb_of(qpx);
+    if (!b) return EINVAL;
+    if (!b->active) return EINVAL;
+    b->active = 0;
+    if (b->err) { int e = b->err; b->err = 0; b->nwr = 0; return e; }
+    if (!b->nwr) return 0;
+    for (int i = 0; i < b->nwr; i++) {
+        b->wr[i].num_sge = b->nsge[i];
+        b->wr[i].next = (i + 1 < b->nwr) ? &b->wr[i + 1] : NULL;
+    }
+    struct ibv_send_wr *bad = NULL;
+    int rc = ibv_post_send(&qpx->qp_base, &b->wr[0], &bad);
+    b->nwr = 0;
+    return rc;
+}
+
+static void melondma_wr_rdma_write(struct ibv_qp_ex *qpx, uint32_t rkey,
+                                   uint64_t remote_addr)
+{
+    struct ibv_send_wr *wr = wrb_begin(qpx, IBV_WR_RDMA_WRITE);
+    if (!wr) return;
+    wr->wr.rdma.rkey = rkey;
+    wr->wr.rdma.remote_addr = remote_addr;
+}
+
+static void melondma_wr_rdma_write_imm(struct ibv_qp_ex *qpx, uint32_t rkey,
+                                       uint64_t remote_addr, __be32 imm_data)
+{
+    struct ibv_send_wr *wr = wrb_begin(qpx, IBV_WR_RDMA_WRITE_WITH_IMM);
+    if (!wr) return;
+    wr->wr.rdma.rkey = rkey;
+    wr->wr.rdma.remote_addr = remote_addr;
+    wr->imm_data = imm_data;
+}
+
+static void melondma_wr_rdma_read(struct ibv_qp_ex *qpx, uint32_t rkey,
+                                  uint64_t remote_addr)
+{
+    struct ibv_send_wr *wr = wrb_begin(qpx, IBV_WR_RDMA_READ);
+    if (!wr) return;
+    wr->wr.rdma.rkey = rkey;
+    wr->wr.rdma.remote_addr = remote_addr;
+}
+
+static void melondma_wr_send(struct ibv_qp_ex *qpx)
+{
+    (void)wrb_begin(qpx, IBV_WR_SEND);
+}
+
+static void melondma_wr_send_imm(struct ibv_qp_ex *qpx, __be32 imm_data)
+{
+    struct ibv_send_wr *wr = wrb_begin(qpx, IBV_WR_SEND_WITH_IMM);
+    if (!wr) return;
+    wr->imm_data = imm_data;
+}
+
+static void melondma_wr_local_inv(struct ibv_qp_ex *qpx, uint32_t invalidate_rkey)
+{
+    struct ibv_send_wr *wr = wrb_begin(qpx, IBV_WR_LOCAL_INV);
+    if (!wr) return;
+    wr->wr.local_inv.invalidate_rkey = invalidate_rkey;
+}
+
+static void melondma_wr_atomic_cmp_swp(struct ibv_qp_ex *qpx, uint32_t rkey,
+                                       uint64_t remote_addr, uint64_t compare,
+                                       uint64_t swap)
+{
+    struct ibv_send_wr *wr = wrb_begin(qpx, IBV_WR_ATOMIC_CMP_AND_SWP);
+    if (!wr) return;
+    wr->wr.atomic.rkey = rkey;
+    wr->wr.atomic.remote_addr = remote_addr;
+    wr->wr.atomic.compare_add = compare;
+    wr->wr.atomic.swap = swap;
+}
+
+static void melondma_wr_atomic_fetch_add(struct ibv_qp_ex *qpx, uint32_t rkey,
+                                         uint64_t remote_addr, uint64_t add)
+{
+    struct ibv_send_wr *wr = wrb_begin(qpx, IBV_WR_ATOMIC_FETCH_AND_ADD);
+    if (!wr) return;
+    wr->wr.atomic.rkey = rkey;
+    wr->wr.atomic.remote_addr = remote_addr;
+    wr->wr.atomic.compare_add = add;
+}
+
+static void melondma_wr_set_sge(struct ibv_qp_ex *qpx, uint32_t lkey,
+                                uint64_t addr, uint32_t length)
+{
+    wrb_add_sge(qpx, lkey, addr, length);
+}
+
+static void melondma_wr_set_sge_list(struct ibv_qp_ex *qpx, size_t num_sge,
+                                     const struct ibv_sge *sg_list)
+{
+    if (!sg_list) { struct melondma_wr_builder *b = wrb_of(qpx);
+                    if (b && !b->err) b->err = EINVAL; return; }
+    for (size_t i = 0; i < num_sge; i++)
+        wrb_add_sge(qpx, sg_list[i].lkey, sg_list[i].addr, sg_list[i].length);
+}
+
+/* Inline data is referenced, not copied: the caller's buffer has to stay valid
+ * until wr_complete anyway, and the post path already reads inline payloads
+ * straight from the scatter list. */
+static void melondma_wr_set_inline_data(struct ibv_qp_ex *qpx, void *addr,
+                                        size_t length)
+{
+    struct ibv_send_wr *wr = wrb_current(qpx);
+    if (!wr) return;
+    wr->send_flags |= IBV_SEND_INLINE;
+    wrb_add_sge(qpx, 0, (uint64_t)(uintptr_t)addr, (uint32_t)length);
+}
+
+static void melondma_wr_set_inline_data_list(struct ibv_qp_ex *qpx, size_t num_buf,
+                                             const struct ibv_data_buf *buf_list)
+{
+    struct ibv_send_wr *wr = wrb_current(qpx);
+    if (!wr) return;
+    if (!buf_list) { struct melondma_wr_builder *b = wrb_of(qpx);
+                     if (b && !b->err) b->err = EINVAL; return; }
+    wr->send_flags |= IBV_SEND_INLINE;
+    for (size_t i = 0; i < num_buf; i++)
+        wrb_add_sge(qpx, 0, (uint64_t)(uintptr_t)buf_list[i].addr,
+                    (uint32_t)buf_list[i].length);
+}
+
+static void melondma_qp_ex_init(struct ibv_qp_ex *qpx)
+{
+    qpx->wr_start                = melondma_wr_start;
+    qpx->wr_complete             = melondma_wr_complete;
+    qpx->wr_abort                = melondma_wr_abort;
+    qpx->wr_rdma_write           = melondma_wr_rdma_write;
+    qpx->wr_rdma_write_imm       = melondma_wr_rdma_write_imm;
+    qpx->wr_rdma_read            = melondma_wr_rdma_read;
+    qpx->wr_send                 = melondma_wr_send;
+    qpx->wr_send_imm             = melondma_wr_send_imm;
+    qpx->wr_local_inv            = melondma_wr_local_inv;
+    qpx->wr_atomic_cmp_swp       = melondma_wr_atomic_cmp_swp;
+    qpx->wr_atomic_fetch_add     = melondma_wr_atomic_fetch_add;
+    qpx->wr_set_sge              = melondma_wr_set_sge;
+    qpx->wr_set_sge_list         = melondma_wr_set_sge_list;
+    qpx->wr_set_inline_data      = melondma_wr_set_inline_data;
+    qpx->wr_set_inline_data_list = melondma_wr_set_inline_data_list;
 }

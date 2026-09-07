@@ -85,14 +85,19 @@ mlxLog2PowerOfTwo(uint32_t value)
 
 static inline bool
 mlxEncodeRst2InitQpc(void *qpcBuffer, size_t qpcSize, uint32_t pkeyIndex,
-                     uint32_t portNum, uint32_t *optParamMask)
+                     uint32_t portNum, uint32_t serviceType,
+                     uint32_t *optParamMask)
 {
     if (!qpcBuffer || qpcSize < MLX_QPC_BYTES || pkeyIndex > 0xffff ||
-        !portNum || portNum > 0xff)
+        !portNum || portNum > 0xff || serviceType > 0xff)
         return false;
 
     uint8_t *qpc = static_cast<uint8_t *>(qpcBuffer);
-    mlxSetBits(qpc, 0x08, 8, 0); /* RC transport */
+    /* The service type has to match what the pair was created as. Hardcoding
+     * the connected value here was invisible while only connected pairs
+     * existed; a datagram pair reaches firmware claiming to be connected, and
+     * firmware refuses the transition. */
+    mlxSetBits(qpc, 0x08, 8, serviceType);
     mlxSetBits(qpc, 0x13, 2, 3); /* pm_state = MIGRATED (Linux default) */
     mlxSetBits(qpc, MLX_QPC_PRIMARY_PATH_BIT_OFFSET + 0x10, 16, pkeyIndex);
     mlxSetBits(qpc, MLX_QPC_PRIMARY_PATH_BIT_OFFSET + 0x128, 8, portNum);

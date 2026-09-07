@@ -94,11 +94,29 @@ int main(int argc, char **argv)
                irq.completion_eq_variant_syndrome[1],
                irq.completion_eq_variant_syndrome[2],
                irq.completion_eq_variant_syndrome[3]);
-    if (irq_rc == 0)
+    if (irq_rc == 0) {
         printf("EQ service: async_irq=%llu completion_irq=%llu timer_ticks=%llu timer_period=%u ms\n",
                (unsigned long long)irq.async_interrupts,
                (unsigned long long)irq.completion_interrupts,
                (unsigned long long)irq.eq_timer_ticks, irq.eq_timer_period_ms);
+        /* The host index is not the firmware vector. A silent vector with a
+         * level-triggered binding is a wiring mistake, not a dead platform;
+         * mlx_irq_probe prints the whole map. */
+        if (irq.msix_index_base == IBV_MLX5_IRQ_INDEX_NONE)
+            printf("EQ vectors: no messaged index pair found, bound to %u/%u "
+                   "(%s, %s) — probed %u indices\n",
+                   irq.async_index, irq.completion_index,
+                   ibv_mlx5_irq_kind_name(irq.index_kind[irq.async_index & 15]),
+                   ibv_mlx5_irq_kind_name(irq.index_kind[irq.completion_index & 15]),
+                   irq.index_count);
+        else
+            printf("EQ vectors: firmware vector V on host index %u+V; "
+                   "async=%u completion=%u (%s) — probed %u indices, %u before "
+                   "allocation\n",
+                   irq.msix_index_base, irq.async_index, irq.completion_index,
+                   ibv_mlx5_irq_kind_name(irq.index_kind[irq.async_index & 15]),
+                   irq.index_count, irq.index_count_pre);
+    }
     else
         printf("interrupts: query unavailable (rc=%d)\n", irq_rc);
     printf("before: external_methods=%llu mr_registers=%llu mr_bytes=%llu\n",

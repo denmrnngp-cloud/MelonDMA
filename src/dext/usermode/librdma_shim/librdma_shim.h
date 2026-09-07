@@ -173,6 +173,18 @@ enum {
     RDMA_CQEQ_STAGE_CREATE        = 3,
     RDMA_CQEQ_STAGE_OK            = 4,
 };
+/* Host interrupt index classification, mirroring MLX_IRQ_KIND_*. */
+#define RDMA_IRQ_INDEX_MAP  16
+#define RDMA_IRQ_INDEX_NONE 0xffffffffu
+enum {
+    RDMA_IRQ_KIND_ABSENT = 0,  /* the provider refused this index */
+    RDMA_IRQ_KIND_LEVEL  = 1,  /* level-triggered, i.e. legacy INTx */
+    RDMA_IRQ_KIND_EDGE   = 2,
+    RDMA_IRQ_KIND_MSI    = 3,
+    RDMA_IRQ_KIND_MSIX   = 4,
+    RDMA_IRQ_KIND_OTHER  = 5,
+};
+
 struct rdma_interrupt_attr {
     uint32_t vectors;
     uint32_t setup_status;
@@ -192,8 +204,50 @@ struct rdma_interrupt_attr {
     uint64_t completion_interrupts;
     uint64_t eq_timer_ticks;
     uint32_t eq_timer_period_ms;
+    /* Host interrupt index map. These indices are NOT the firmware's intr
+     * field: firmware vector V is raised on host index msix_index_base + V.
+     * index_kind_pre is the same probe taken before the DEXT allocated
+     * vectors, so a reader can see whether the messaged indices only appear
+     * once ConfigureInterrupts has run. msix_index_base is
+     * RDMA_IRQ_INDEX_NONE when no messaged pair answered, in which case the
+     * DEXT kept the historical hardcoded 0 and 1. */
+    uint32_t index_count;
+    uint32_t index_count_pre;
+    uint32_t msix_index_base;
+    uint32_t async_index;
+    uint32_t completion_index;
+    uint32_t index_probe_status;
+    uint8_t  index_kind[RDMA_IRQ_INDEX_MAP];
+    uint8_t  index_kind_pre[RDMA_IRQ_INDEX_MAP];
+    uint64_t index_type_raw[RDMA_IRQ_INDEX_MAP];
 };
 int  rdma_query_interrupts(rdma_device *dev, struct rdma_interrupt_attr *attr);
+
+/* Per-client limits and the posting-path capabilities behind them. bf_regs_per_uar
+ * is how many QPs of one client can post without sharing a doorbell register;
+ * zero means the card reports no blue flame at all, and writing a WQE into the
+ * register is unavailable regardless of what the environment asks for. */
+struct rdma_limits {
+    uint32_t max_pd, max_qp, max_cq, max_mr, max_mw, max_ah, max_gid;
+    uint32_t max_sq_depth, max_rq_depth;
+    uint32_t fw_cmd_burst, fw_cmd_window_ns, max_db_records;
+    uint32_t bf_supported;
+    uint32_t log_bf_reg_size;
+    uint32_t uar_page_size;
+    uint32_t bf_regs_per_uar;
+    uint32_t max_inline_data;
+    uint32_t max_sge;
+    uint32_t pcie_link_speed;   /* encoded generation, 0 = unknown */
+    uint32_t pcie_link_width;   /* lanes, 0 = unknown */
+};
+int  rdma_query_limits(rdma_device *dev, struct rdma_limits *limits);
+
+/* Raw per-direction line rate of the negotiated PCIe link, in Gbit/s, or 0
+ * when it is unknown. Encoded speeds are 2.5, 5, 8, 16 and 32 GT/s; the first
+ * two use 8b/10b and the rest 128b/130b, which is where the coefficients come
+ * from. Divide a measured rate by this to get a number that means the same on
+ * another machine. */
+double rdma_pcie_line_gbps(uint32_t speed, uint32_t width);
 
 /* Hardware completion moderation. period is microseconds (0..4095), max_count
  * is CQEs (0..65535); zero in a field disables that half. Both zero restores
@@ -201,8 +255,85 @@ int  rdma_query_interrupts(rdma_device *dev, struct rdma_interrupt_attr *attr);
 int  rdma_modify_cq_moderation(rdma_cq *cq, uint32_t period, uint32_t max_count);
 
 /* Diagnostic: rebind the completion EQ to MSI-X index `intr` (0 or 1) and
- * return its new EQ number. Refused with -EBUSY while any CQ is live. */
+ * return its new EQ number. Refused with -EBUSY while any CQ is live.
+ * NOTE: `intr` is the FIRMWARE vector, not the host dispatch index. Moving it
+ * cannot detect a host-side index mismatch; read rdma_interrupt_attr's index
+ * map for that. */
 int  rdma_probe_completion_vector(rdma_device *dev, uint32_t intr, uint32_t *eqn);
+
+/* Raw MSI-X capability readback. Requires the privileged diagnostics
+ * entitlement, and returns -EPERM without it. See the comment on
+ * mlx_msix_state_resp for how to read the result. */
+/* Must match MLX_MSIX_TABLE_SNAPSHOT: a smaller value here silently truncates
+ * the readback, which then reports fewer programmed entries than were written
+ * and looks exactly like writes failing to land. */
+#define RDMA_MSIX_TABLE_SNAPSHOT 16
+#define RDMA_MSIX_PBA_WORDS      4
+struct rdma_msix_entry {
+    uint32_t addr_lo;
+    uint32_t addr_hi;
+    uint32_t data;
+    uint32_t vector_control;   /* bit 0 = masked */
+};
+struct rdma_msix_state {
+    uint32_t cap_offset;       /* 0 when the device has no MSI-X capability */
+    uint32_t message_control;  /* bit 15 enable, bit 14 function mask */
+    uint32_t table_size;
+    uint32_t table_bir;
+    uint32_t pba_bir;
+    uint32_t table_offset;
+    uint32_t pba_offset;
+    uint32_t entries_read;
+    uint32_t pba_words;
+    uint32_t status;           /* non-zero when the payload could not be read */
+    uint32_t command_reg;
+    uint32_t bar_index_used;
+    /* Entry 0 read BEFORE this DEXT's own ConfigureInterrupts (front A). */
+    uint32_t pre_configure_entry0_addr_lo;
+    uint32_t pre_configure_entry0_data;
+    struct rdma_msix_entry entry[RDMA_MSIX_TABLE_SNAPSHOT];
+    uint32_t pba[RDMA_MSIX_PBA_WORDS];
+};
+int  rdma_query_msix_state(rdma_device *dev, struct rdma_msix_state *state);
+
+/* Writes one MSI-X table entry, or flips only its mask bit. Needs the
+ * privileged diagnostics entitlement. `data` selects one of the interrupt
+ * controller's vectors and is NOT the global interrupt number; the right value
+ * is found by trying candidates, because the base lives in the device tree
+ * where a dext cannot read it. */
+#define RDMA_MSIX_DOORBELL_ADDR 0xfffff000u
+int  rdma_program_msix(rdma_device *dev, uint32_t vector, uint32_t addr_lo,
+                       uint32_t addr_hi, uint32_t data, int masked);
+int  rdma_mask_msix(rdma_device *dev, uint32_t vector, int masked);
+/* Diagnostic-only: pause/resume the DEXT EQ timer around MSI-X tests. */
+int  rdma_set_eq_timer_paused(rdma_device *dev, int paused);
+
+/* Raw dword access inside the MSI-X structures, for one question: is there
+ * hardware behind this window? `region` is 0 for the table and 1 for the
+ * pending bits; `index` is a dword index inside it. The pending-bit array is
+ * read-only in hardware, so a poke there that survives a peek proves the
+ * window is a shadow and that masking a vector from here never reached the
+ * device either. */
+int  rdma_msix_poke(rdma_device *dev, uint32_t region, uint32_t index,
+                    uint32_t value);
+int  rdma_msix_peek(rdma_device *dev, uint32_t region, uint32_t index,
+                    uint32_t *value);
+
+/* Firmware's own view of an event queue. state 0x9 armed, 0xa fired, 0xb
+ * always-armed. An EQ still reading armed after an entry was written to it
+ * never raised its vector. */
+struct rdma_eq_state {
+    uint32_t status, state, intr, uar_page;
+    uint32_t consumer_index, producer_index, log_eq_size;
+    uint32_t fw_status, syndrome;   /* set only on a refusal */
+};
+/* Diagnostic: proves the RMP context layout before the SRQ object model is
+ * built on it. Fills the raw driver response; see mlx_probe_rmp_layout_resp. */
+struct mlx_probe_rmp_layout_resp;
+int  rdma_probe_rmp_layout(rdma_device *dev, struct mlx_probe_rmp_layout_resp *out);
+
+int  rdma_query_eq_state(rdma_device *dev, uint32_t eqn,
+                         struct rdma_eq_state *out);
 
 struct rdma_perf {
     uint64_t external_methods;
@@ -223,9 +354,23 @@ struct rdma_perf {
     /* Device-wide completion MSI-X interrupts the DEXT serviced, and this
      * client's WaitCqEvent calls that returned a fresh generation. */
     uint64_t cq_events;
+    /* Device-wide firmware command counters; see mlx_perf_resp. */
+    uint64_t fw_commands;
+    uint64_t fw_command_sleeps;
     uint64_t cq_event_wakeups;
 };
 int  rdma_query_perf(rdma_device *dev, struct rdma_perf *perf);
+
+/* P2.1 per-client datapath counters (mlx_stats_resp). RNR/retry counts are
+ * the congestion signal: a fabric that is dropping or marking raises them
+ * long before the port's own pause counters move. */
+struct rdma_stats {
+    uint64_t posted_send, posted_write, posted_recv;
+    uint64_t completed_send, completed_write, completed_recv;
+    uint64_t cqe_error, cqe_retry_exc, cqe_rnr_retry, cq_lost;
+    uint32_t sq_occupancy, rq_occupancy;
+};
+int  rdma_query_stats(rdma_device *dev, struct rdma_stats *stats);
 struct rdma_runtime_status {
     uint32_t version, size;
     uint64_t device_epoch;
@@ -291,6 +436,10 @@ enum rdma_wc_opcode {
     RDMA_WC_COMP_SWAP   = 6,
 };
 #define RDMA_WC_WITH_IMM 1u
+/* Datagram receive: 40 bytes of routing header precede the payload. */
+#define RDMA_WC_GRH (1u << 2)
+/* Bytes of global routing header ahead of every datagram payload. */
+#define RDMA_GRH_BYTES 40
 #define RDMA_WC_WITH_ATOMIC 2u
 struct rdma_wc {
     uint64_t wr_id;
@@ -332,6 +481,10 @@ struct rdma_qp_init_attr {
     void    *sq_buf;       /* reserved; Phase 2 WQs are DEXT-owned */
     void    *rq_buf;       /* reserved; Phase 2 WQs are DEXT-owned */
     uint32_t max_inline_data; /* must be zero */
+    /* Shared receive queue handle, 0 for a QP that owns its receive ring.
+     * Set it and the QPC carries rq_type = MLX5_SRQ_RQ plus srqn_rmpn_xrqn,
+     * and no receive ring is allocated for this QP. */
+    uint32_t srqn;
 };
 rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init);
 int      rdma_destroy_qp(rdma_qp *qp);
@@ -361,10 +514,26 @@ struct rdma_qp_attr {
     uint32_t retry_cnt;        /* transport retry count, 0..7 */
     uint32_t rnr_retry;        /* receiver-not-ready retry count, 0..7 */
     uint32_t sl;               /* RoCEv2 VLAN priority / service level 0..7 */
+    uint32_t qkey;      /* datagram only */
+    /* Why the last transition was refused: firmware outbox status and the
+     * syndrome behind it. The return code alone collapses several. */
+    uint32_t last_fw_status, last_fw_syndrome;
 };
 int  rdma_modify_qp(rdma_qp *qp, const struct rdma_qp_attr *attr);
 uint32_t rdma_qp_number(const rdma_qp *qp);
 int  rdma_query_qp(rdma_qp *qp, uint32_t *state);
+
+/* Traffic-marking readback from the firmware QPC (front F, task 2): the
+ * RoCEv2 VLAN priority (sl), the full 8-bit TOS and the 6-bit DSCP the card
+ * actually programs on the primary path. Both endpoints must agree on these
+ * for ECN to behave as designed; this reads the truth, not the request. */
+struct rdma_qp_marking {
+    uint32_t sl;
+    uint32_t traffic_class;
+    uint32_t dscp;
+};
+int  rdma_qp_last_refusal(rdma_qp *qp, uint32_t *fw_status, uint32_t *syndrome);
+int  rdma_query_qp_marking(rdma_qp *qp, struct rdma_qp_marking *marking);
 
 /* Program and strictly read back a RoCE address table entry. */
 int  rdma_set_roce_address(rdma_device *dev, const uint8_t gid[16],
@@ -455,9 +624,30 @@ struct rdma_ah_attr {
 };
 rdma_ah *rdma_create_ah(rdma_pd *pd, const struct rdma_ah_attr *attr);
 int      rdma_destroy_ah(rdma_ah *ah);
+/* Driver-side handle of an address vector, for a datagram work request. */
+uint32_t rdma_ah_handle(rdma_ah *ah);
 
 /* ---- data path ---- */
 struct rdma_sge { uint32_t lkey; uint64_t addr; uint32_t length; };
+/* Shared receive queue. A basic SRQ is an RMP on this firmware; the driver
+ * owns the queue and the free list, the client only posts into it. */
+/* A 64-byte SRQ WQE holds a next segment plus three data segments. */
+#define RDMA_SRQ_MAX_SGE 3
+typedef struct rdma_srq rdma_srq;
+struct rdma_srq_attr {
+    uint32_t max_wr, max_sge, srq_limit, free_count, posted;
+    /* Completion-path observation; see mlx_query_srq_resp. */
+    uint32_t recv_seen, recv_with_srqn, last_cqe_srqn, last_cqe_wqe, last_cqe_op;
+    uint32_t wqe_seen_mask;
+};
+rdma_srq *rdma_create_srq(rdma_pd *pd, uint32_t max_wr, uint32_t max_sge,
+                          uint32_t limit, struct rdma_srq_attr *out);
+int  rdma_destroy_srq(rdma_srq *srq);
+int  rdma_post_srq_recv(rdma_srq *srq, uint64_t wr_id, uint32_t num_sge,
+                        const struct rdma_sge *sge);
+int  rdma_query_srq(rdma_srq *srq, struct rdma_srq_attr *out);
+int  rdma_modify_srq(rdma_srq *srq, uint32_t limit);
+uint32_t rdma_srq_number(rdma_srq *srq);
 enum rdma_wr_opcode {
     RDMA_WR_SEND        = 0,
     RDMA_WR_RDMA_WRITE  = 1,
@@ -479,6 +669,8 @@ struct rdma_send_wr {
     uint32_t rkey;
     uint32_t send_flags;    /* bit0: signaled completion */
     uint32_t imm_data;      /* network byte order; *_IMM only */
+    /* Datagram destination; ignored for a connected pair. */
+    uint32_t ah_handle, remote_qpn, remote_qkey;
 };
 #define RDMA_SEND_SIGNALED  1u << 0
 #define RDMA_SEND_FENCE     1u << 1
@@ -513,9 +705,12 @@ int  rdma_post_send_batch(rdma_qp *qp, const struct rdma_send_wr *wr,
 int  rdma_post_recv_batch(rdma_qp *qp, const struct rdma_recv_wr *wr,
                           uint32_t count);
 
-/* P3: inline SEND (payload copied into the request) and RC atomics. */
+/* Inline SEND / RDMA_WRITE and their _IMM forms: the payload is copied into
+ * the WQE, so the NIC never DMA-reads it. remote_addr and rkey are required
+ * for the write opcodes and must be zero for the send ones. RC atomics below. */
 int  rdma_post_send_inline(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
                            const void *data, uint32_t len,
+                           uint64_t remote_addr, uint32_t rkey,
                            uint32_t imm_data, uint32_t send_flags);
 int  rdma_post_send_atomic(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
                            uint64_t remote_addr, uint32_t rkey,

@@ -30,6 +30,7 @@
 #include "hw/MlxIfcHelpers.hpp"
 #include "MlxUCIO.h"
 #include "MlxSafety.hpp"
+#include "MlxSRQ.hpp"
 #include "MlxPCIDriver.h"
 
 #include <DriverKit/IOLib.h>
@@ -54,7 +55,7 @@
  * process, so two clients can never mint the same token (cross-client
  * isolation) and a stale token never aliases a recycled raw ID within a
  * 12-bit generation epoch (4096 mints per slot). */
-enum { MLX_T_PD = 0, MLX_T_QP, MLX_T_CQ, MLX_T_MR, MLX_T_MW, MLX_T_COUNT };
+enum { MLX_T_PD = 0, MLX_T_QP, MLX_T_CQ, MLX_T_MR, MLX_T_MW, MLX_T_SRQ, MLX_T_COUNT };
 #define MLX_T_SLOT_BITS 9u
 #define MLX_T_SLOTS     (1u << MLX_T_SLOT_BITS)          /* 512 */
 #define MLX_T_GEN_BITS  12u
@@ -75,6 +76,7 @@ struct MlxUserClient_IVars {
     MlxPCIDriver   *fCore;
     OSArray        *fOwnedPd;
     OSArray        *fOwnedQp;
+    OSArray        *fOwnedSrq;
     OSArray        *fOwnedCq;
     OSArray        *fOwnedMr;
     OSArray        *fOwnedMw;
@@ -92,6 +94,9 @@ struct MlxUserClient_IVars {
     uint32_t        fDataInflight;
     bool            fDataTeardown;
     bool            fPrivilegedDiagnostics;
+    /* com.mlx5.rdma.entitlement: raise QP/CQ/MR/MW quotas to the firmware
+     * capability instead of the default per-client policy ceilings. */
+    bool            fEntitledQuotas;
     /* P1.1 per-client quota counters (see MLX_UC_MAX_*_PER_CLIENT). */
     uint32_t        fQuotaPd;
     uint32_t        fQuotaQp;
@@ -374,6 +379,18 @@ static uint32_t CapLimit(uint32_t policy, uint32_t firmware)
     return firmware && firmware < policy ? firmware : policy;
 }
 
+/* Front C, task 2: quotas are policy, not constants. A client signed with
+ * com.mlx5.rdma.entitlement gets the firmware capability as its ceiling
+ * (still bounded by the DEXT-wide tables and, for QP/CQ, the DB-record
+ * capacity). Everyone else keeps the default MLX_UC_MAX_* policy ceiling.
+ * firmware==0 means the caps were never read: fall back to the policy. */
+static uint32_t PolicyLimit(MlxUserClient_IVars *v, uint32_t policy,
+                            uint32_t firmware)
+{
+    if (v && v->fEntitledQuotas) return firmware ? firmware : policy;
+    return CapLimit(policy, firmware);
+}
+
 static const MlxHcaCaps *ClientCaps(MlxUserClient_IVars *v)
 {
     return v && v->fCore && v->fCore->GetHCA()
@@ -389,8 +406,8 @@ static uint32_t DbRecordLimit(MlxUserClient_IVars *v)
 static uint32_t ClientQpLimit(MlxUserClient_IVars *v)
 {
     const MlxHcaCaps *caps = ClientCaps(v);
-    uint32_t limit = CapLimit(MLX_UC_MAX_QP_PER_CLIENT,
-                              caps ? caps->maxQp : 0);
+    uint32_t limit = PolicyLimit(v, MLX_UC_MAX_QP_PER_CLIENT,
+                                 caps ? caps->maxQp : 0);
     uint32_t db = DbRecordLimit(v);
     return db && db < limit ? db : limit;
 }
@@ -398,7 +415,8 @@ static uint32_t ClientQpLimit(MlxUserClient_IVars *v)
 static uint32_t ClientCqLimit(MlxUserClient_IVars *v)
 {
     const MlxHcaCaps *caps = ClientCaps(v);
-    uint32_t limit = CapLimit(MLX_UC_MAX_CQ_PER_CLIENT, caps ? caps->maxCq : 0);
+    uint32_t limit = PolicyLimit(v, MLX_UC_MAX_CQ_PER_CLIENT,
+                                 caps ? caps->maxCq : 0);
     uint32_t db = DbRecordLimit(v);
     return db && db < limit ? db : limit;
 }
@@ -406,13 +424,13 @@ static uint32_t ClientCqLimit(MlxUserClient_IVars *v)
 static uint32_t ClientMrLimit(MlxUserClient_IVars *v)
 {
     const MlxHcaCaps *caps = ClientCaps(v);
-    return CapLimit(MLX_UC_MAX_MR_PER_CLIENT, caps ? caps->maxMr : 0);
+    return PolicyLimit(v, MLX_UC_MAX_MR_PER_CLIENT, caps ? caps->maxMr : 0);
 }
 
 static uint32_t ClientMwLimit(MlxUserClient_IVars *v)
 {
     const MlxHcaCaps *caps = ClientCaps(v);
-    return CapLimit(MLX_UC_MAX_MW_PER_CLIENT, caps ? caps->maxMr : 0);
+    return PolicyLimit(v, MLX_UC_MAX_MW_PER_CLIENT, caps ? caps->maxMr : 0);
 }
 
 /* Token-bucket firmware-command gate for the raw passthrough selectors. */
@@ -492,6 +510,8 @@ MlxUserClient::Start_Impl(IOService * provider)
     if (CopyClientEntitlements(&entitlements) == kIOReturnSuccess && entitlements) {
         ivars->fPrivilegedDiagnostics =
             entitlements->getObject("com.mlx5.rdma.diagnostic") == kOSBooleanTrue;
+        ivars->fEntitledQuotas =
+            entitlements->getObject("com.mlx5.rdma.entitlement") == kOSBooleanTrue;
         entitlements->release();
     }
     /* RoCE may not be up yet (FwInit stopped at boot pages) —
@@ -502,6 +522,7 @@ MlxUserClient::Start_Impl(IOService * provider)
 
     ivars->fOwnedPd = OSArray::withCapacity(8);
     ivars->fOwnedQp = OSArray::withCapacity(8);
+    ivars->fOwnedSrq = OSArray::withCapacity(4);
     ivars->fOwnedCq = OSArray::withCapacity(8);
     ivars->fOwnedMr = OSArray::withCapacity(8);
     ivars->fOwnedMw = OSArray::withCapacity(8);
@@ -509,7 +530,8 @@ MlxUserClient::Start_Impl(IOService * provider)
     ivars->fOwnedGid = OSArray::withCapacity(4);
     ivars->fOwnedLock = IOLockAlloc();
     ivars->fMethodLock = IOLockAlloc();
-    if (!ivars->fOwnedPd || !ivars->fOwnedQp || !ivars->fOwnedCq || !ivars->fOwnedMr ||
+    if (!ivars->fOwnedSrq ||
+        !ivars->fOwnedPd || !ivars->fOwnedQp || !ivars->fOwnedCq || !ivars->fOwnedMr ||
         !ivars->fOwnedMw || !ivars->fOwnedAh || !ivars->fOwnedGid ||
         !ivars->fOwnedLock || !ivars->fMethodLock) {
         Cleanup();
@@ -567,6 +589,7 @@ MlxUserClient::Cleanup()
     }
     if (ivars->fOwnedPd)  { ivars->fOwnedPd->release();  ivars->fOwnedPd = NULL; }
     if (ivars->fOwnedQp)  { ivars->fOwnedQp->release();  ivars->fOwnedQp = NULL; }
+    if (ivars->fOwnedSrq) { ivars->fOwnedSrq->release(); ivars->fOwnedSrq = NULL; }
     if (ivars->fOwnedCq)  { ivars->fOwnedCq->release();  ivars->fOwnedCq = NULL; }
     if (ivars->fOwnedMr)  { ivars->fOwnedMr->release();  ivars->fOwnedMr = NULL; }
     if (ivars->fOwnedMw)  { ivars->fOwnedMw->release();  ivars->fOwnedMw = NULL; }
@@ -654,6 +677,7 @@ MlxUserClient::ReleaseOwnedResources()
 {
     if (!ivars->fRoce) return;
     uint32_t handle;
+    /* SRQs are torn down after QPs below: a QP bound to one must go first. */
     while (TakeOwned(ivars->fOwnedQp, &handle)) {
         kern_return_t kr = ivars->fRoce->DestroyQP(handle);
         /* DestroyQP refuses a QP with in-flight SQ/RQ WQEs. Force it to RESET
@@ -707,6 +731,27 @@ static const MlxMethodSpec sMlxMethods[] = {
     MLX_UC_METHOD(kMlxUCMethodProbeCompletionVector,
                   sizeof(struct mlx_probe_completion_vector_req),
                   sizeof(struct mlx_probe_completion_vector_resp)),
+    MLX_UC_METHOD(kMlxUCMethodQueryMsixState, 0,
+                  sizeof(struct mlx_msix_state_resp)),
+    MLX_UC_METHOD(kMlxUCMethodProgramMsix,
+                  sizeof(struct mlx_program_msix_req),
+                  sizeof(struct mlx_program_msix_req)),
+    MLX_UC_METHOD(kMlxUCMethodQueryEqState,
+                  sizeof(struct mlx_query_eq_req),
+                  sizeof(struct mlx_query_eq_resp)),
+    MLX_UC_METHOD(kMlxUCMethodSetEqTimerPaused, sizeof(uint32_t), 0),
+    MLX_UC_METHOD(kMlxUCMethodProbeRmpLayout, 0,
+                  sizeof(struct mlx_probe_rmp_layout_resp)),
+    MLX_UC_METHOD(kMlxUCMethodCreateSrq, sizeof(struct mlx_create_srq_req),
+                  sizeof(struct mlx_create_srq_resp)),
+    MLX_UC_METHOD(kMlxUCMethodDestroySrq, sizeof(uint32_t), 0),
+    MLX_UC_METHOD(kMlxUCMethodPostSrqRecv,
+                  sizeof(struct mlx_post_srq_recv_req), 0),
+    MLX_UC_METHOD(kMlxUCMethodQuerySrq, sizeof(uint32_t),
+                  sizeof(struct mlx_query_srq_resp)),
+    MLX_UC_METHOD(kMlxUCMethodModifySrq, sizeof(struct mlx_modify_srq_req), 0),
+    MLX_UC_METHOD(kMlxUCMethodQpLastRefusal, sizeof(uint32_t),
+                  sizeof(struct mlx_qp_refusal_resp)),
     MLX_UC_METHOD(kMlxUCMethodQueryAbi, 0,
                   sizeof(struct mlx_query_abi_resp)),
     MLX_UC_METHOD(kMlxUCMethodQueryLimits, 0,
@@ -845,7 +890,12 @@ MlxUserClient::ExternalMethod(uint64_t selector,
          selector == kMlxUCMethodProbeCompletionVector ||
          selector == kMlxUCMethodDbgFlr || selector == kMlxUCMethodDbgExec ||
          selector == kMlxUCMethodDbgProvidePages || selector == kMlxUCMethodFwReset ||
-         selector == kMlxUCMethodFwCmd || selector == kMlxUCMethodAccessReg))
+         selector == kMlxUCMethodFwCmd || selector == kMlxUCMethodAccessReg ||
+         selector == kMlxUCMethodQueryMsixState ||
+         selector == kMlxUCMethodProgramMsix ||
+         selector == kMlxUCMethodQueryEqState ||
+         selector == kMlxUCMethodProbeRmpLayout ||
+         selector == kMlxUCMethodSetEqTimerPaused))
         return kIOReturnNotPermitted;
     if (!spec)
         return kIOReturnUnsupported;
@@ -1063,11 +1113,135 @@ MlxUserClient::ExternalMethod(uint64_t selector,
                                         &resp->completionInterrupts,
                                         &resp->eqTimerTicks,
                                         &resp->eqTimerPeriodMs);
+        ivars->fCore->GetInterruptIndexMap(&resp->indexCount,
+                                           &resp->indexCountPre,
+                                           &resp->msixIndexBase,
+                                           &resp->asyncIndex,
+                                           &resp->completionIndex,
+                                           &resp->indexProbeStatus,
+                                           resp->indexKind,
+                                           resp->indexKindPre,
+                                           resp->indexTypeRaw);
         return kIOReturnSuccess;
+    }
+    case kMlxUCMethodQueryMsixState: {
+        if (!out) return kIOReturnBadArgument;
+        if (!ivars->fCore) return kIOReturnNotAttached;
+        return ivars->fCore->ReadMsixState((struct mlx_msix_state_resp *)out);
+    }
+    case kMlxUCMethodQueryEqState: {
+        if (!in || !out) return kIOReturnBadArgument;
+        if (!ivars->fCore) return kIOReturnNotAttached;
+        if (!FwCmdAllowed(ivars)) return kIOReturnNoResources;
+        struct mlx_query_eq_req raw = *(const struct mlx_query_eq_req *)in;
+        return ivars->fCore->QueryEqState(&raw,
+                                          (struct mlx_query_eq_resp *)out);
+    }
+    case kMlxUCMethodCreateSrq: {
+        if (!in || !out || !ivars->fRoce) return kIOReturnBadArgument;
+        MlxSRQ *srqs = ivars->fRoce->GetSRQ();
+        if (!srqs) return kIOReturnUnsupported;
+        struct mlx_create_srq_req raw = *(const struct mlx_create_srq_req *)in;
+        raw.pd = TokenResolve(ivars, raw.pd, MLX_T_PD);
+        if (!raw.pd || !Owns(ivars->fOwnedPd, raw.pd)) return kIOReturnNotPermitted;
+        struct mlx_create_srq_resp *resp = (struct mlx_create_srq_resp *)out;
+        kern_return_t r = srqs->CreateSRQ(&raw, resp);
+        if (r != kIOReturnSuccess) return r;
+        uint32_t rawSrqn = resp->srqn;
+        uint32_t token = TokenCreate(ivars, MLX_T_SRQ, rawSrqn);
+        if (!token || !AddOwned(ivars->fOwnedSrq, rawSrqn)) {
+            (void)srqs->DestroySRQ(rawSrqn);
+            return kIOReturnNoMemory;
+        }
+        resp->srqn = token;
+        return kIOReturnSuccess;
+    }
+    case kMlxUCMethodDestroySrq: {
+        if (!in || !ivars->fRoce) return kIOReturnBadArgument;
+        MlxSRQ *srqs = ivars->fRoce->GetSRQ();
+        if (!srqs) return kIOReturnUnsupported;
+        uint32_t srqn = TokenResolve(ivars, *(const uint32_t *)in, MLX_T_SRQ);
+        if (!srqn || !Owns(ivars->fOwnedSrq, srqn)) return kIOReturnNotPermitted;
+        kern_return_t r = srqs->DestroySRQ(srqn);
+        if (r == kIOReturnSuccess) { uint32_t h; (void)h; RemoveOwned(ivars->fOwnedSrq, srqn); }
+        return r;
+    }
+    case kMlxUCMethodPostSrqRecv: {
+        if (!in || !ivars->fRoce) return kIOReturnBadArgument;
+        MlxSRQ *srqs = ivars->fRoce->GetSRQ();
+        if (!srqs) return kIOReturnUnsupported;
+        struct mlx_post_srq_recv_req raw = *(const struct mlx_post_srq_recv_req *)in;
+        raw.srqn = TokenResolve(ivars, raw.srqn, MLX_T_SRQ);
+        if (!raw.srqn || !Owns(ivars->fOwnedSrq, raw.srqn)) return kIOReturnNotPermitted;
+        /* Every scatter entry must land in a region this client registered. */
+        for (uint32_t i = 0; i < raw.numSge && i < MLX_SRQ_MAX_SGE; i++) {
+            MlxMRContext *mr = ivars->fRoce->GetMR()->LookupByLkey(raw.sge[i].lkey);
+            if (!mr || !Owns(ivars->fOwnedMr, mr->mrHandle))
+                return kIOReturnNotPermitted;
+        }
+        return srqs->PostRecv(&raw);
+    }
+    case kMlxUCMethodQuerySrq: {
+        if (!in || !out || !ivars->fRoce) return kIOReturnBadArgument;
+        MlxSRQ *srqs = ivars->fRoce->GetSRQ();
+        if (!srqs) return kIOReturnUnsupported;
+        uint32_t srqn = TokenResolve(ivars, *(const uint32_t *)in, MLX_T_SRQ);
+        if (!srqn || !Owns(ivars->fOwnedSrq, srqn)) return kIOReturnNotPermitted;
+        return srqs->QuerySRQ(srqn, (struct mlx_query_srq_resp *)out);
+    }
+    case kMlxUCMethodModifySrq: {
+        if (!in || !ivars->fRoce) return kIOReturnBadArgument;
+        MlxSRQ *srqs = ivars->fRoce->GetSRQ();
+        if (!srqs) return kIOReturnUnsupported;
+        struct mlx_modify_srq_req raw = *(const struct mlx_modify_srq_req *)in;
+        raw.srqn = TokenResolve(ivars, raw.srqn, MLX_T_SRQ);
+        if (!raw.srqn || !Owns(ivars->fOwnedSrq, raw.srqn)) return kIOReturnNotPermitted;
+        return srqs->ModifyLimit(raw.srqn, raw.limit);
+    }
+    case kMlxUCMethodProbeRmpLayout: {
+        if (!out || !ivars->fCore) return kIOReturnBadArgument;
+        if (!FwCmdAllowed(ivars)) return kIOReturnNoResources;
+        return ivars->fCore->ProbeRmpLayout(
+            (struct mlx_probe_rmp_layout_resp *)out);
+    }
+    case kMlxUCMethodSetEqTimerPaused: {
+        if (!in || !ivars->fCore) return kIOReturnBadArgument;
+        uint32_t paused = *(const uint32_t *)in;
+        if (paused > 1) return kIOReturnBadArgument;
+        return ivars->fCore->SetEqTimerPaused(paused != 0);
+    }
+    case kMlxUCMethodProgramMsix: {
+        if (!in || !out) return kIOReturnBadArgument;
+        if (!ivars->fCore) return kIOReturnNotAttached;
+        struct mlx_program_msix_req raw =
+            *(const struct mlx_program_msix_req *)in;
+        kern_return_t pkr = ivars->fCore->ProgramMsix(&raw);
+        /* PEEK returns its dword in the request echoed back. */
+        *(struct mlx_program_msix_req *)out = raw;
+        return pkr;
     }
     case kMlxUCMethodQueryLimits: {
         struct mlx_query_limits_resp *resp = (struct mlx_query_limits_resp *)out;
         const MlxHcaCaps *caps = ClientCaps(ivars);
+        /* Posting-path capabilities. The dev machine's kernel log channel is
+         * dead, so without these there is no way to see whether the card even
+         * reports blue flame, and a doorbell that silently stays a plain
+         * 64-bit write looks identical to one that does not. */
+        {
+            const uint8_t logBf = caps ? caps->logBfRegSize : 0;
+            const uint32_t bfRegSize = logBf && logBf < 13 ? (1u << logBf) : 0;
+            const uint32_t uarPageSize = !caps ? 4096u :
+                (caps->uar4k ? 4096u : (1u << caps->logUarPageSize));
+            resp->bfSupported   = bfRegSize ? 1u : 0u;
+            resp->logBfRegSize  = logBf;
+            resp->uarPageSize   = uarPageSize;
+            resp->bfRegsPerUar  = mlxBfRegsPerUar(uarPageSize, bfRegSize);
+            resp->maxInlineData = MLX_UC_MAX_INLINE_DATA;
+            resp->maxSge        = MLX_UC_MAX_SGE;
+        }
+        if (ivars->fCore)
+            ivars->fCore->GetPcieLink(&resp->pcieLinkSpeed,
+                                      &resp->pcieLinkWidth);
         resp->maxPd = MLX_UC_MAX_PD_PER_CLIENT;
         resp->maxQp = ClientQpLimit(ivars);
         resp->maxCq = ClientCqLimit(ivars);
@@ -1112,6 +1286,9 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         resp->cqEvents = ivars->fCore ? ivars->fCore->CompletionEventCount() : 0;
         resp->cqEventWakeups = ivars->fCore ?
             ivars->fCore->CompletionWakeupCount() : 0;
+        if (ivars->fCore && ivars->fCore->GetCmd())
+            ivars->fCore->GetCmd()->CommandStats(&resp->fwCommands,
+                                                 &resp->fwCommandSleeps);
         return kIOReturnSuccess;
     }
     case kMlxUCMethodQueryStats: {
@@ -1251,6 +1428,11 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         raw.pd = TokenResolve(ivars, req->pd, MLX_T_PD);
         raw.sendCq = TokenResolve(ivars, req->sendCq, MLX_T_CQ);
         raw.recvCq = TokenResolve(ivars, req->recvCq, MLX_T_CQ);
+        if (req->srqn) {
+            raw.srqn = TokenResolve(ivars, req->srqn, MLX_T_SRQ);
+            if (!raw.srqn || !Owns(ivars->fOwnedSrq, raw.srqn))
+                return kIOReturnNotPermitted;
+        }
         if (!raw.pd || !raw.sendCq || !raw.recvCq ||
             !Owns(ivars->fOwnedPd, raw.pd) ||
             !Owns(ivars->fOwnedCq, raw.sendCq) ||
@@ -1305,6 +1487,18 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         }
         return r;
     }
+    case kMlxUCMethodQpLastRefusal: {
+        if (!in || !out || !ivars->fRoce || !ivars->fRoce->GetQP())
+            return kIOReturnBadArgument;
+        uint32_t token = *(const uint32_t *)in;
+        uint32_t qpn = TokenResolve(ivars, token, MLX_T_QP);
+        if (!qpn || !Owns(ivars->fOwnedQp, qpn)) return kIOReturnNotPermitted;
+        struct mlx_qp_refusal_resp *r = (struct mlx_qp_refusal_resp *)out;
+        r->qpn = token;
+        r->rsvd = 0;
+        return ivars->fRoce->GetQP()->LastRefusal(qpn, &r->fwStatus,
+                                                  &r->syndrome);
+    }
     case kMlxUCMethodQueryQP: {
         uint32_t token = *(const uint32_t *)in;
         uint32_t qpn = TokenResolve(ivars, token, MLX_T_QP);
@@ -1313,6 +1507,11 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         struct mlx_query_qp_resp *resp = (struct mlx_query_qp_resp *)out;
         kern_return_t r = ivars->fRoce->GetQP()->QueryQP(qpn, resp);
         if (r == kIOReturnSuccess) {
+            /* Filled here, not inside QueryQP: ModifyQP calls that one while
+             * already holding the QP lock, and taking it again deadlocks every
+             * transition. Nothing is held on this path. */
+            (void)ivars->fRoce->GetQP()->LastRefusal(qpn, &resp->lastFwStatus,
+                                                     &resp->lastFwSyndrome);
             resp->qpn = token;
             uint32_t scq = TokenForRaw(ivars, MLX_T_CQ, resp->sendCq);
             uint32_t rcq = TokenForRaw(ivars, MLX_T_CQ, resp->recvCq);

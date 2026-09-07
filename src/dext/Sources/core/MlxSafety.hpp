@@ -65,6 +65,13 @@ static inline bool mlxBuildSegmentPas(const Segment *segments, uint32_t count,
 }
 
 /* Proof is per completion vector and reset epoch, never "any IRQ ever". */
+/* EQ timer period. On this machine MSI-X delivery is platform-broken (see
+ * msix-delivery-apple-silicon-2026-09.md): IOPCIFamily enables MSI-X but never
+ * programs the table, so completionIrqProven never becomes true and the timer
+ * IS the delivery mechanism, not a fallback. The old 1 ms "unproven" tier was
+ * a temporary aggressive mode while the vector was expected to come up; now
+ * that it never will, 10 ms is the permanent floor for the blocking
+ * consumer (busy-poll direct-CQ is unaffected and stays at ~8.7 us). */
 static inline uint32_t mlxEqPollPeriodMs(bool liveCq, bool completionIrqProven)
-{ return !liveCq ? 100u : completionIrqProven ? 50u : 1u; }
+{ return !liveCq ? 100u : completionIrqProven ? 50u : 10u; }
 #endif

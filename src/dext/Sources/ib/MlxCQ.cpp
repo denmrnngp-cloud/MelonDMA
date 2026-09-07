@@ -8,6 +8,7 @@
  */
 #include "MlxCQ.hpp"
 #include "MlxRoCE.hpp"
+#include "MlxSRQ.hpp"
 #include "MlxQP.hpp"
 #include "MlxPCIDriver.h"
 #include "MlxEQ.hpp"
@@ -526,6 +527,58 @@ MlxCQ::PollCQ(const struct mlx_poll_cq_req *req, struct mlx_poll_cq_resp *resp)
         struct MlxCqe64 local;
         memcpy(&local, (const void *)(uintptr_t)entry, sizeof(local));
         struct mlx_work_completion *wc = &resp->wc[resp->count];
+        const uint8_t cqeOp = (uint8_t)(opOwn >> 4);
+        const bool isRecv = (cqeOp == MLX_CQE_RESP || cqeOp == MLX_CQE_RESP_WR_IMM ||
+                             cqeOp == MLX_CQE_RESP_SEND_IMM ||
+                             cqeOp == MLX_CQE_RESP_SEND_INV ||
+                             cqeOp == MLX_CQE_RESP_ERR);
+        /* srqn_uidx in the CQE carries a user index in user mode and reads
+         * zero, proven twice on this hardware. The shared queue is found
+         * through the QP that took the receive instead, which is also how
+         * libmlx5 resolves it. */
+        const uint32_t cqeQpn = OSSwapBigToHostInt32(local.sop_drop_qpn) & 0xffffffu;
+        const uint32_t cqeSrqn = (isRecv && s->roce->GetQP()) ?
+            s->roce->GetQP()->SrqnFor(cqeQpn) : 0;
+        const uint32_t cqeWqe = OSSwapBigToHostInt16(local.wqe_counter);
+
+        /* A receive from a shared queue cannot be attributed through the QP:
+         * such a QP has no receive ring to look the work request up in. The
+         * id lives in the SRQ, indexed by the wqe_counter the CQE carries. */
+        if (isRecv && s->roce->GetSRQ())
+            s->roce->GetSRQ()->NoteReceiveCqe(cqeSrqn, cqeWqe, cqeOp);
+        if (cqeSrqn && s->roce->GetSRQ()) {
+            MlxSRQ *srqs = s->roce->GetSRQ();
+            memset(wc, 0, sizeof(*wc));
+            wc->wrId = srqs->WrIdFor(cqeSrqn, cqeWqe);
+            wc->qpNum = cqeQpn;
+            wc->byteLen = OSSwapBigToHostInt32(local.byte_cnt);
+            wc->wqeCounter = cqeWqe;
+            if (cqeOp == MLX_CQE_RESP_ERR) {
+                /* This branch bypasses CompleteCQE, so it has to lift the
+                 * syndrome itself; without it an error here says only that
+                 * something went wrong. Error CQEs carry vendor_err_synd and
+                 * syndrome in the last bytes, as the QP decoder reads them. */
+                const uint8_t *raw = reinterpret_cast<const uint8_t *>(&local);
+                uint8_t vendorErrSynd = raw[54];
+                uint8_t syndrome = raw[55];
+                wc->status = MlxSyndromeToWcStatus(syndrome);
+                wc->vendorError = ((uint32_t)vendorErrSynd << 8) | syndrome;
+                MLX_LOG("SRQ[%u] error CQE on qp=%u wqe=%u: syndrome=0x%02x "
+                        "vendor=0x%02x -> status=%u", cqeSrqn, cqeQpn, cqeWqe,
+                        syndrome, vendorErrSynd, wc->status);
+            } else {
+                wc->status = 0;
+            }
+            wc->opcode = MLX_UC_WC_RECV;
+            if (cqeOp == MLX_CQE_RESP_WR_IMM || cqeOp == MLX_CQE_RESP_SEND_IMM) {
+                wc->immData = OSSwapBigToHostInt32(local.imm_inval_pkey);
+                wc->wcFlags |= MLX_UC_WC_WITH_IMM;
+            }
+            srqs->ReturnWqe(cqeSrqn, cqeWqe);
+            cq->consumerIndex++;
+            resp->count++;
+            continue;
+        }
         if (!s->roce->GetQP() ||
             !s->roce->GetQP()->CompleteCQE(cq->cqNumber, &local, wc)) {
             MLX_LOG("PollCQ: CompleteCQE fallback cq=%u getQP=%s op_own=0x%02x",

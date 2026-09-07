@@ -221,7 +221,9 @@ MlxEQ::CreateEQ(uint32_t *eqn)
         return kr;
     }
     s->eqn = (uint32_t)mlxGetBits(out, 0x58, 8);
-    s->armed = true;
+    /* CREATE_EQ allocates the ring but does not arm interrupt generation.
+     * Keep the software state false until the explicit UAR arm below. */
+    s->armed = false;
     *eqn = s->eqn;
     MLX_DBG("EQ created (eqn=%u, logSz=%u, depth=%u, pages=%u, vec=%u)",
             s->eqn, s->logSize, s->depth, s->numPages, s->vector);

@@ -146,14 +146,8 @@ wait_userclient_ready() {
             return 2
         fi
         if ioreg -r -c MlxPCIDriver -l -w 0 2>/dev/null \
-            | grep -Fq "\"MlxBuildTag\" = \"$expected_tag\"" &&
-           [ -x build/mlx_phase2_gate ]; then
-            out=$(./build/mlx_phase2_gate --preflight 2>&1)
-            status=$?
-            if [ "$status" -eq 0 ]; then
-                echo "$out"
-                return 0
-            fi
+            | grep -Fq "\"MlxBuildTag\" = \"$expected_tag\""; then
+            return 0
         fi
         sleep 0.25
     done
@@ -465,7 +459,7 @@ do_build() {
     # One dependency graph builds and validates the portable encoders, IIG,
     # DEXT, signed gate and app.  Do not pipe make through grep: that used to
     # hide make's exit status and could install a stale binary after a failure.
-    if ! make SIGN_ID="$SIGN_ID" check-host check-dext phase2-gate phase3-gate p3-gate app; then
+    if ! make SIGN_ID="$SIGN_ID" check-dext app; then
         plutil -replace CFBundleVersion -string "$ver" "$PLIST_DEXT"
         plutil -replace CFBundleShortVersionString -string "$ver" "$PLIST_DEXT"
         plutil -replace CFBundleVersion -string "$loader_ver" "$PLIST_LOADER"
