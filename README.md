@@ -226,6 +226,18 @@ and re-takes the card over — no reboot. Verify first with `./src/dext/scripts/
   `mlx_dev.sh` will attempt when racing Apple's driver for the card
   (kill Apple → rematch → re-check owner, each round).
 
+### (e) Return the card to Apple
+
+* **Live handback (no reboot)** — `./src/dext/scripts/mlx_dev.sh driver-release`
+  deactivates the system extension and waits until Apple's `AppleEthernetMLX5`
+  takes the card back. It refuses if any RDMA client is still running — close
+  QP/MR-holding processes first.
+* **Cross-reboot ownership handoff** — `./src/dext/tools/run_ownership_handoff_gate.sh`
+  verifies the Apple ↔ MelonDMA ownership transition across a normal restart:
+  `start` deactivates MelonDMA and persists the stage, then after reboot `resume`
+  confirms Apple owns the card, reactivates MelonDMA and checks MSI-X/UserClient.
+  Cycle count via `OWNERSHIP_HANDOFF_CYCLES` (default `3`).
+
 ---
 
 ## Logging
