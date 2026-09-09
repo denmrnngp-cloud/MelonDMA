@@ -108,6 +108,7 @@ enum {
     RDMA_FEATURE_CQ_EVENT_WAIT = 1u << 16,
     RDMA_FEATURE_RUNTIME_STATUS = 1u << 17,
     RDMA_FEATURE_COHERENT_UMA_MR = 1u << 15,
+    RDMA_FEATURE_UC = 1u << 18,
 };
 struct rdma_abi_attr { uint32_t version; uint32_t features; };
 int  rdma_query_abi(rdma_device *dev, struct rdma_abi_attr *attr);
@@ -127,15 +128,53 @@ struct rdma_device_attr {
     uint32_t max_inline_data;
     uint32_t max_qp_rd_atom;
     uint32_t max_qp_init_rd_atom;
+    /* Identity from the nic_vport_context. Zero means firmware supplied none. */
+    uint64_t node_guid;
+    uint64_t port_guid;
+    uint64_t sys_image_guid;
 };
 int  rdma_query_device(rdma_device *dev, struct rdma_device_attr *attr);
+
+/* Per-vport queue counters. out_of_buffer is packets dropped because nothing
+ * was posted to receive them — the port counters stay clean while it climbs,
+ * so it is the one number that names a starved receiver. Counter set 0 is
+ * where this driver's QPs land. clear zeroes the set after reading.
+ * Returns -ENOTSUP on a DEXT that predates the selector. */
+struct rdma_q_counters {
+    uint32_t rx_write_requests, rx_read_requests, rx_atomic_requests;
+    uint32_t out_of_buffer, out_of_sequence, duplicate_request;
+    uint32_t rnr_nak_retry_err, packet_seq_err, implied_nak_seq_err;
+    uint32_t local_ack_timeout_err, req_rnr_retries_exceeded;
+    uint32_t resp_local_length_error, req_local_length_error;
+    uint32_t local_operation_error, resp_cqe_error, req_cqe_error;
+};
+/* The card's internal timer, the clock every CQE timestamp is counted in,
+ * read together with the host clock so a timestamp can be turned into a real
+ * time. Sample this occasionally, not per completion: two samples give the
+ * offset and the drift, and after that the conversion is arithmetic. */
+struct rdma_hca_clock {
+    uint64_t ticks;
+    uint64_t host_uptime_ns;
+    uint32_t frequency_khz;   /* 0 when the card does not report it */
+};
+int  rdma_query_hca_clock(rdma_device *dev, struct rdma_hca_clock *clock);
+
+int  rdma_query_q_counters(rdma_device *dev, uint32_t counter_set_id,
+                           int clear, struct rdma_q_counters *counters);
 
 struct rdma_port_attr {
     uint8_t  link_layer;        /* 1=IB 2=Ethernet */
     uint8_t  port_state;        /* 0=down 1=up */
     uint8_t  gid_type;          /* 2=RoCEv2 */
     uint32_t active_speed_mbps;
+    uint32_t link_speed_mbps;   /* PTYS eth_proto_oper decoded, 0 unknown */
     uint32_t max_mtu;
+    uint8_t  pause_tx;          /* 802.3x pause transmit (PFCC pptx) */
+    uint8_t  pause_rx;          /* 802.3x pause receive (PFCC pprx) */
+    uint8_t  pfc_tx_mask;       /* per-priority PFC tx enable (PFCC pfctx) */
+    uint8_t  pfc_rx_mask;       /* PFCC pfcrx */
+    uint8_t  pfc_prio_mask;     /* PFCC prio_mask_tx | prio_mask_rx */
+    uint8_t  rsvd[3];
     uint16_t gid_tbl_len;
     uint16_t pkey_tbl_len;
 };
@@ -150,8 +189,39 @@ struct rdma_health_attr {
     uint32_t owned_cq;
     uint32_t owned_mr;
     uint32_t owned_ah;
+    /* The init-segment health buffer, decoded by the driver. Firmware fills it
+     * only when it asserts, so on a healthy card every field is zero.
+     * device_removed is set once the health counter and fw_rev both read
+     * all-ones, which is how a card off the bus looks over MMIO. */
+    uint32_t assert_var[6];
+    uint32_t assert_exit_ptr;
+    uint32_t assert_callra;
+    uint32_t health_time;
+    uint32_t fw_ver;
+    uint32_t hw_id;
+    uint32_t rfr_severity;
+    uint32_t irisc_index;
+    uint32_t device_removed;
 };
 int  rdma_query_health(rdma_device *dev, struct rdma_health_attr *attr);
+
+/* DCQCN observability. enable says whether firmware's loop is on for this
+ * priority; the counters are device-wide accumulators, and clear zeroes them
+ * after the read. Returns -ENOTSUP on a DEXT that predates the selector. */
+struct rdma_cong_stats {
+    uint32_t enable;
+    uint32_t tag_enable;
+    uint64_t rp_cnp_ignored;
+    uint64_t rp_cnp_handled;
+    uint64_t np_ecn_marked_roce_packets;
+    uint64_t np_cnp_sent;
+    uint64_t time_stamp;
+    uint32_t rp_cur_flows;
+    uint32_t sum_flows;
+    uint32_t accumulators_period;
+};
+int  rdma_query_cong_stats(rdma_device *dev, uint32_t priority, int clear,
+                           struct rdma_cong_stats *stats);
 
 /* MSI-X bring-up diagnosis. setup_stage is RDMA_IRQ_STAGE_*; NONE with
  * completion_ready set means the blocking completion path is live. Returns
@@ -174,6 +244,8 @@ enum {
     RDMA_CQEQ_STAGE_OK            = 4,
 };
 /* Host interrupt index classification, mirroring MLX_IRQ_KIND_*. */
+#define RDMA_IRQ_BIND_NOT_TRIED 0xffffffffu
+#define RDMA_IRQ_COMP_EQ_MAX 4u
 #define RDMA_IRQ_INDEX_MAP  16
 #define RDMA_IRQ_INDEX_NONE 0xffffffffu
 enum {
@@ -220,6 +292,15 @@ struct rdma_interrupt_attr {
     uint8_t  index_kind[RDMA_IRQ_INDEX_MAP];
     uint8_t  index_kind_pre[RDMA_IRQ_INDEX_MAP];
     uint64_t index_type_raw[RDMA_IRQ_INDEX_MAP];
+    /* kern_return_t of a trial IOInterruptDispatchSource::Create on each index
+     * the driver does not bind, or RDMA_IRQ_BIND_NOT_TRIED. Zero means a
+     * dispatch source really can be had there, which is what decides whether a
+     * command-completion vector or a set of completion EQs is available. */
+    uint32_t index_bind[RDMA_IRQ_INDEX_MAP];
+    /* Completion queues in service and the interrupts each has taken; index 0
+     * is the primary. completion_interrupts is their sum. */
+    uint32_t completion_eq_count;
+    uint64_t completion_irq_by_eq[RDMA_IRQ_COMP_EQ_MAX];
 };
 int  rdma_query_interrupts(rdma_device *dev, struct rdma_interrupt_attr *attr);
 
@@ -239,6 +320,13 @@ struct rdma_limits {
     uint32_t max_sge;
     uint32_t pcie_link_speed;   /* encoded generation, 0 = unknown */
     uint32_t pcie_link_width;   /* lanes, 0 = unknown */
+    /* Read back from firmware after INIT_HCA. cache_line_128 is what the card
+     * was told about the host cache line, log_uar_page_sz the raw exponent
+     * behind uar_page_size, board_id the QUERY_ADAPTER psid (NUL-terminated
+     * here even though the wire form is only NUL-padded). */
+    uint32_t cache_line_128;
+    uint32_t log_uar_page_sz;
+    char     board_id[17];
 };
 int  rdma_query_limits(rdma_device *dev, struct rdma_limits *limits);
 
@@ -357,6 +445,7 @@ struct rdma_perf {
     /* Device-wide firmware command counters; see mlx_perf_resp. */
     uint64_t fw_commands;
     uint64_t fw_command_sleeps;
+    uint64_t fw_command_slot_waits;
     uint64_t cq_event_wakeups;
 };
 int  rdma_query_perf(rdma_device *dev, struct rdma_perf *perf);
@@ -441,6 +530,7 @@ enum rdma_wc_opcode {
 /* Bytes of global routing header ahead of every datagram payload. */
 #define RDMA_GRH_BYTES 40
 #define RDMA_WC_WITH_ATOMIC 2u
+#define RDMA_WC_WITH_INV (1u << 3)
 struct rdma_wc {
     uint64_t wr_id;
     uint32_t status;       /* rdma_wc_status */
@@ -459,8 +549,8 @@ struct rdma_wc {
 int  rdma_poll_cq(rdma_cq *cq, struct rdma_wc *wc, int num);
 
 
-/* ---- queue pair (RC only for v1) ---- */
-enum rdma_qp_type { RDMA_QPT_RC = 0, RDMA_QPT_UD = 1 };
+/* ---- queue pair ---- */
+enum rdma_qp_type { RDMA_QPT_RC = 0, RDMA_QPT_UD = 1, RDMA_QPT_UC = 2 };
 enum rdma_qp_state {
     RDMA_QPS_RESET = 0, RDMA_QPS_INIT = 1, RDMA_QPS_RTR = 2,
     RDMA_QPS_RTS   = 3, RDMA_QPS_SQD  = 4, RDMA_QPS_SQERR=5, RDMA_QPS_ERR = 6,
@@ -553,6 +643,15 @@ struct rdma_gid_attr {
     uint8_t gid_type;         /* ibv_gid_type: 2=RoCEv2 */
     uint8_t ifindex;          /* 0: no macOS netif */
 };
+struct rdma_cap_regs {
+    uint32_t version;
+    uint32_t valid_mask;
+    uint8_t pcam[80];
+    uint8_t mcam[80];
+    uint8_t qcam[80];
+};
+int  rdma_query_cap_regs(rdma_device *dev, struct rdma_cap_regs *caps);
+
 /* Port counters straight from the card. The DEXT owns the port and macOS has
  * no netif behind it, so this is the only receive-side view of the wire. */
 struct rdma_port_stats {
@@ -658,6 +757,7 @@ enum rdma_wr_opcode {
     RDMA_WR_BIND_MW = 7,
     RDMA_WR_ATOMIC_CS = 8,
     RDMA_WR_ATOMIC_FA = 9,
+    RDMA_WR_SEND_INV = 10,
 };
 struct rdma_send_wr {
     uint64_t wr_id;

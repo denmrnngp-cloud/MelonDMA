@@ -237,8 +237,13 @@ static int run_reg_bench(struct ibv_pd *pd, long reps)
     static const size_t sizes[] = {
         4u << 10, 64u << 10, 1u << 20, 16u << 20, 96u << 20, 149u << 20,
     };
-    printf("%12s %10s %10s %10s %12s\n",
-           "region", "reg p50", "reg p90", "dereg p50", "MB/s pinned");
+    /* The first repetition is the only real registration: verbs_compat caches
+     * the native one and later repetitions of the same buffer are cache hits
+     * costing a lease. Reporting p50 alone turned this from a registration
+     * benchmark into a cache benchmark, so first is printed beside it. */
+    printf("%12s %10s %10s %10s %10s %12s\n",
+           "region", "reg first", "reg p50", "reg p90", "dereg p50",
+           "MB/s pinned");
     for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
         size_t n = sizes[i];
         uint8_t *buf = malloc(n);
@@ -247,6 +252,7 @@ static int run_reg_bench(struct ibv_pd *pd, long reps)
         uint64_t *dereg = calloc((size_t)reps, sizeof(*dereg));
         if (!reg || !dereg) { free(buf); free(reg); free(dereg); return -1; }
         long done = 0;
+        uint64_t first_ns = 0;
         for (long r = 0; r < reps; r++) {
             /* Touch every page so the cost measured is registration, not the
              * first-touch faults that would otherwise land inside it. */
@@ -258,6 +264,7 @@ static int run_reg_bench(struct ibv_pd *pd, long reps)
             if (!mr) break;
             (void)ibv_dereg_mr(mr);
             uint64_t t2 = now_ns();
+            if (!done) first_ns = t1 - t0;
             reg[done] = t1 - t0;
             dereg[done] = t2 - t1;
             done++;
@@ -267,11 +274,11 @@ static int run_reg_bench(struct ibv_pd *pd, long reps)
         } else {
             qsort(reg, (size_t)done, sizeof(*reg), cmp_u64);
             qsort(dereg, (size_t)done, sizeof(*dereg), cmp_u64);
-            double p50 = pct(reg, done, 0.50);
-            printf("%9zu KiB %9.1fus %9.1fus %9.1fus %12.0f\n",
-                   n >> 10, p50, pct(reg, done, 0.90),
-                   pct(dereg, done, 0.50),
-                   p50 > 0 ? (double)n / p50 : 0.0);
+            double first = (double)first_ns / 1000.0;
+            printf("%9zu KiB %9.1fus %9.1fus %9.1fus %9.1fus %12.0f\n",
+                   n >> 10, first, pct(reg, done, 0.50),
+                   pct(reg, done, 0.90), pct(dereg, done, 0.50),
+                   first > 0 ? (double)n / first : 0.0);
         }
         free(reg); free(dereg); free(buf);
     }
@@ -432,10 +439,20 @@ int main(int argc, char **argv)
         if (have_p0 && ibv_mlx5_query_perf(ictx, &p1) == 0) {
             uint64_t cmds = p1.fw_commands - p0.fw_commands;
             uint64_t slept = p1.fw_command_sleeps - p0.fw_command_sleeps;
-            printf("FW_CMD: %llu commands, %llu of them slept past the spin "
-                   "window (%.1f%%)\n", (unsigned long long)cmds,
-                   (unsigned long long)slept,
-                   cmds ? 100.0 * (double)slept / (double)cmds : 0.0);
+            uint64_t waits = p1.fw_command_slot_waits - p0.fw_command_slot_waits;
+            /* Not milliseconds. The counter increments once per pass past
+             * the spin window, and a pass waits AT MOST a millisecond — it
+             * ends early when the command-completion event arrives. It was
+             * milliseconds while the only wait was IOSleep(1), and printing it
+             * as milliseconds after the event wait landed would have been the
+             * same mistake twice. Both counters are device-wide, so a
+             * concurrent client inflates them. */
+            printf("FW_CMD: %llu commands, %llu waits past the spin window "
+                   "(%.2f per command, each up to 1 ms), %llu waited for a "
+                   "free slot\n",
+                   (unsigned long long)cmds, (unsigned long long)slept,
+                   cmds ? (double)slept / (double)cmds : 0.0,
+                   (unsigned long long)waits);
         }
         goto out_qp;
     }

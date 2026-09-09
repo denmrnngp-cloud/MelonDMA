@@ -15,6 +15,7 @@
 #include "MlxServiceMatch.h"
 
 #include <stdlib.h>
+#include <os/lock.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -76,12 +77,38 @@ static inline void rdma_mmio_flush(void)
 
 /* ---- internal object layouts ---- */
 
+/* One blue-flame register, as the hardware sees it. The toggle belongs here
+ * and not to a queue pair: it alternates the doorbell between the two halves
+ * of the register so that consecutive doorbells never land on the same
+ * address, and a write-combining mapping is free to merge two stores that do.
+ * Two QPs sharing a register with private toggles can produce exactly that
+ * pair of stores, and the merged doorbell is a work request the card never
+ * fetches. rdma-core keeps the toggle in the shared `mlx5_bf` for the same
+ * reason. The lock is taken only by QPs that share, so a private register
+ * keeps the lock-free path and its numbers. */
+struct rdma_bf_reg {
+    uint32_t        offset;      /* flat bf_offset; identifies the register */
+    uint32_t        toggle;
+    os_unfair_lock  lock;
+    int             in_use;
+};
+
+/* Four UAR pages at four registers each is the ceiling the driver allocates
+ * from; the table is sized past it so a firmware that reports more registers
+ * per page still resolves rather than silently falling back to a private
+ * toggle. */
+#define RDMA_BF_REG_SLOTS 64u
+
 struct rdma_device {
     io_connect_t  conn;
     char          name[64];
-    void         *uar_map;
+    /* One entry per UAR page / doorbell page the driver has given this
+     * client. Slot 0 and page 0 are mapped when the fast path is enabled; the
+     * rest appear lazily, the first time a QP or CQ lands on them. */
+    void         *uar_map[MLX_CLIENT_MAX_UAR];
     size_t        uar_map_size;
-    void         *db_map;
+    unsigned      uar_map_options;
+    void         *db_map[MLX_CLIENT_MAX_DB_PAGES];
     size_t        db_map_size;
     struct rdma_qp *qps;
     struct rdma_cq *cqs;
@@ -89,6 +116,11 @@ struct rdma_device {
     struct rdma_mr *mrs;
     uint32_t      abi_features;
     struct rdma_fast_path_stats stats;
+    /* Registers this client's QPs have landed on. Sharing only ever happens
+     * between QPs of one client, and a client is one process, so a
+     * process-local table is the whole scope of the problem. */
+    struct rdma_bf_reg bf_regs[RDMA_BF_REG_SLOTS];
+    os_unfair_lock     bf_table_lock;
 };
 
 static inline void rdma_stat_add(uint64_t *counter, uint64_t value)
@@ -124,6 +156,7 @@ struct rdma_cq {
     uint32_t     synced_consumer_index;    /* last CI known by the DEXT object */
     uint32_t     consumer_batch;           /* lazy DB publication threshold */
     uint32_t     db_record_offset;
+    uint8_t     *db_rec;        /* resolved doorbell record */
     uint32_t     depth;
     struct rdma_cq *next;
 };
@@ -138,15 +171,31 @@ struct rdma_qp {
      * the direct poll has no metadata for it and must defer to the kernel. */
     uint32_t     srqn;
     int          is_ud;   /* datagram queue pair */
+    int          is_uc;   /* unreliable connected queue pair */
     uint32_t     state;
     uint32_t     sq_size;
     uint32_t     rq_size;
     void        *sq_buf;
     void        *rq_buf;
-    uint32_t     bf_offset;
+    uint32_t     bf_offset;      /* flat, as the driver reported it */
+    uint8_t     *bf_reg;        /* resolved: mapping base + in-page offset */
+    uint8_t     *db_rec;        /* resolved doorbell record */
     int          bf_shared;   /* doorbell register shared with another QP */
     uint32_t     bf_buf_size;
-    uint32_t     bf_toggle;
+    uint32_t     bf_toggle;   /* private toggle; used when nothing shares */
+    /* Points at bf_toggle when this QP owns its register outright, and at the
+     * register's own toggle when it does not. bf_lock is NULL in the first
+     * case, so the common path costs one predicted branch. */
+    uint32_t    *bf_togglep;
+    os_unfair_lock *bf_lock;
+    /* Serialises posts on this queue pair. rdma-core's mlx5 provider takes a
+     * per-queue lock unless the QP is created single threaded, and the
+     * libibverbs compatibility layer here presents rdma-core semantics, so
+     * this defaults on. MELONDMA_SINGLE_THREADED_QP=1 turns it off for a
+     * caller that does its own serialisation and wants the last nanoseconds
+     * back. */
+    os_unfair_lock post_lock;
+    int          post_serialize;
     uint32_t     db_record_offset;
     uint32_t     sq_stride;
     uint64_t     sq_head;
@@ -168,6 +217,7 @@ struct rdma_qp {
     uint8_t     *sq_span;
     uint64_t    *sq_atomic_result;
     uint64_t    *rq_wrid;
+    uint64_t    *rq_sge_addr;  /* first recv SGE addr per slot, for scatter-to-CQE */
     uint8_t      wqe_template[3][8][64]; /* SEND/WRITE/READ x CE/fence/solicit */
     uint8_t      wqe_template_valid[3];
     struct rdma_qp *next;
@@ -177,39 +227,149 @@ struct rdma_qp {
 /* Copy a complete WQE to one Blue Flame buffer. The UAR mapping is WC and
  * every store is volatile MMIO; the device-scope barrier flushes the group
  * before selecting the other half of the BF register for the next post. */
+/* Map one page of a client pool on demand and cache it. The driver only
+ * exports slots it has actually given this client, so an index it does not
+ * own comes back refused rather than as somebody else's page. */
+static void *rdma_map_pool_page(rdma_device *dev, uint32_t kind,
+                                uint32_t index, size_t expect,
+                                unsigned options)
+{
+    mach_vm_address_t addr = 0;
+    mach_vm_size_t size = 0;
+    kern_return_t kr = IOConnectMapMemory64(
+        dev->conn, MLX_UC_MEM_TYPE(kind, index), mach_task_self(),
+        &addr, &size, options);
+    if (kr != kIOReturnSuccess) return NULL;
+    if (expect && size != (mach_vm_size_t)expect) {
+        (void)IOConnectUnmapMemory(dev->conn, MLX_UC_MEM_TYPE(kind, index),
+                                   mach_task_self(), addr);
+        return NULL;
+    }
+    return (void *)(uintptr_t)addr;
+}
+
+static void *rdma_uar_slot(rdma_device *dev, uint32_t slot)
+{
+    if (!dev || slot >= MLX_CLIENT_MAX_UAR) return NULL;
+    if (!dev->uar_map[slot])
+        dev->uar_map[slot] = rdma_map_pool_page(dev, kMlxUCMemKindUar, slot,
+                                                dev->uar_map_size,
+                                                dev->uar_map_options);
+    return dev->uar_map[slot];
+}
+
+static void *rdma_db_page(rdma_device *dev, uint32_t page)
+{
+    if (!dev || page >= MLX_CLIENT_MAX_DB_PAGES) return NULL;
+    if (!dev->db_map[page])
+        dev->db_map[page] = rdma_map_pool_page(dev, kMlxUCMemKindDbRecord,
+                                               page, dev->db_map_size,
+                                               kIOMapAnywhere);
+    return dev->db_map[page];
+}
+
+/* The register write and the toggle that follows it are one indivisible step:
+ * a second poster that reads the toggle before this one advances it aims its
+ * doorbell at the same half. Only QPs that share a register take the lock.
+ */
 static int rdma_blue_flame_post(rdma_qp *qp, const void *wqe, uint32_t bytes)
 {
     if (!qp || !wqe || bytes <= sizeof(uint64_t) || (bytes & 63u) ||
         !qp->bf_buf_size || bytes > qp->bf_buf_size)
         return 0;
-    volatile uint64_t *dst = (volatile uint64_t *)
-        ((uint8_t *)qp->dev->uar_map + qp->bf_offset + qp->bf_toggle);
     const uint8_t *src = (const uint8_t *)wqe;
-    rdma_mmio_flush();
-    for (uint32_t off = 0; off < bytes; off += sizeof(uint64_t)) {
-        uint64_t word;
-        memcpy(&word, src + off, sizeof(word));
-        dst[off / sizeof(uint64_t)] = word;
+    /* The private and shared cases are written out separately on purpose. A QP
+     * that owns its register runs exactly the code it ran before any of this
+     * existed: the toggle is a field, not a load through a pointer, and there
+     * is no lock. Folding the two together cost 0.25 us of post time for the
+     * common case, which is most of the post path. */
+    if (!qp->bf_lock) {
+        volatile uint64_t *dst =
+            (volatile uint64_t *)(qp->bf_reg + qp->bf_toggle);
+        rdma_mmio_flush();
+        for (uint32_t off = 0; off < bytes; off += sizeof(uint64_t)) {
+            uint64_t word;
+            memcpy(&word, src + off, sizeof(word));
+            dst[off / sizeof(uint64_t)] = word;
+        }
+        rdma_mmio_flush();
+        qp->bf_toggle ^= qp->bf_buf_size;
+    } else {
+        os_unfair_lock_lock(qp->bf_lock);
+        volatile uint64_t *dst =
+            (volatile uint64_t *)(qp->bf_reg + *qp->bf_togglep);
+        rdma_mmio_flush();
+        for (uint32_t off = 0; off < bytes; off += sizeof(uint64_t)) {
+            uint64_t word;
+            memcpy(&word, src + off, sizeof(word));
+            dst[off / sizeof(uint64_t)] = word;
+        }
+        rdma_mmio_flush();
+        *qp->bf_togglep ^= qp->bf_buf_size;
+        os_unfair_lock_unlock(qp->bf_lock);
     }
-    rdma_mmio_flush();
-    qp->bf_toggle ^= qp->bf_buf_size;
     rdma_stat_add(&qp->dev->stats.blue_flame_wqes, 1);
     return 1;
 }
 
 static void rdma_ring_send_doorbell(rdma_qp *qp, uint64_t doorbell)
 {
-    *(volatile uint64_t *)((uint8_t *)qp->dev->uar_map + qp->bf_offset +
-                          qp->bf_toggle) = doorbell;
-    /* The barrier has to match the mapping, and the mapping follows blue
-     * flame: with it the UAR page is write-combining and the store can sit in
-     * a combining buffer, which only dsb pushes out; without it the page is
-     * Device memory, where the store is not buffered and dmb is both
-     * sufficient and materially cheaper on this hot path. */
+    /* Same split as the blue-flame post above, and for the same reason: a QP
+     * that owns its register pays nothing for the fact that sharing exists. */
+    if (!qp->bf_lock) {
+        *(volatile uint64_t *)(qp->bf_reg + qp->bf_toggle) = doorbell;
+        /* The barrier has to match the mapping, and the mapping follows blue
+         * flame: with it the UAR page is write-combining and the store can sit
+         * in a combining buffer, which only dsb pushes out; without it the
+         * page is Device memory, where the store is not buffered and dmb is
+         * both sufficient and materially cheaper on this hot path. */
+        if (qp->bf_buf_size) rdma_mmio_flush();
+        else                 rdma_dma_write_barrier();
+        if (qp->bf_buf_size)
+            qp->bf_toggle ^= qp->bf_buf_size;
+        return;
+    }
+    os_unfair_lock_lock(qp->bf_lock);
+    *(volatile uint64_t *)(qp->bf_reg + *qp->bf_togglep) = doorbell;
     if (qp->bf_buf_size) rdma_mmio_flush();
     else                 rdma_dma_write_barrier();
     if (qp->bf_buf_size)
-        qp->bf_toggle ^= qp->bf_buf_size;
+        *qp->bf_togglep ^= qp->bf_buf_size;
+    os_unfair_lock_unlock(qp->bf_lock);
+}
+
+/* Resolve the register this QP posts through. A QP the driver reported as
+ * sharing gets the register's own toggle and its lock; every other QP keeps
+ * the private toggle it already had and no lock at all. Falling back to the
+ * private toggle when the table is full is deliberate: it is what the code did
+ * before this existed, so a full table is no worse than yesterday. */
+static void rdma_bf_bind(rdma_qp *qp)
+{
+    qp->bf_togglep = &qp->bf_toggle;
+    qp->bf_lock = NULL;
+    if (!qp->bf_shared || !qp->dev) return;
+    os_unfair_lock_lock(&qp->dev->bf_table_lock);
+    struct rdma_bf_reg *free_slot = NULL;
+    for (uint32_t i = 0; i < RDMA_BF_REG_SLOTS; i++) {
+        struct rdma_bf_reg *r = &qp->dev->bf_regs[i];
+        if (r->in_use && r->offset == qp->bf_offset) {
+            qp->bf_togglep = &r->toggle;
+            qp->bf_lock = &r->lock;
+            os_unfair_lock_unlock(&qp->dev->bf_table_lock);
+            return;
+        }
+        if (!r->in_use && !free_slot) free_slot = r;
+    }
+    if (free_slot) {
+        free_slot->in_use = 1;
+        free_slot->offset = qp->bf_offset;
+        /* Seed from the QP so the first shared post continues the alternation
+         * this register was already on rather than restarting it. */
+        free_slot->toggle = qp->bf_toggle;
+        qp->bf_togglep = &free_slot->toggle;
+        qp->bf_lock = &free_slot->lock;
+    }
+    os_unfair_lock_unlock(&qp->dev->bf_table_lock);
 }
 
 static inline uint32_t rdma_qpn_hash(uint32_t qpn)
@@ -249,12 +409,14 @@ static rdma_cq *rdma_find_cq_token(rdma_device *dev, uint32_t token)
  * safe: the rest of the 128-byte slot is otherwise zeroed and unused. */
 static inline void rdma_qp_publish_shadow_force(rdma_qp *qp)
 {
-    if (!qp || !qp->dev || !qp->dev->db_map ||
-        (uint64_t)qp->db_record_offset + MLX_QP_SHADOW_OFFSET +
-            sizeof(struct mlx_qp_shadow) > qp->dev->db_map_size)
+    if (!qp || !qp->dev || !qp->db_rec ||
+        (uint64_t)mlxFlatWithin(qp->db_record_offset,
+                                MLX_CLIENT_DB_PAGE_SIZE) +
+            MLX_QP_SHADOW_OFFSET + sizeof(struct mlx_qp_shadow) >
+                qp->dev->db_map_size)
         return;
     struct mlx_qp_shadow *sh = (struct mlx_qp_shadow *)
-        ((uint8_t *)qp->dev->db_map + qp->db_record_offset + MLX_QP_SHADOW_OFFSET);
+        (qp->db_rec + MLX_QP_SHADOW_OFFSET);
     /* Seqlock write side.  post (worker thread) and poll (recv thread) can
      * publish the same QP concurrently, so the sequence must be acquired with
      * a CAS, not a load-then-store: two racers would otherwise interleave
@@ -420,18 +582,7 @@ rdma_device *rdma_open_device_by_name(const char *name)
 void rdma_close_device(rdma_device *dev)
 {
     if (!dev) return;
-    if (dev->uar_map) {
-        IOConnectUnmapMemory(dev->conn,
-                             MLX_UC_MEM_TYPE(kMlxUCMemKindUar, 0),
-                             mach_task_self(), (mach_vm_address_t)dev->uar_map);
-        dev->uar_map = NULL;
-    }
-    if (dev->db_map) {
-        IOConnectUnmapMemory(dev->conn,
-                             MLX_UC_MEM_TYPE(kMlxUCMemKindDbRecord, 0),
-                             mach_task_self(), (mach_vm_address_t)dev->db_map);
-        dev->db_map = NULL;
-    }
+    rdma_unmap_fast_path(dev);
     if (dev->conn) IOServiceClose(dev->conn);
     free(dev);
 }
@@ -483,9 +634,15 @@ int rdma_enable_fast_path(rdma_device *dev, struct rdma_fast_path *path)
     size_t out = sizeof(resp);
     kern_return_t kr = IOConnectCallStructMethod(
         dev->conn, kMlxUCMethodEnableFastPath, NULL, 0, &resp, &out);
+    /* The UAR page is whatever geometry the driver negotiated with firmware,
+     * so accept any whole number of 4 KiB adapter pages up to a host page
+     * rather than the 4 KiB this used to demand. The exact value still has to
+     * match what the kernel actually maps, which rdma_map_fast_path checks.
+     * dbPageSize is host memory the driver allocates and stays 4 KiB. */
     if (kr != kIOReturnSuccess || out != sizeof(resp) ||
         resp.version != MLX_FAST_PATH_ABI_VERSION ||
-        resp.uarPageSize != 4096 || resp.dbPageSize != 4096)
+        !resp.uarPageSize || (resp.uarPageSize & 4095u) ||
+        resp.uarPageSize > 65536u || resp.dbPageSize != 4096)
         return -EIO;
     memset(path, 0, sizeof(*path));
     path->version = resp.version;
@@ -498,45 +655,24 @@ int rdma_map_fast_path(rdma_device *dev, struct rdma_fast_path *path)
 {
     if (!dev || !path || path->version != MLX_FAST_PATH_ABI_VERSION)
         return -EINVAL;
-    mach_vm_address_t uar = 0, db = 0;
-    mach_vm_size_t uar_size = 0, db_size = 0;
-    IOOptionBits uar_options = kIOMapAnywhere;
     /* Write-combining is what makes a 64-byte doorbell write worth doing, so
      * it follows blue flame. Measured on ConnectX-4 Lx behind Thunderbolt
      * Gen3 x4: p50 8.4 -> 6.0 us end to end and 2.1 -> 0.6 us on the post
      * itself, reproducible across three runs. Default on; MELONDMA_BLUE_FLAME=0
-     * is the kill switch. */
+     * is the kill switch. Every UAR page of this client is mapped the same
+     * way, so a QP that lands on a later page keeps the same doorbell cost. */
+    dev->uar_map_options = kIOMapAnywhere;
     if ((dev->abi_features & RDMA_FEATURE_BLUE_FLAME) &&
         rdma_env_default_on("MELONDMA_BLUE_FLAME"))
-        uar_options |= kIOMapWriteCombineCache;
-    kern_return_t kr = IOConnectMapMemory64(
-        dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindUar, 0), mach_task_self(),
-        &uar, &uar_size, uar_options);
-    if (kr != kIOReturnSuccess) return -EIO;
-    kr = IOConnectMapMemory64(
-        dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindDbRecord, 0),
-        mach_task_self(), &db, &db_size, kIOMapAnywhere);
-    if (kr != kIOReturnSuccess) {
-        (void)IOConnectUnmapMemory(
-            dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindUar, 0),
-            mach_task_self(), uar);
+        dev->uar_map_options |= kIOMapWriteCombineCache;
+    dev->uar_map_size = path->uar_page_size;
+    dev->db_map_size = path->db_page_size;
+    if (!rdma_uar_slot(dev, 0) || !rdma_db_page(dev, 0)) {
+        rdma_unmap_fast_path(dev);
         return -EIO;
     }
-    if (uar_size != path->uar_page_size || db_size != path->db_page_size) {
-        (void)IOConnectUnmapMemory(
-            dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindUar, 0),
-            mach_task_self(), uar);
-        (void)IOConnectUnmapMemory(
-            dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindDbRecord, 0),
-            mach_task_self(), db);
-        return -EPROTO;
-    }
-    dev->uar_map = (void *)(uintptr_t)uar;
-    dev->uar_map_size = (size_t)uar_size;
-    dev->db_map = (void *)(uintptr_t)db;
-    dev->db_map_size = (size_t)db_size;
-    path->uar = dev->uar_map;
-    path->db_record = dev->db_map;
+    path->uar = dev->uar_map[0];
+    path->db_record = dev->db_map[0];
     return 0;
 }
 
@@ -564,20 +700,22 @@ int rdma_qp_trusted_fast_path(const rdma_qp *qp)
 void rdma_unmap_fast_path(rdma_device *dev)
 {
     if (!dev) return;
-    if (dev->uar_map) {
+    for (uint32_t i = 0; i < MLX_CLIENT_MAX_UAR; i++) {
+        if (!dev->uar_map[i]) continue;
         (void)IOConnectUnmapMemory(
-            dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindUar, 0),
-            mach_task_self(), (mach_vm_address_t)dev->uar_map);
-        dev->uar_map = NULL;
-        dev->uar_map_size = 0;
+            dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindUar, i),
+            mach_task_self(), (mach_vm_address_t)dev->uar_map[i]);
+        dev->uar_map[i] = NULL;
     }
-    if (dev->db_map) {
+    for (uint32_t i = 0; i < MLX_CLIENT_MAX_DB_PAGES; i++) {
+        if (!dev->db_map[i]) continue;
         (void)IOConnectUnmapMemory(
-            dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindDbRecord, 0),
-            mach_task_self(), (mach_vm_address_t)dev->db_map);
-        dev->db_map = NULL;
-        dev->db_map_size = 0;
+            dev->conn, MLX_UC_MEM_TYPE(kMlxUCMemKindDbRecord, i),
+            mach_task_self(), (mach_vm_address_t)dev->db_map[i]);
+        dev->db_map[i] = NULL;
     }
+    dev->uar_map_size = 0;
+    dev->db_map_size = 0;
 }
 
 /* ---- query ---- */
@@ -675,6 +813,7 @@ int rdma_query_perf(rdma_device *dev, struct rdma_perf *perf)
     perf->cq_events = resp.cqEvents;
     perf->fw_commands = resp.fwCommands;
     perf->fw_command_sleeps = resp.fwCommandSleeps;
+    perf->fw_command_slot_waits = resp.fwCommandSlotWaits;
     perf->cq_event_wakeups = resp.cqEventWakeups;
     return 0;
 }
@@ -731,6 +870,9 @@ int rdma_query_device(rdma_device *dev, struct rdma_device_attr *attr)
     attr->max_inline_data = resp.maxInlineData;
     attr->max_qp_rd_atom = resp.maxQpRdAtomic;
     attr->max_qp_init_rd_atom = resp.maxQpInitRdAtomic;
+    attr->node_guid = resp.nodeGuid;
+    attr->port_guid = resp.portGuid;
+    attr->sys_image_guid = resp.sysImageGuid;
     return 0;
 }
 
@@ -773,6 +915,11 @@ int rdma_query_interrupts(rdma_device *dev, struct rdma_interrupt_attr *attr)
         attr->index_kind[i] = resp.indexKind[i];
         attr->index_kind_pre[i] = resp.indexKindPre[i];
         attr->index_type_raw[i] = resp.indexTypeRaw[i];
+        attr->index_bind[i] = resp.indexBind[i];
+    }
+    attr->completion_eq_count = resp.completionEqCount;
+    for (unsigned i = 0; i < RDMA_IRQ_COMP_EQ_MAX; i++) {
+        attr->completion_irq_by_eq[i] = resp.completionIrqByEq[i];
     }
     return 0;
 }
@@ -806,6 +953,10 @@ int rdma_query_limits(rdma_device *dev, struct rdma_limits *limits)
     limits->max_sge = resp.maxSge;
     limits->pcie_link_speed = resp.pcieLinkSpeed;
     limits->pcie_link_width = resp.pcieLinkWidth;
+    limits->cache_line_128 = resp.cacheLine128;
+    limits->log_uar_page_sz = resp.logUarPageSz;
+    memcpy(limits->board_id, resp.boardId, sizeof(resp.boardId));
+    limits->board_id[sizeof(limits->board_id) - 1] = '\0';
     return 0;
 }
 
@@ -1082,6 +1233,93 @@ int rdma_query_health(rdma_device *dev, struct rdma_health_attr *attr)
     attr->owned_cq = resp.ownedCq;
     attr->owned_mr = resp.ownedMr;
     attr->owned_ah = resp.ownedAh;
+    for (int i = 0; i < 6; i++) attr->assert_var[i] = resp.assertVar[i];
+    attr->assert_exit_ptr = resp.assertExitPtr;
+    attr->assert_callra = resp.assertCallra;
+    attr->health_time = resp.healthTime;
+    attr->fw_ver = resp.fwVer;
+    attr->hw_id = resp.hwId;
+    attr->rfr_severity = resp.rfrSeverity;
+    attr->irisc_index = resp.iriscIndex;
+    attr->device_removed = resp.deviceRemoved;
+    return 0;
+}
+
+int rdma_query_hca_clock(rdma_device *dev, struct rdma_hca_clock *clock)
+{
+    if (!dev || !clock) return -EINVAL;
+    struct mlx_hca_clock_resp resp = {};
+    size_t out = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodQueryHcaClock, NULL, 0, &resp, &out);
+    if (kr == kIOReturnUnsupported) return -ENOTSUP;
+    if (kr == kIOReturnBadArgument) return -EINVAL;
+    if (kr != kIOReturnSuccess || out != sizeof(resp)) return -EIO;
+    clock->ticks = resp.ticks;
+    clock->host_uptime_ns = resp.hostUptimeNs;
+    clock->frequency_khz = resp.frequencyKhz;
+    return 0;
+}
+
+int rdma_query_q_counters(rdma_device *dev, uint32_t counter_set_id, int clear,
+                          struct rdma_q_counters *counters)
+{
+    if (!dev || !counters) return -EINVAL;
+    struct mlx_q_counters_req req = { .counterSetId = counter_set_id,
+                                      .clear = clear ? 1u : 0u };
+    struct mlx_q_counters_resp resp = {};
+    size_t out = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodQueryQCounters, &req, sizeof(req), &resp, &out);
+    /* Only a genuinely absent selector is ENOTSUP. Folding BadArgument in as
+     * well printed "not supported by this DEXT" for a firmware BAD_PARAM,
+     * which sent the search in the wrong direction for one deploy. */
+    if (kr == kIOReturnUnsupported) return -ENOTSUP;
+    if (kr == kIOReturnBadArgument) return -EINVAL;
+    if (kr != kIOReturnSuccess || out != sizeof(resp)) return -EIO;
+    counters->rx_write_requests       = resp.rxWriteRequests;
+    counters->rx_read_requests        = resp.rxReadRequests;
+    counters->rx_atomic_requests      = resp.rxAtomicRequests;
+    counters->out_of_buffer           = resp.outOfBuffer;
+    counters->out_of_sequence         = resp.outOfSequence;
+    counters->duplicate_request       = resp.duplicateRequest;
+    counters->rnr_nak_retry_err       = resp.rnrNakRetryErr;
+    counters->packet_seq_err          = resp.packetSeqErr;
+    counters->implied_nak_seq_err     = resp.impliedNakSeqErr;
+    counters->local_ack_timeout_err   = resp.localAckTimeoutErr;
+    counters->req_rnr_retries_exceeded = resp.reqRnrRetriesExceeded;
+    counters->resp_local_length_error = resp.respLocalLengthError;
+    counters->req_local_length_error  = resp.reqLocalLengthError;
+    counters->local_operation_error   = resp.localOperationError;
+    counters->resp_cqe_error          = resp.respCqeError;
+    counters->req_cqe_error           = resp.reqCqeError;
+    return 0;
+}
+
+int rdma_query_cong_stats(rdma_device *dev, uint32_t priority, int clear,
+                          struct rdma_cong_stats *stats)
+{
+    if (!dev || !stats || priority > 7) return -EINVAL;
+    struct mlx_cc_stats_req req = { .priority = priority,
+                                    .clear = clear ? 1u : 0u };
+    struct mlx_cc_stats_resp resp = {};
+    size_t out = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodCCStats, &req, sizeof(req), &resp, &out);
+    if (kr == kIOReturnUnsupported || kr == kIOReturnBadArgument)
+        return -ENOTSUP;
+    if (kr != kIOReturnSuccess || out != sizeof(resp)) return -EIO;
+    memset(stats, 0, sizeof(*stats));
+    stats->enable = resp.enable;
+    stats->tag_enable = resp.tagEnable;
+    stats->rp_cnp_ignored = resp.rpCnpIgnored;
+    stats->rp_cnp_handled = resp.rpCnpHandled;
+    stats->np_ecn_marked_roce_packets = resp.npEcnMarkedRocePackets;
+    stats->np_cnp_sent = resp.npCnpSent;
+    stats->time_stamp = resp.timeStamp;
+    stats->rp_cur_flows = resp.rpCurFlows;
+    stats->sum_flows = resp.sumFlows;
+    stats->accumulators_period = resp.accumulatorsPeriod;
     return 0;
 }
 
@@ -1141,7 +1379,13 @@ int rdma_query_port(rdma_device *dev, struct rdma_port_attr *attr)
     attr->port_state     = resp.portState;
     attr->gid_type       = resp.gidType;
     attr->active_speed_mbps = resp.activeSpeed;
+    attr->link_speed_mbps   = resp.linkSpeedMbps;
     attr->max_mtu        = resp.maxMtu;
+    attr->pause_tx       = resp.pauseTx;
+    attr->pause_rx       = resp.pauseRx;
+    attr->pfc_tx_mask    = resp.pfcTxMask;
+    attr->pfc_rx_mask    = resp.pfcRxMask;
+    attr->pfc_prio_mask  = resp.pfcPrioMask;
     attr->gid_tbl_len    = resp.gidTblLen;
     attr->pkey_tbl_len   = resp.pkeyTblLen;
     return 0;
@@ -1232,6 +1476,17 @@ rdma_cq *rdma_create_cq(rdma_device *dev, uint32_t cqe_depth)
         cq->consumer_batch = cq->depth / 4u;
     if (!cq->consumer_batch) cq->consumer_batch = 1;
     cq->db_record_offset = resp.dbRecordOffset;
+    /* The offset is flat across this client's doorbell pages: divide for the
+     * page, take the remainder inside it. The page is mapped on first use. */
+    {
+        const uint32_t page = mlxFlatPage(resp.dbRecordOffset,
+                                          MLX_CLIENT_DB_PAGE_SIZE);
+        const uint32_t within = mlxFlatWithin(resp.dbRecordOffset,
+                                              MLX_CLIENT_DB_PAGE_SIZE);
+        uint8_t *base = (uint8_t *)rdma_db_page(cq->dev, page);
+        if (base && within + sizeof(uint32_t) <= cq->dev->db_map_size)
+            cq->db_rec = base + within;
+    }
     mach_vm_address_t cqe = 0;
     mach_vm_size_t cqe_size = 0;
     kr = IOConnectMapMemory64(
@@ -1292,10 +1547,8 @@ static void rdma_publish_cq_consumer(rdma_cq *cq, int force)
     if (!force && pending < cq->consumer_batch &&
         pending < (cq->depth > 4 ? cq->depth / 4u : 1u))
         return;
-    if (cq->dev->db_map &&
-        cq->db_record_offset + sizeof(uint32_t) <= cq->dev->db_map_size) {
-        volatile uint32_t *db = (volatile uint32_t *)
-            ((uint8_t *)cq->dev->db_map + cq->db_record_offset);
+    if (cq->db_rec) {
+        volatile uint32_t *db = (volatile uint32_t *)(cq->db_rec);
         rdma_dma_write_barrier();
         db[0] = __builtin_bswap32(cq->consumer_index & 0xffffffu);
         cq->published_consumer_index = cq->consumer_index;
@@ -1510,6 +1763,17 @@ static int rdma_poll_cq_direct(rdma_cq *cq, struct rdma_wc *wc, int num)
                  opcode == MLX_CQE_RESP_SEND_IMM)) {
                 out->imm_data = e->imm_inval_pkey;   /* network byte order, as DEXT */
                 out->wc_flags |= RDMA_WC_WITH_IMM;
+            } else if (!error_cqe && opcode == MLX_CQE_RESP_SEND_INV) {
+                out->imm_data = __builtin_bswap32(e->imm_inval_pkey);
+                out->wc_flags |= RDMA_WC_WITH_INV;
+            }
+            /* Scatter-to-CQE (DATA32): the <=32-byte payload is in the CQE
+             * bytes 0..31, not the receive buffer. Copy it to the first recv
+             * SGE so the caller finds the data where it posted it. */
+            if (!error_cqe && (e->op_own & MLX_CQE_INLINE_SCATTER_32) &&
+                out->byte_len && out->byte_len <= 32 && qp->rq_sge_addr) {
+                void *dst = (void *)(uintptr_t)qp->rq_sge_addr[idx];
+                if (dst) memcpy(dst, (const void *)e, out->byte_len);
             }
             uint64_t done = (qp->rq_head & ~0xffffULL) | counter;
             if (done > qp->rq_head) done -= 0x10000ULL;
@@ -1767,10 +2031,14 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
         (pd->dev->abi_features & RDMA_FEATURE_TRUSTED_FAST_PATH) != 0 &&
         rdma_env_default_on("MELONDMA_DIRECT_UAR") &&
         rdma_env_default_on("MELONDMA_DIRECT_CQ") &&
-        pd->dev->uar_map && pd->dev->db_map &&
+        pd->dev->uar_map[0] && pd->dev->db_map[0] &&
         init->send_cq->cqe_buf && init->recv_cq->cqe_buf &&
         !(trusted_env && strcmp(trusted_env, "0") == 0);
     req.rsvd = want_trusted ? MLX_UC_QP_TRUSTED : 0;
+    /* Scatter-to-CQE opt-in for the loopback gate: the byte-exact check in
+     * mlx_rtt_bench proves the scattered receive payload is copied back. */
+    if (getenv("MELONDMA_SCATTER_CQE"))
+        req.rsvd |= MLX_UC_QP_SCATTER_CQE;
     struct mlx_create_qp_resp resp = {};
     size_t out = sizeof(resp);
     kern_return_t kr = IOConnectCallStructMethod(
@@ -1795,6 +2063,7 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
     qp->qpn = resp.qpn; qp->hw_qpn = resp.hwQpn; qp->state = RDMA_QPS_RESET;
     qp->srqn = init->srqn;
     qp->is_ud = (init->qp_type == RDMA_QPT_UD);
+    qp->is_uc = (init->qp_type == RDMA_QPT_UC);
     if (init->srqn || init->qp_type == RDMA_QPT_UD) {
         /* One owner for this pair's state. A datagram posts through the driver
          * because its address vector lives there, so its completions must be
@@ -1812,8 +2081,9 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
     qp->sq_atomic_result = calloc(qp->sq_size,
                                    sizeof(*qp->sq_atomic_result));
     qp->rq_wrid = calloc(qp->rq_size, sizeof(*qp->rq_wrid));
+    qp->rq_sge_addr = calloc(qp->rq_size, sizeof(*qp->rq_sge_addr));
     if (!qp->sq_wrid || !qp->sq_opcode || !qp->sq_span ||
-        !qp->sq_atomic_result || !qp->rq_wrid) {
+        !qp->sq_atomic_result || !qp->rq_wrid || !qp->rq_sge_addr) {
         (void)IOConnectCallStructMethod(pd->dev->conn,
                                         kMlxUCMethodDestroyQP,
                                         &resp.qpn, sizeof(resp.qpn), NULL, 0);
@@ -1822,6 +2092,7 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
         free(qp->sq_span);
         free(qp->sq_atomic_result);
         free(qp->rq_wrid);
+        free(qp->rq_sge_addr);
         free(qp);
         return NULL;
     }
@@ -1840,15 +2111,36 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
                  resp.qpn, resp.bfOffset);
     qp->db_record_offset = resp.dbRecordOffset;
     qp->sq_stride = resp.sqStrideSize;
+    /* Both offsets are flat across this client's pools. Resolve each once
+     * here, mapping the page if this is the first QP to land on it, so the
+     * post path adds no indirection at all. */
+    {
+        const uint32_t uarPageSize = (uint32_t)pd->dev->uar_map_size;
+        const uint32_t uarSlot = mlxFlatPage(resp.bfOffset, uarPageSize);
+        const uint32_t bfWithin = mlxFlatWithin(resp.bfOffset, uarPageSize);
+        uint8_t *uarBase = (uint8_t *)rdma_uar_slot(pd->dev, uarSlot);
+        if (uarBase && bfWithin + sizeof(uint64_t) <= pd->dev->uar_map_size)
+            qp->bf_reg = uarBase + bfWithin;
+        const uint32_t dbPage = mlxFlatPage(resp.dbRecordOffset,
+                                            MLX_CLIENT_DB_PAGE_SIZE);
+        const uint32_t dbWithin = mlxFlatWithin(resp.dbRecordOffset,
+                                                MLX_CLIENT_DB_PAGE_SIZE);
+        uint8_t *dbBase = (uint8_t *)rdma_db_page(pd->dev, dbPage);
+        if (dbBase && dbWithin + 8 <= pd->dev->db_map_size)
+            qp->db_rec = dbBase + dbWithin;
+    }
+    rdma_bf_bind(qp);
+    /* On by default, matching rdma-core's mlx5 provider and the contract the
+     * libibverbs layer here advertises. A caller that serialises its own posts
+     * can take the last nanoseconds back. */
+    qp->post_serialize = rdma_env_default_on("MELONDMA_SERIALIZE_POST");
 
     /* Direct SQ is capability-driven and enabled by default when the DEXT
      * returned the exact isolated mapping contract. Mapping failure remains a
      * transparent compatibility fallback. */
-    if (rdma_env_default_on("MELONDMA_DIRECT_UAR") && pd->dev->uar_map &&
-        pd->dev->db_map && resp.mappingVersion == MLX_FAST_PATH_ABI_VERSION &&
-        resp.sqStrideSize == 64 && resp.bfOffset + sizeof(uint64_t) <=
-        pd->dev->uar_map_size && resp.dbRecordOffset + 8 <=
-        pd->dev->db_map_size) {
+    if (rdma_env_default_on("MELONDMA_DIRECT_UAR") && qp->bf_reg && qp->db_rec &&
+        resp.mappingVersion == MLX_FAST_PATH_ABI_VERSION &&
+        resp.sqStrideSize == 64) {
         mach_vm_address_t sq = 0;
         mach_vm_size_t sq_size = 0;
         kern_return_t mapkr = IOConnectMapMemory64(
@@ -1863,7 +2155,9 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
              * what this whole design avoids, so such a pair posts through the
              * driver where the encoder already is. The receive ring is still
              * mapped: only the send side needs the vector. */
-            qp->direct_sq = (init->qp_type == RDMA_QPT_UD) ? 0 : 1;
+            /* UC stays on the validated kernel posting path until its own
+             * direct-WQE gate exists; it must never inherit RC READ/atomic. */
+            qp->direct_sq = (init->qp_type == RDMA_QPT_RC) ? 1 : 0;
             mach_vm_address_t rq = 0;
             mach_vm_size_t rq_size = 0;
             kern_return_t rqkr = IOConnectMapMemory64(
@@ -1888,7 +2182,9 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
             if (!(pd->dev->abi_features & RDMA_FEATURE_BLUE_FLAME) ||
                 !rdma_env_default_on("MELONDMA_BLUE_FLAME") ||
                 !qp->bf_buf_size || qp->bf_buf_size > 2048u ||
-                resp.bfOffset + 2u * qp->bf_buf_size > pd->dev->uar_map_size)
+                (size_t)mlxFlatWithin(resp.bfOffset,
+                                      (uint32_t)pd->dev->uar_map_size) +
+                    2u * qp->bf_buf_size > pd->dev->uar_map_size)
                 qp->bf_buf_size = 0;
             SHIM_LOG("QP[%u] direct SQ mapped size=%llu uar=%u bf=0x%x bf_buf=%u db=0x%x",
                      qp->qpn, (unsigned long long)sq_size, resp.uarPage,
@@ -1905,7 +2201,7 @@ rdma_qp *rdma_create_qp(rdma_pd *pd, const struct rdma_qp_init_attr *init)
     } else {
         SHIM_LOG("QP[%u] direct SQ skipped: uar=%p db=%p mappingVersion=%u "
                  "stride=%u bfOffset=0x%x dbOffset=0x%x uar_size=%zu db_size=%zu",
-                 resp.qpn, pd->dev->uar_map, pd->dev->db_map,
+                 resp.qpn, pd->dev->uar_map[0], pd->dev->db_map[0],
                  resp.mappingVersion, resp.sqStrideSize, resp.bfOffset,
                  resp.dbRecordOffset, pd->dev->uar_map_size,
                  pd->dev->db_map_size);
@@ -1936,6 +2232,8 @@ int rdma_destroy_qp(rdma_qp *qp)
         if (rdma_modify_qp(qp, &reset) != 0) return -EBUSY;
         qp->sq_tail = qp->sq_head;
         qp->rq_tail = qp->rq_head;
+        if (rdma_sync_qp_tails(qp, qp->sq_tail, qp->rq_tail) != 0)
+            return -EBUSY;
         if (qp->sq_span) memset(qp->sq_span, 0, qp->sq_size);
         rdma_qp_publish_shadow_force(qp);
     }
@@ -1987,6 +2285,7 @@ int rdma_destroy_qp(rdma_qp *qp)
     free(qp->sq_span);
     free(qp->sq_atomic_result);
     free(qp->rq_wrid);
+    free(qp->rq_sge_addr);
     free(qp);
     return 0;
 }
@@ -2196,6 +2495,22 @@ int rdma_set_roce_address_vlan(rdma_device *dev, const uint8_t gid[16],
                                         &index, sizeof(index), NULL, 0);
     }
     return -EIO;
+}
+
+int rdma_query_cap_regs(rdma_device *dev, struct rdma_cap_regs *caps)
+{
+    if (!dev || !caps) return -EINVAL;
+    struct mlx_query_cap_regs_resp resp = {};
+    size_t out = sizeof(resp);
+    kern_return_t kr = IOConnectCallStructMethod(
+        dev->conn, kMlxUCMethodQueryCapRegs, NULL, 0, &resp, &out);
+    if (kr != kIOReturnSuccess || out != sizeof(resp)) return -EIO;
+    caps->version = resp.version;
+    caps->valid_mask = resp.validMask;
+    memcpy(caps->pcam, resp.pcam, sizeof(caps->pcam));
+    memcpy(caps->mcam, resp.mcam, sizeof(caps->mcam));
+    memcpy(caps->qcam, resp.qcam, sizeof(caps->qcam));
+    return 0;
 }
 
 int rdma_query_port_stats(rdma_device *dev, struct rdma_port_stats *stats)
@@ -2500,7 +2815,7 @@ int rdma_dbg_exec(rdma_device *dev, uint32_t opcode, const void *in,
     size_t outsz = sizeof(resp);
     kern_return_t kr = IOConnectCallStructMethod(
         dev->conn, kMlxUCMethodDbgExec, &req, sizeof(req), &resp, &outsz);
-    /* DbgsExec sits behind the com.mlx5.rdma.diagnostic entitlement; a
+    /* DbgsExec sits behind the com.melondma.rdma.diagnostic entitlement; a
      * refusal is a client-permission answer, not a firmware verdict, and the
      * caller must be able to tell the two apart. */
     if (kr == kIOReturnNotPermitted) return -EPERM;
@@ -2700,7 +3015,7 @@ static int rdma_post_send_direct(rdma_qp *qp,
     const char *batch_env = getenv("MELONDMA_POST_BATCH");
     if (batch_env && strcmp(batch_env, "16") == 0) post_chunk = 16;
     if (!qp || !wr || !qp->direct_sq || !qp->sq_buf ||
-        !qp->dev->uar_map || !qp->dev->db_map || !count ||
+        !qp->dev->uar_map[0] || !qp->dev->db_map[0] || !count ||
         count > post_chunk || qp->state != RDMA_QPS_RTS)
         return -EINVAL;
     /* The DEXT validates the same producer/consumer distance under its QP
@@ -2780,7 +3095,7 @@ static int rdma_post_send_direct(rdma_qp *qp,
 
     rdma_dma_write_barrier();
     volatile uint32_t *db = (volatile uint32_t *)
-        ((uint8_t *)qp->dev->db_map + qp->db_record_offset);
+        (qp->db_rec);
     db[1] = __builtin_bswap32((uint32_t)(head + count) & 0xffffu);
     rdma_dma_write_barrier();
 
@@ -2812,6 +3127,7 @@ static int rdma_post_send_direct_sge(rdma_qp *qp,
                      wr->opcode == RDMA_WR_RDMA_READ ? MLX_OPCODE_RDMA_READ :
                      wr->opcode == RDMA_WR_RDMA_WRITE_IMM ? MLX_OPCODE_RDMA_WRITE_IMM :
                      wr->opcode == RDMA_WR_SEND_IMM ? MLX_OPCODE_SEND_IMM :
+                     wr->opcode == RDMA_WR_SEND_INV ? MLX_OPCODE_SEND_INVAL :
                      wr->opcode == RDMA_WR_LOCAL_INV ? MLX_OPCODE_LOCAL_INVAL : MLX_OPCODE_SEND;
     struct MlxRcSge sges[RDMA_MAX_SGE] = {};
     for (uint32_t i = 0; i < (uint32_t)wr->num_sge; i++) {
@@ -2820,7 +3136,14 @@ static int rdma_post_send_direct_sge(rdma_qp *qp,
         sges[i].lkey = wr->sg_list[i].lkey;
     }
     uint8_t flat[256] = {};
-    uint32_t ds = (opcode == MLX_OPCODE_SEND_IMM || opcode == MLX_OPCODE_RDMA_WRITE_IMM) ?
+    uint32_t ds = opcode == MLX_OPCODE_SEND_INVAL ?
+        mlxEncodeRcSendInvalidateWqe(flat, sizeof(flat), qp->hw_qpn,
+                                     (uint16_t)qp->sq_head, sges,
+                                     (uint32_t)wr->num_sge, wr->rkey,
+                                     (wr->send_flags & RDMA_SEND_SIGNALED) != 0,
+                                     (wr->send_flags & RDMA_SEND_FENCE) != 0,
+                                     (wr->send_flags & RDMA_SEND_SOLICITED) != 0) :
+        (opcode == MLX_OPCODE_SEND_IMM || opcode == MLX_OPCODE_RDMA_WRITE_IMM) ?
         mlxEncodeRcSendWqeImm(flat, sizeof(flat), qp->hw_qpn, (uint16_t)qp->sq_head,
                                opcode, sges, (uint32_t)wr->num_sge,
                                wr->remote_addr, wr->rkey, wr->imm_data,
@@ -2866,7 +3189,7 @@ static int rdma_post_send_direct_sge(rdma_qp *qp,
     }
     rdma_dma_write_barrier();
     volatile uint32_t *db = (volatile uint32_t *)
-        ((uint8_t *)qp->dev->db_map + qp->db_record_offset);
+        (qp->db_rec);
     db[1] = __builtin_bswap32((uint32_t)(qp->sq_head + span) & 0xffffu);
     rdma_dma_write_barrier();
     uint64_t doorbell = 0; memcpy(&doorbell, flat, sizeof(doorbell));
@@ -2888,7 +3211,7 @@ static int rdma_post_send_direct_mixed(rdma_qp *qp,
 {
     if (!qp || !wr || !count || count > RDMA_POST_CHUNK ||
         !qp->direct_sq || !qp->trusted_fast_path || !qp->sq_buf ||
-        !qp->dev->uar_map || !qp->dev->db_map || qp->state != RDMA_QPS_RTS)
+        !qp->dev->uar_map[0] || !qp->dev->db_map[0] || qp->state != RDMA_QPS_RTS)
         return -EINVAL;
 
     uint8_t spans[RDMA_POST_CHUNK];
@@ -3041,7 +3364,7 @@ static int rdma_post_send_direct_mixed(rdma_qp *qp,
 
     rdma_dma_write_barrier();
     volatile uint32_t *db = (volatile uint32_t *)
-        ((uint8_t *)qp->dev->db_map + qp->db_record_offset);
+        (qp->db_rec);
     db[1] = __builtin_bswap32((uint32_t)producer & 0xffffu);
     rdma_dma_write_barrier();
     if (!(count == 1 && qp->bf_buf_size &&
@@ -3056,7 +3379,7 @@ static int rdma_post_send_direct_mixed(rdma_qp *qp,
     return 0;
 }
 
-int rdma_post_local_inv(rdma_qp *qp, uint64_t wr_id, uint32_t rkey)
+static int rdma_post_local_inv_unlocked(rdma_qp *qp, uint64_t wr_id, uint32_t rkey)
 {
     if (!qp || !rkey) return -EINVAL;
     /* LOCAL_INV mutates the DEXT-owned MR table. Reconcile the trusted shadow
@@ -3083,7 +3406,7 @@ int rdma_post_local_inv(rdma_qp *qp, uint64_t wr_id, uint32_t rkey)
     return kr == kIOReturnSuccess ? 0 : (kr == kIOReturnBusy ? -EAGAIN : -EIO);
 }
 
-int rdma_post_send_inline(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
+static int rdma_post_send_inline_unlocked(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
                           const void *data, uint32_t len,
                           uint64_t remote_addr, uint32_t rkey,
                           uint32_t imm_data, uint32_t send_flags)
@@ -3114,7 +3437,7 @@ int rdma_post_send_inline(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
         MLX_UC_SEND_INLINE;
 
     if (qp->direct_sq && qp->trusted_fast_path && qp->sq_buf &&
-        qp->dev->uar_map && qp->dev->db_map && qp->state == RDMA_QPS_RTS) {
+        qp->dev->uar_map[0] && qp->dev->db_map[0] && qp->state == RDMA_QPS_RTS) {
         uint8_t flat[MLX_WQE_MAX_INLINE + 64] = {};
         uint64_t head = qp->sq_head;
         uint32_t ds = mlxEncodeRcInlineWqe(
@@ -3137,7 +3460,7 @@ int rdma_post_send_inline(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
         qp->sq_span[idx] = (uint8_t)span;
         rdma_dma_write_barrier();
         volatile uint32_t *db = (volatile uint32_t *)
-            ((uint8_t *)qp->dev->db_map + qp->db_record_offset);
+            (qp->db_rec);
         db[1] = __builtin_bswap32((uint32_t)(head + span) & 0xffffu);
         rdma_dma_write_barrier();
         if (!rdma_blue_flame_post(qp, flat, span * 64u)) {
@@ -3191,19 +3514,19 @@ int rdma_post_send_inline(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
     return kr == kIOReturnSuccess ? 0 : (kr == kIOReturnBusy ? -EAGAIN : -EIO);
 }
 
-int rdma_post_send_atomic(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
+static int rdma_post_send_atomic_unlocked(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
                           uint64_t remote_addr, uint32_t rkey,
                           uint64_t compare, uint64_t swap_add,
                           uint64_t result_addr, uint32_t result_lkey,
                           uint32_t send_flags)
 {
-    if (!qp || !remote_addr || !rkey || (remote_addr & 7) ||
+    if (!qp || qp->is_uc || !remote_addr || !rkey || (remote_addr & 7) ||
         !result_addr || !result_lkey || (result_addr & 7) ||
         (opcode != RDMA_WR_ATOMIC_CS && opcode != RDMA_WR_ATOMIC_FA) ||
         (send_flags & ~RDMA_SEND_SIGNALED))
         return -EINVAL;
     if (qp->direct_sq && qp->trusted_fast_path && qp->sq_buf &&
-        qp->dev->uar_map && qp->dev->db_map && qp->state == RDMA_QPS_RTS) {
+        qp->dev->uar_map[0] && qp->dev->db_map[0] && qp->state == RDMA_QPS_RTS) {
         uint64_t head = qp->sq_head;
         if (head - qp->sq_tail + 1 > qp->sq_size) return -EAGAIN;
         uint8_t flat[64] = {};
@@ -3224,7 +3547,7 @@ int rdma_post_send_atomic(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
         qp->sq_atomic_result[idx] = result_addr;
         rdma_dma_write_barrier();
         volatile uint32_t *db = (volatile uint32_t *)
-            ((uint8_t *)qp->dev->db_map + qp->db_record_offset);
+            (qp->db_rec);
         db[1] = __builtin_bswap32((uint32_t)(head + 1) & 0xffffu);
         rdma_dma_write_barrier();
         uint64_t doorbell = 0;
@@ -3266,7 +3589,7 @@ int rdma_post_send_atomic(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
     return kr == kIOReturnSuccess ? 0 : (kr == kIOReturnBusy ? -EAGAIN : -EIO);
 }
 
-int rdma_post_send_sge(rdma_qp *qp, const struct rdma_send_wr *wr)
+static int rdma_post_send_sge_unlocked(rdma_qp *qp, const struct rdma_send_wr *wr)
 {
     int zero_write_imm = wr && wr->opcode == RDMA_WR_RDMA_WRITE_IMM &&
                          wr->num_sge == 0;
@@ -3276,8 +3599,13 @@ int rdma_post_send_sge(rdma_qp *qp, const struct rdma_send_wr *wr)
         wr->num_sge > RDMA_MAX_SGE || qp->direct_sq ||
         (wr->send_flags & ~(RDMA_SEND_SIGNALED | RDMA_SEND_FENCE |
                             RDMA_SEND_SOLICITED))) return -EINVAL;
+    /* The public shim keeps SEND_INV after the standard verbs opcodes.  The
+     * DriverKit ABI deliberately assigns it its own compact value, so never
+     * leak the public enum value through the user-client boundary. */
+    uint32_t ucOpcode = wr->opcode == RDMA_WR_SEND_INV ?
+                        MLX_UC_WR_SEND_INV : wr->opcode;
     struct mlx_post_send_sge_req req = {
-        .qpn = qp->qpn, .opcode = wr->opcode, .wrId = wr->wr_id,
+        .qpn = qp->qpn, .opcode = ucOpcode, .wrId = wr->wr_id,
         .numSge = wr->num_sge, .sendFlags = wr->send_flags,
         .remoteAddr = wr->remote_addr, .rkey = wr->rkey,
         .immData = wr->imm_data,
@@ -3296,14 +3624,108 @@ int rdma_post_send_sge(rdma_qp *qp, const struct rdma_send_wr *wr)
     return kr == kIOReturnSuccess ? 0 : (kr == kIOReturnBusy ? -EAGAIN : -EIO);
 }
 
+static int rdma_post_local_inv_unlocked(rdma_qp *qp, uint64_t wr_id, uint32_t rkey);
+static int rdma_post_send_inline_unlocked(rdma_qp *qp, uint64_t wr_id, uint32_t opcode, const void *data, uint32_t len, uint64_t remote_addr, uint32_t rkey, uint32_t imm_data, uint32_t send_flags);
+static int rdma_post_send_atomic_unlocked(rdma_qp *qp, uint64_t wr_id, uint32_t opcode, uint64_t remote_addr, uint32_t rkey, uint64_t compare, uint64_t swap_add, uint64_t result_addr, uint32_t result_lkey, uint32_t send_flags);
+static int rdma_post_send_sge_unlocked(rdma_qp *qp, const struct rdma_send_wr *wr);
+static int rdma_post_send_batch_unlocked(rdma_qp *qp, const struct rdma_send_wr *wr, uint32_t count);
+static int rdma_post_recv_sge_unlocked(rdma_qp *qp, const struct rdma_recv_wr *wr);
+static int rdma_post_recv_batch_unlocked(rdma_qp *qp, const struct rdma_recv_wr *wr, uint32_t count);
+
+/* Public posting entry points. Each forwards to the body above under the
+ * queue pair's own lock, so two threads posting on one QP cannot compute the
+ * same ring index and write the same work-queue slot. The lock is skipped
+ * entirely for a caller that opted out. Entry points that delegate to another
+ * entry point, rdma_post_send and rdma_post_recv, are deliberately not wrapped
+ * so a post takes the lock exactly once. */
+int rdma_post_local_inv(rdma_qp *qp, uint64_t wr_id, uint32_t rkey)
+{
+    if (!qp) return -EINVAL;
+    if (!qp->post_serialize) return rdma_post_local_inv_unlocked(qp, wr_id, rkey);
+    os_unfair_lock_lock(&qp->post_lock);
+    int rc = rdma_post_local_inv_unlocked(qp, wr_id, rkey);
+    os_unfair_lock_unlock(&qp->post_lock);
+    return rc;
+}
+
+int rdma_post_send_inline(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
+                          const void *data, uint32_t len,
+                          uint64_t remote_addr, uint32_t rkey,
+                          uint32_t imm_data, uint32_t send_flags)
+{
+    if (!qp) return -EINVAL;
+    if (!qp->post_serialize) return rdma_post_send_inline_unlocked(qp, wr_id, opcode, data, len, remote_addr, rkey, imm_data, send_flags);
+    os_unfair_lock_lock(&qp->post_lock);
+    int rc = rdma_post_send_inline_unlocked(qp, wr_id, opcode, data, len, remote_addr, rkey, imm_data, send_flags);
+    os_unfair_lock_unlock(&qp->post_lock);
+    return rc;
+}
+
+int rdma_post_send_atomic(rdma_qp *qp, uint64_t wr_id, uint32_t opcode,
+                          uint64_t remote_addr, uint32_t rkey,
+                          uint64_t compare, uint64_t swap_add,
+                          uint64_t result_addr, uint32_t result_lkey,
+                          uint32_t send_flags)
+{
+    if (!qp) return -EINVAL;
+    if (!qp->post_serialize) return rdma_post_send_atomic_unlocked(qp, wr_id, opcode, remote_addr, rkey, compare, swap_add, result_addr, result_lkey, send_flags);
+    os_unfair_lock_lock(&qp->post_lock);
+    int rc = rdma_post_send_atomic_unlocked(qp, wr_id, opcode, remote_addr, rkey, compare, swap_add, result_addr, result_lkey, send_flags);
+    os_unfair_lock_unlock(&qp->post_lock);
+    return rc;
+}
+
+int rdma_post_send_sge(rdma_qp *qp, const struct rdma_send_wr *wr)
+{
+    if (!qp) return -EINVAL;
+    if (!qp->post_serialize) return rdma_post_send_sge_unlocked(qp, wr);
+    os_unfair_lock_lock(&qp->post_lock);
+    int rc = rdma_post_send_sge_unlocked(qp, wr);
+    os_unfair_lock_unlock(&qp->post_lock);
+    return rc;
+}
+
+int rdma_post_send_batch(rdma_qp *qp, const struct rdma_send_wr *wr,
+                         uint32_t count)
+{
+    if (!qp) return -EINVAL;
+    if (!qp->post_serialize) return rdma_post_send_batch_unlocked(qp, wr, count);
+    os_unfair_lock_lock(&qp->post_lock);
+    int rc = rdma_post_send_batch_unlocked(qp, wr, count);
+    os_unfair_lock_unlock(&qp->post_lock);
+    return rc;
+}
+
+int rdma_post_recv_sge(rdma_qp *qp, const struct rdma_recv_wr *wr)
+{
+    if (!qp) return -EINVAL;
+    if (!qp->post_serialize) return rdma_post_recv_sge_unlocked(qp, wr);
+    os_unfair_lock_lock(&qp->post_lock);
+    int rc = rdma_post_recv_sge_unlocked(qp, wr);
+    os_unfair_lock_unlock(&qp->post_lock);
+    return rc;
+}
+
+int rdma_post_recv_batch(rdma_qp *qp, const struct rdma_recv_wr *wr,
+                         uint32_t count)
+{
+    if (!qp) return -EINVAL;
+    if (!qp->post_serialize) return rdma_post_recv_batch_unlocked(qp, wr, count);
+    os_unfair_lock_lock(&qp->post_lock);
+    int rc = rdma_post_recv_batch_unlocked(qp, wr, count);
+    os_unfair_lock_unlock(&qp->post_lock);
+    return rc;
+}
+
 int rdma_post_send(rdma_qp *qp, const struct rdma_send_wr *wr)
 {
     return wr && (wr->num_sge > 1 || wr->opcode == RDMA_WR_SEND_IMM ||
+                  wr->opcode == RDMA_WR_SEND_INV ||
                   wr->opcode == RDMA_WR_RDMA_WRITE_IMM) ?
         rdma_post_send_sge(qp, wr) : rdma_post_send_batch(qp, wr, 1);
 }
 
-int rdma_post_send_batch(rdma_qp *qp, const struct rdma_send_wr *wr,
+static int rdma_post_send_batch_unlocked(rdma_qp *qp, const struct rdma_send_wr *wr,
                          uint32_t count)
 {
     if (!qp || !wr || !count || count > RDMA_MAX_POST_BATCH)
@@ -3381,7 +3803,7 @@ int rdma_post_send_batch(rdma_qp *qp, const struct rdma_send_wr *wr,
 static int rdma_post_recv_direct_sge(rdma_qp *qp,
                                      const struct rdma_recv_wr *wr);
 
-int rdma_post_recv_sge(rdma_qp *qp, const struct rdma_recv_wr *wr)
+static int rdma_post_recv_sge_unlocked(rdma_qp *qp, const struct rdma_recv_wr *wr)
 {
     /* A datagram receive begins with 40 bytes of global routing header, so a
      * buffer with no room for it truncates the payload. The check lives here
@@ -3446,9 +3868,10 @@ static int rdma_post_recv_direct_sge(rdma_qp *qp,
         }
     }
     if (qp->rq_wrid) qp->rq_wrid[index] = wr->wr_id;
+    if (qp->rq_sge_addr) qp->rq_sge_addr[index] = wr->sg_list[0].addr;
     rdma_dma_write_barrier();
     volatile uint32_t *db = (volatile uint32_t *)
-        ((uint8_t *)qp->dev->db_map + qp->db_record_offset);
+        (qp->db_rec);
     db[0] = __builtin_bswap32((uint32_t)(qp->rq_head + 1) & 0xffffu);
     qp->rq_head++;
     rdma_qp_publish_shadow_maybe(qp, RDMA_QP_SHADOW_RQ_HEAD);
@@ -3456,7 +3879,7 @@ static int rdma_post_recv_direct_sge(rdma_qp *qp,
     return 0;
 }
 
-int rdma_post_recv_batch(rdma_qp *qp, const struct rdma_recv_wr *wr,
+static int rdma_post_recv_batch_unlocked(rdma_qp *qp, const struct rdma_recv_wr *wr,
                          uint32_t count)
 {
     if (!qp || !wr || !count || count > RDMA_MAX_POST_BATCH)
@@ -3522,6 +3945,7 @@ int rdma_post_recv_batch(rdma_qp *qp, const struct rdma_recv_wr *wr,
                     req.wr[i].sge.lkey = wr[base + i].sg_list[0].lkey;
                 }
                 if (qp->rq_wrid) qp->rq_wrid[idx] = wr[base + i].wr_id;
+                if (qp->rq_sge_addr) qp->rq_sge_addr[idx] = wr[base + i].sg_list[0].addr;
             }
             if (!qp->trusted_fast_path) {
                 kern_return_t kr = IOConnectCallStructMethod(
@@ -3531,7 +3955,7 @@ int rdma_post_recv_batch(rdma_qp *qp, const struct rdma_recv_wr *wr,
             }
             rdma_dma_write_barrier();
             volatile uint32_t *db = (volatile uint32_t *)
-                ((uint8_t *)qp->dev->db_map + qp->db_record_offset);
+                (qp->db_rec);
             db[0] = __builtin_bswap32((uint32_t)(head + chunk) & 0xffffu);
             qp->rq_head = head + chunk;
             rdma_qp_publish_shadow_maybe(qp, RDMA_QP_SHADOW_RQ_HEAD);

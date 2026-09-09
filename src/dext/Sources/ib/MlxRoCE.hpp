@@ -28,6 +28,13 @@ class MlxCC;
 class IOMemoryDescriptor;
 struct MlxClientDoorbellBundle;
 
+/* Async EQ events are collected once for the device but CQ/QP/SRQ handles are
+ * owned by individual UserClients.  A caller supplies this matcher so it can
+ * remove only an event it is allowed to observe; another client's event stays
+ * queued rather than being consumed and rejected at the ABI boundary. */
+typedef bool (*MlxAsyncEventMatcher)(void *context,
+                                     const struct mlx_async_event *event);
+
 class MlxRoCE : public MlxEventNotifier {
 public:
     MlxRoCE();
@@ -83,6 +90,9 @@ public:
     kern_return_t   ModifyCqModeration(const struct mlx_modify_cq_moderation_req *req);
 
     kern_return_t   GetAsyncEvent(struct mlx_async_event *event);
+    kern_return_t   GetAsyncEventMatching(struct mlx_async_event *event,
+                                          MlxAsyncEventMatcher matcher,
+                                          void *matcherContext);
     void            QueueAsyncEvent(uint32_t eventType, uint32_t elementType,
                                      uint32_t elementHandle);
     /* Process deferred runtime PAGE_REQUEST (after EQ Poll).

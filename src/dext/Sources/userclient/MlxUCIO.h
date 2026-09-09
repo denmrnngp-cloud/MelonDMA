@@ -29,7 +29,55 @@ enum {
     ((uint64_t)((kind) & 0xffu) | ((uint64_t)(handle) << 8))
 #define MLX_UC_MEM_KIND(type) ((uint32_t)((type) & 0xffu))
 #define MLX_UC_MEM_HANDLE(type) ((uint32_t)((type) >> 8))
-#define MLX_FAST_PATH_ABI_VERSION 2u
+/* v3: the UAR page a client maps is no longer fixed at 4 KiB, and its
+ * blue-flame registers are no longer one contiguous run. A shim built
+ * against v2 asserts both, so the version gate is what stops it from
+ * writing a WQE onto a doorbell register. */
+/* v4: bfOffset and dbRecordOffset are flat offsets into the client's whole
+ * UAR / doorbell address space, not offsets inside a single page — divide by
+ * the page size for the mapping index and take the remainder inside it. A v3
+ * shim reads a flat offset as an in-page one and writes a doorbell into the
+ * wrong page, so the version gate is what stops it. */
+#define MLX_FAST_PATH_ABI_VERSION 4u
+
+/* How many UAR pages and doorbell-record pages one client may hold.
+ *
+ * A UAR carries four blue-flame registers, so four UARs let sixteen QPs post
+ * without sharing a register; beyond that they share, which costs the
+ * ping-pong toggle rather than correctness. A doorbell page holds 32 records
+ * at 128-byte spacing — one host cache line each on Apple silicon, so two
+ * queues never share a line — and QPs and CQs draw from the same pool, which
+ * is why one page ran out at 16 QPs against advertised limits of 32 and 32.
+ * Apple's DEXT grows its doorbell pages from a linked directory
+ * (allocDBPgDir/allocDB); a small fixed array is the same idea with a bound. */
+#define MLX_CLIENT_MAX_UAR       4u
+#define MLX_CLIENT_MAX_DB_PAGES  8u
+#define MLX_CLIENT_DB_PAGE_SIZE  4096u
+#define MLX_CLIENT_DB_SLOT_SIZE  128u
+#define MLX_CLIENT_DB_SLOTS_PER_PAGE \
+    (MLX_CLIENT_DB_PAGE_SIZE / MLX_CLIENT_DB_SLOT_SIZE)
+
+/* Blue-flame and doorbell-record offsets cross the ABI as flat offsets into
+ * the whole pool: page index times page size, plus the offset inside that
+ * page. Both sides use these so the arithmetic cannot drift apart — a
+ * mismatch there would put a doorbell in the wrong page with no error
+ * anywhere. uarPageSize comes from the fast-path response, so a client never
+ * has to guess it. */
+static inline uint32_t mlxFlatOffset(uint32_t page, uint32_t pageSize,
+                                     uint32_t within)
+{
+    return page * pageSize + within;
+}
+
+static inline uint32_t mlxFlatPage(uint32_t flat, uint32_t pageSize)
+{
+    return pageSize ? flat / pageSize : 0u;
+}
+
+static inline uint32_t mlxFlatWithin(uint32_t flat, uint32_t pageSize)
+{
+    return pageSize ? flat % pageSize : flat;
+}
 /* ABI v2: resource handles (PD/CQ/QP/MR/MW) and completion qpNum are opaque
  * per-UserClient tokens with an embedded generation; raw firmware IDs never
  * cross this boundary. Clients must reject a mismatched major version. */
@@ -60,6 +108,9 @@ enum {
     MLX_UC_FEATURE_COHERENT_UMA_MR = 1u << 15,
     MLX_UC_FEATURE_CQ_EVENT_WAIT = 1u << 16, /* may be serviced by timer */
     MLX_UC_FEATURE_RUNTIME_STATUS = 1u << 17,
+    /* Unreliable connected: SEND and RDMA WRITE (including immediate-data
+     * variants), without RC's retransmission, RDMA READ, or atomics. */
+    MLX_UC_FEATURE_UC              = 1u << 18,
 };
 
 /* Conservative, explicit policy for small-memory Macs, not firmware limits. */
@@ -132,6 +183,10 @@ enum {
  * IOInterruptDispatchSource::GetInterruptType and publishes what it found. */
 #define MLX_IRQ_INDEX_MAP 16
 
+/* Completion queues this ABI can report on. The driver's own cap may be
+ * lower; completionEqCount says how many are actually live. */
+#define MLX_IRQ_COMP_EQ_MAX 4u
+
 enum {
     MLX_IRQ_KIND_ABSENT = 0,  /* GetInterruptType refused this index */
     MLX_IRQ_KIND_LEVEL  = 1,  /* level-triggered, i.e. legacy INTx */
@@ -186,7 +241,28 @@ struct mlx_interrupts_resp {
     uint8_t  indexKind[MLX_IRQ_INDEX_MAP];      /* MLX_IRQ_KIND_*, after */
     uint8_t  indexKindPre[MLX_IRQ_INDEX_MAP];   /* MLX_IRQ_KIND_*, before */
     uint64_t indexTypeRaw[MLX_IRQ_INDEX_MAP];   /* raw GetInterruptType value */
+    /* Whether an index above the two the driver binds actually yields a
+     * dispatch source. The table entries for every allocated vector are
+     * programmed and every index reports MSI-X, but neither says that
+     * IOInterruptDispatchSource::Create will bind there — and that is what
+     * decides whether a command-completion vector or a set of completion EQs
+     * is available at all. Each entry is the kern_return_t of a Create that
+     * was cancelled again immediately, or MLX_IRQ_BIND_NOT_TRIED for the two
+     * indices in use and for anything that did not report MSI-X. */
+    uint32_t indexBind[MLX_IRQ_INDEX_MAP];
+    /* Completion queues in service and the interrupts each has taken. Index 0
+     * is the primary; the rest are the extra vectors. completionInterrupts
+     * above is their sum, which answers "did an interrupt arrive" but not
+     * "did the work spread", and spreading is the whole point of having more
+     * than one. */
+    uint32_t completionEqCount;
+    uint32_t rsvd1;
+    uint64_t completionIrqByEq[MLX_IRQ_COMP_EQ_MAX];
 };
+
+
+
+#define MLX_IRQ_BIND_NOT_TRIED 0xffffffffu
 
 #define MLX_IRQ_INDEX_NONE 0xffffffffu
 
@@ -311,6 +387,100 @@ struct mlx_health_resp {
     uint32_t ownedCq;
     uint32_t ownedMr;
     uint32_t ownedAh;
+    /* The init-segment health buffer, decoded. Layout is mlx5's own
+     * struct health_buffer at BAR0 offset 0x200; it is only meaningful once
+     * firmware has asserted, and stays zero otherwise. Without it a fatal
+     * event gives a syndrome number and nothing to correlate it with, and this
+     * machine's kernel log channel is dead, so the driver cannot print it
+     * either. deviceRemoved is set when the health counter and fw_rev both
+     * read all-ones, which is how a card that has fallen off the bus looks. */
+    uint32_t assertVar[6];
+    uint32_t assertExitPtr;
+    uint32_t assertCallra;
+    uint32_t healthTime;
+    uint32_t fwVer;
+    uint32_t hwId;
+    uint32_t rfrSeverity;
+    uint32_t iriscIndex;
+    uint32_t deviceRemoved;
+};
+
+/* DCQCN observability. Firmware runs the loop; these say whether it is
+ * enabled for a priority and what it has actually done. Counters come from
+ * QUERY_CONG_STATISTICS (0x826) and are device-wide accumulators; clear
+ * resets them after the read. */
+/* Per-vport queue counters (QUERY_Q_COUNTER 0x773).
+ *
+ * These are the only place a receiver's own failures are counted.
+ * outOfBuffer is packets dropped because nothing was posted to receive them,
+ * and the port counters stay clean while it climbs — so without this the
+ * failure mode is invisible. The rest name most of what goes wrong on an RC
+ * connection. All are 32-bit firmware counters, device-wide for the counter
+ * set, and clear zeroes them after the read. */
+struct mlx_q_counters_req {
+    uint32_t  counterSetId;     /* 0 is the set QPs land in by default */
+    uint32_t  clear;            /* 1 = zero the counters after reading */
+};
+
+struct mlx_q_counters_resp {
+    uint32_t  rxWriteRequests;
+    uint32_t  rxReadRequests;
+    uint32_t  rxAtomicRequests;
+    uint32_t  outOfBuffer;
+    uint32_t  outOfSequence;
+    uint32_t  duplicateRequest;
+    uint32_t  rnrNakRetryErr;
+    uint32_t  packetSeqErr;
+    uint32_t  impliedNakSeqErr;
+    uint32_t  localAckTimeoutErr;
+    uint32_t  reqRnrRetriesExceeded;
+    uint32_t  respLocalLengthError;
+    uint32_t  reqLocalLengthError;
+    uint32_t  localOperationError;
+    uint32_t  respCqeError;
+    uint32_t  reqCqeError;
+};
+
+/* The card's internal timer, which is the clock behind every CQE timestamp,
+ * read together with the host clock so the two can be correlated.
+ *
+ * This is deliberately a command and not a mapped page. Apple's provider mmaps
+ * the core-clock page because its whole design is built on mapped regions; the
+ * timer here lives at init-segment offset 0x1000, and on a 16 KiB host page
+ * the smallest window containing it also contains the command doorbell and the
+ * command-queue address at the bottom of the segment. Handing that to an
+ * untrusted client to save a syscall is a bad trade, and it buys nothing:
+ * correlating the two clocks is a calibration done occasionally, after which
+ * turning a CQE timestamp into a real time is arithmetic with no device access
+ * at all. */
+struct mlx_hca_clock_resp {
+    uint64_t  ticks;          /* internal_timer_h:l, one 64-bit read */
+    uint64_t  hostUptimeNs;   /* CLOCK_UPTIME_RAW, sampled around the ticks */
+    uint32_t  frequencyKhz;   /* 0 when firmware does not report it */
+    uint32_t  reserved;
+};
+#if defined(__cplusplus)
+static_assert(sizeof(struct mlx_hca_clock_resp) == 24,
+              "mlx_hca_clock_resp ABI mismatch");
+#endif
+
+struct mlx_cc_stats_req {
+    uint32_t  priority;     /* 0..7 */
+    uint32_t  clear;        /* 1 = zero the accumulators after reading */
+};
+
+struct mlx_cc_stats_resp {
+    uint32_t  enable;       /* congestion control on for this priority */
+    uint32_t  tagEnable;
+    uint64_t  rpCnpIgnored;
+    uint64_t  rpCnpHandled;
+    uint64_t  npEcnMarkedRocePackets;
+    uint64_t  npCnpSent;
+    uint64_t  timeStamp;
+    uint32_t  rpCurFlows;
+    uint32_t  sumFlows;
+    uint32_t  accumulatorsPeriod;
+    uint32_t  rsvd;
 };
 
 /* ===== P1.1 per-client quotas (DoS protection) =====
@@ -320,7 +490,7 @@ struct mlx_health_resp {
  * MlxCQ / MlxMR) remain the ultimate bound shared by all clients.
  *
  * These constants are the DEFAULT policy, not the firmware limit: a client
- * signed with the com.mlx5.rdma.entitlement entitlement has the ceilings for
+ * signed with the com.melondma.rdma.entitlement entitlement has the ceilings for
  * QP/CQ/MR/MW raised to the firmware capability (still bounded by the
  * DEXT-wide tables and, for QP/CQ, the shared DB-record slot capacity). This
  * is what lets one trusted client hold as many QPs as it needs without
@@ -377,10 +547,21 @@ struct mlx_query_limits_resp {
      * 4=16, 5=32 GT/s), width is lanes. Both zero when unreadable. */
     uint32_t pcieLinkSpeed;
     uint32_t pcieLinkWidth;
+    /* Read back after INIT_HCA, not what the driver asked for. The DEXT's
+     * log channel is dead on this machine, so a capability that is only
+     * logged cannot be verified at all; these three are here to be checked.
+     * cacheLine128 is the firmware's view of the host cache line, which the
+     * driver sets because every Apple silicon core has a 128-byte one.
+     * logUarPageSz is the raw log_uar_page_sz, so uarPageSize above can be
+     * cross-checked against it. boardId is the QUERY_ADAPTER psid, NUL-padded
+     * and not necessarily terminated. */
+    uint32_t cacheLine128;
+    uint32_t logUarPageSz;
+    char     boardId[16];
 };
 
 #if defined(__cplusplus)
-static_assert(sizeof(struct mlx_query_limits_resp) == 80,
+static_assert(sizeof(struct mlx_query_limits_resp) == 104,
               "mlx_query_limits_resp ABI mismatch");
 #endif
 
@@ -498,17 +679,29 @@ struct mlx_perf_resp {
      * up as a flat millisecond added to all of them. */
     uint64_t fwCommands;
     uint64_t fwCommandSleeps;
+    /* How many commands found every regular command slot busy and had to wait
+     * for one. Zero on a serial workload; a rising count is the signal that
+     * MLX_CMD_REG_SLOTS is too small for the concurrency in play. */
+    uint64_t fwCommandSlotWaits;
 };
 
 #if defined(__cplusplus)
-static_assert(sizeof(struct mlx_interrupts_resp) == 288,
+static_assert(sizeof(struct mlx_interrupts_resp) == 392,
               "mlx_interrupts_resp ABI mismatch");
 static_assert(sizeof(struct mlx_msix_entry) == 16,
               "mlx_msix_entry ABI mismatch");
 static_assert(sizeof(struct mlx_msix_state_resp) == 328,
               "mlx_msix_state_resp ABI mismatch");
-static_assert(sizeof(struct mlx_perf_resp) == 152,
+static_assert(sizeof(struct mlx_perf_resp) == 160,
               "mlx_perf_resp ABI mismatch");
+static_assert(sizeof(struct mlx_q_counters_req) == 8,
+              "mlx_q_counters_req ABI mismatch");
+static_assert(sizeof(struct mlx_q_counters_resp) == 64,
+              "mlx_q_counters_resp ABI mismatch");
+static_assert(sizeof(struct mlx_cc_stats_req) == 8,
+              "mlx_cc_stats_req ABI mismatch");
+static_assert(sizeof(struct mlx_cc_stats_resp) == 64,
+              "mlx_cc_stats_resp ABI mismatch");
 static_assert(sizeof(struct mlx_query_abi_resp) == 8,
               "mlx_query_abi_resp ABI mismatch");
 static_assert(sizeof(struct mlx_modify_cq_moderation_req) == 8,
@@ -526,6 +719,7 @@ enum {
     kMlxUCMethodClose         = 0x1001,
     kMlxUCMethodQueryDevice   = 0x1002,  /* capability query */
     kMlxUCMethodQueryPort     = 0x1003,  /* port state */
+    kMlxUCMethodQueryCapRegs  = 0x1007,  /* cached PCAM/MCAM/QCAM */
     kMlxUCMethodQueryAbi      = 0x1004,  /* ABI version/features */
     kMlxUCMethodQueryLimits   = 0x1005,  /* per-client quota limits (P1.1) */
 
@@ -572,6 +766,9 @@ enum {
     /* congestion control */
     kMlxUCMethodCCQuery       = 0x1070,
     kMlxUCMethodCCModify      = 0x1071,
+    kMlxUCMethodCCStats       = 0x1072,  /* DCQCN status + counters */
+    kMlxUCMethodQueryQCounters = 0x1073,
+    kMlxUCMethodQueryHcaClock  = 0x1074, /* per-vport queue counters */
 
     /* ===== firmware management (used by mlxconfig/mlxup/mlxlink) ===== */
     kMlxUCMethodAccessReg     = 0x1080,   /* ACCESS_REG register read/write */
@@ -807,6 +1004,7 @@ enum {
     MLX_UC_WR_LOCAL_INV = 6,
     MLX_UC_WR_ATOMIC_CS = 7,   /* compare-and-swap */
     MLX_UC_WR_ATOMIC_FA = 8,   /* fetch-and-add */
+    MLX_UC_WR_SEND_INV = 9,    /* SEND_WITH_INV; rkey is the remote key */
 };
 
 enum {
@@ -837,6 +1035,7 @@ enum {
      * room for it, and the driver refuses a receive too short to hold it. */
     MLX_UC_WC_GRH         = 1u << 2,
     MLX_UC_WC_WITH_ATOMIC = 1u << 1,
+    MLX_UC_WC_WITH_INV    = 1u << 3,
 };
 
 struct mlx_datapath_sge {
@@ -1180,8 +1379,8 @@ static_assert(sizeof(struct mlx_query_gid_table_resp) ==
 /* async event (see rdma-core ibv_async_event) */
 struct mlx_async_event {
     uint32_t  eventType;       /* see ibv_event_type */
-    uint32_t  elementType;     /* MLX_ASYNC_ELEMENT_*: 0=device 1=CQ 2=QP 3=port */
-    uint32_t  elementHandle;   /* CQ/QP handle or port_num */
+    uint32_t  elementType;     /* MLX_ASYNC_ELEMENT_*: device/CQ/QP/port/SRQ */
+    uint32_t  elementHandle;   /* CQ/QP/SRQ handle or port_num */
     uint32_t  reserved;
 };
 
@@ -1191,18 +1390,25 @@ enum {
     MLX_ASYNC_ELEMENT_CQ     = 1,
     MLX_ASYNC_ELEMENT_QP     = 2,
     MLX_ASYNC_ELEMENT_PORT   = 3,
+    MLX_ASYNC_ELEMENT_SRQ    = 4,
 };
 
 /* event types (see ibv_event_type) */
 enum {
     MLX_EVENT_CQ_ERR = 0,
     MLX_EVENT_QP_FATAL = 1,
+    MLX_EVENT_QP_REQ_ERR = 2,
+    MLX_EVENT_QP_ACCESS_ERR = 3,
     MLX_EVENT_COMM_EST = 4,
     MLX_EVENT_SQ_DRAINED = 5,
     MLX_EVENT_PATH_MIG = 6,
+    MLX_EVENT_PATH_MIG_ERR = 7,
     MLX_EVENT_DEVICE_FATAL = 8,
     MLX_EVENT_PORT_ACTIVE = 9,
     MLX_EVENT_PORT_ERR = 10,
+    MLX_EVENT_SRQ_ERR = 13,
+    MLX_EVENT_SRQ_LIMIT_REACHED = 14,
+    MLX_EVENT_QP_LAST_WQE_REACHED = 16,
     MLX_EVENT_GID_CHANGE = 18,
     MLX_EVENT_WQ_FATAL = 19,
 };
@@ -1276,6 +1482,18 @@ static_assert(sizeof(struct mlx_access_reg_resp) == 516,
 /* ========== struct definitions (POD) ========== */
 
 /* device capability query response */
+struct mlx_query_cap_regs_resp {
+    uint32_t version;
+    uint32_t validMask;       /* bit0=PCAM bit1=MCAM bit2=QCAM */
+    uint8_t  pcam[80];
+    uint8_t  mcam[80];
+    uint8_t  qcam[80];
+};
+#if defined(__cplusplus)
+static_assert(sizeof(struct mlx_query_cap_regs_resp) == 248,
+              "mlx_query_cap_regs_resp ABI mismatch");
+#endif
+
 struct mlx_query_device_resp {
     uint64_t  fwVersion;
     uint32_t  deviceId;
@@ -1289,6 +1507,13 @@ struct mlx_query_device_resp {
     uint32_t  maxInlineData;    /* MLX_UC_MAX_INLINE_DATA once P3 inline lands */
     uint32_t  maxQpRdAtomic;    /* requester outstanding atomics (power of 2) */
     uint32_t  maxQpInitRdAtomic;/* responder outstanding atomics (power of 2) */
+    /* Identity, from the nic_vport_context this driver already reads for
+     * roce_en. A consumer that keys a connection on node_guid, or names a
+     * device by it, got nothing before these existed. Zero means firmware did
+     * not supply one, which is a real answer and not a missing read. */
+    uint64_t  nodeGuid;
+    uint64_t  portGuid;
+    uint64_t  sysImageGuid;
 };
 
 /* port attributes response */
@@ -1305,8 +1530,16 @@ struct mlx_query_port_resp {
     uint8_t   portState;        /* 0=down 1=up */
     uint8_t   gidType;          /* 2=RoCEv2 */
     uint8_t   rsvd;
-    uint32_t  activeSpeed;      /* Mbps */
+    uint32_t  activeSpeed;      /* Mbps (QUERY_VPORT_STATE max_tx_speed, 100 Mbps units) */
+    uint32_t  linkSpeedMbps;    /* PTYS eth_proto_oper decoded, 0 = unknown */
     uint32_t  maxMtu;
+    /* PFCC semantic state: 802.3x global pause + per-priority PFC. */
+    uint8_t   pauseTx;          /* PFCC pptx */
+    uint8_t   pauseRx;          /* PFCC pprx */
+    uint8_t   pfcTxMask;        /* PFCC pfctx: per-priority PFC tx enable */
+    uint8_t   pfcRxMask;        /* PFCC pfcrx */
+    uint8_t   pfcPrioMask;      /* PFCC prio_mask_tx | prio_mask_rx */
+    uint8_t   rsvd2[3];
     /* IB attributes (reserved for Option C, see ib_port_attr) */
     uint16_t  lid;              /* local LID */
     uint16_t  smLid;            /* subnet manager LID */
@@ -1321,11 +1554,12 @@ struct mlx_query_port_resp {
  * but keeps the validated path) can never make DestroyQP/SyncQpTails read a
  * stale shadow. */
 #define MLX_UC_QP_TRUSTED 1u
+#define MLX_UC_QP_SCATTER_CQE 2u
 struct mlx_create_qp_req {
     uint32_t  pd;
     uint32_t  sendCq;
     uint32_t  recvCq;
-    uint32_t  qpType;           /* 0=RC 1=UD */
+    uint32_t  qpType;           /* 0=RC 1=UD 2=UC */
     uint32_t  sqSize;           /* power of 2 */
     uint32_t  rqSize;
     uint64_t  sqBufAddr;        /* must be 0: DEXT-owned WQ (Option B) */

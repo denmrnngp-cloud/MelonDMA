@@ -58,6 +58,9 @@ struct MlxHcaCaps {
 
     bool     uar4k;
     uint16_t logUarPageSize;
+    uint32_t deviceFrequencyKhz;  /* internal timer rate; 0 when unreported */
+    uint32_t uarPageSize;    /* bytes; the one value the UAR/BF math uses */
+    bool     cacheLine128;   /* firmware told the host line is 128 bytes */
     uint8_t  logBfRegSize;
     bool     swRoceSrcUdpPort;
     bool     nicFlowTable;
@@ -65,6 +68,15 @@ struct MlxHcaCaps {
     uint8_t  numVhcaPorts;
     bool     swOwnerId;
     uint8_t  atomicMode;    /* QPC atomic_mode: 0=NONE 1=IB_COMP 3=8B */
+
+    /* ACCESS_REG capability maps. Raw payloads stay private to the HCA
+     * capability cache until their bit layout is verified for this firmware. */
+    bool     pcamValid;
+    bool     mcamValid;
+    bool     qcamValid;
+    uint8_t  pcam[80];
+    uint8_t  mcam[80];
+    uint8_t  qcam[80];
 
     uint16_t ibMaxLids;
     uint16_t ibMaxPkeys;

@@ -167,7 +167,11 @@ MlxCQ::CmdCreateCQ(MlxCQContext *cq, uint32_t eqNumber)
     uint8_t *cqc = in + cqcOff;
     mlxSetBits(cqc, 0x08, 3, 0);   /* 64-byte CQE */
     mlxSetBits(cqc, 0x63, 5, cq->logSize);
-    uint32_t uarPage = cq->clientBundle ? cq->clientBundle->uarIndex :
+    /* CQ doorbells live at a fixed offset in every UAR page, so a CQ always
+     * uses the client's first one; only QPs spread across the pool, and only
+     * for their blue-flame registers. */
+    uint32_t uarPage = cq->clientBundle ?
+        s->core->GetUAR()->ClientUarIndex(cq->clientBundle, 0) :
         (s->core->GetUAR() ? s->core->GetUAR()->GetBootUarIndex() : 0);
     mlxSetBits(cqc, 0x68, 24, uarPage);
     /* c_eqn — 8 bits @0xb8 (AppleMCX), NOT 0xa0/32bit. The real EQ number. */
@@ -293,7 +297,9 @@ MlxCQ::CreateCQ(uint32_t entries, struct mlx_create_cq_resp *resp,
         goto fail;
     }
 
-    completionEq = s->core->GetCompletionEQ();
+    /* Round-robin across the completion queues so their interrupts land on
+     * different vectors instead of all funnelling through one. */
+    completionEq = s->core->NextCompletionEQ();
     kr = CmdCreateCQ(cq, completionEq ? completionEq->EqNumber() :
                                       (s->core->GetEQ() ?
                                        s->core->GetEQ()->EqNumber() : 0));
@@ -631,7 +637,8 @@ MlxCQ::ArmCQ(uint32_t cqHandle, uint32_t solicitedOnly)
     db[1] = OSSwapHostToBigInt32(val);
     mlxMemoryBarrier();
     kern_return_t ringKr = s->core->GetUAR()->RingCQDoorbell(
-        cq->clientBundle ? cq->clientBundle->uarIndex :
+        cq->clientBundle ?
+            s->core->GetUAR()->ClientUarIndex(cq->clientBundle, 0) :
                            s->core->GetUAR()->GetBootUarIndex(),
         val, cq->cqNumber);
     if (ringKr != kIOReturnSuccess) {

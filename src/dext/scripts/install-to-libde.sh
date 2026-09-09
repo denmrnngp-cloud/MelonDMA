@@ -17,7 +17,7 @@ set -e
 
 SRC="${1:-}"
 if [ -z "$SRC" ]; then
-    SRC=$(ls -d /Library/SystemExtensions/*/com.mlx5.rdma.dext.systemextension 2>/dev/null | tail -1)
+    SRC=$(ls -d /Library/SystemExtensions/*/com.melondma.rdma.dext.systemextension 2>/dev/null | tail -1)
 fi
 [ -n "$SRC" ] || { echo "source bundle not found"; exit 1; }
 [ -f "$SRC/Contents/Info.plist" ] || { echo "not a Contents/ bundle: $SRC"; exit 1; }
@@ -27,7 +27,7 @@ EXEC_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$SRC/Content
 [ -n "$EXEC_NAME" ] || { echo "cannot read CFBundleExecutable"; exit 1; }
 [ -f "$SRC/Contents/MacOS/$EXEC_NAME" ] || { echo "executable missing: $SRC/Contents/MacOS/$EXEC_NAME"; exit 1; }
 
-DEST=/Library/DriverExtensions/com.mlx5.rdma.dext.dext
+DEST=/Library/DriverExtensions/com.melondma.rdma.dext.dext
 mkdir -p /Library/DriverExtensions
 rm -rf "$DEST"
 mkdir -p "$DEST"

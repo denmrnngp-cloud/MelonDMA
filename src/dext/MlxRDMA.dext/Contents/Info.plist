@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>MlxRDMA</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.mlx5.rdma.dext</string>
+	<string>com.melondma.rdma.dext</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -15,19 +15,19 @@
 	<key>CFBundlePackageType</key>
 	<string>DEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.479</string>
+	<string>0.539</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>DriverKit</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>0.479</string>
+	<string>0.539</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>MlxPCIDriver</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.mlx5.rdma.dext</string>
+			<string>com.melondma.rdma.dext</string>
 			<key>CFBundleIdentifierKernel</key>
 			<string>com.apple.kpi.iokit</string>
 			<key>IOClass</key>
@@ -43,7 +43,7 @@
 			<key>IOUserClass</key>
 			<string>MlxPCIDriver</string>
 			<key>IOUserServerName</key>
-			<string>com.mlx5.rdma.dext</string>
+			<string>com.melondma.rdma.dext</string>
 			<key>MlxBuildTag</key>
 			<string>p0-p1-dma-lifetime-runtime-1</string>
 			<key>MlxRDMAUserClient</key>

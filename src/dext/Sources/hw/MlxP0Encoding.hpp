@@ -17,6 +17,11 @@ enum {
     MLX_QPC_BIT_OFFSET = 0xc0,
     MLX_QPC_BYTES = 0x740 / 8,
     MLX_QPC_PRIMARY_PATH_BIT_OFFSET = 0xc0,
+    /* mlx5 qp.h MLX5_QP_OPTPAR_COUNTER_SET_ID. The queue counter a QP reports
+     * into is an OPTIONAL parameter of the state transition, not a plain QPC
+     * field — which is why writing it at CREATE_QP alone did nothing and every
+     * counter stayed zero through thousands of RDMA writes. */
+    MLX_QP_OPTPAR_COUNTER_SET_ID = 1u << 25,
     MLX_ADS_BYTES = 0x160 / 8,
 
     MLX_CREATE_MKEY_FIXED_BYTES = 0x880 / 8,
@@ -86,7 +91,7 @@ mlxLog2PowerOfTwo(uint32_t value)
 static inline bool
 mlxEncodeRst2InitQpc(void *qpcBuffer, size_t qpcSize, uint32_t pkeyIndex,
                      uint32_t portNum, uint32_t serviceType,
-                     uint32_t *optParamMask)
+                     uint32_t *optParamMask, uint32_t counterSetId = 0)
 {
     if (!qpcBuffer || qpcSize < MLX_QPC_BYTES || pkeyIndex > 0xffff ||
         !portNum || portNum > 0xff || serviceType > 0xff)
@@ -101,8 +106,22 @@ mlxEncodeRst2InitQpc(void *qpcBuffer, size_t qpcSize, uint32_t pkeyIndex,
     mlxSetBits(qpc, 0x13, 2, 3); /* pm_state = MIGRATED (Linux default) */
     mlxSetBits(qpc, MLX_QPC_PRIMARY_PATH_BIT_OFFSET + 0x10, 16, pkeyIndex);
     mlxSetBits(qpc, MLX_QPC_PRIMARY_PATH_BIT_OFFSET + 0x128, 8, portNum);
-    /* RESET->INIT has no optional parameters in mlx5 opt_mask[][][].
-     * P_Key and port are transition-required QPC fields, not optpar bits. */
+    /* P_Key and port are transition-required QPC fields, not optpar bits, and
+     * RESET->INIT carries no optional parameters on this firmware.
+     *
+     * counter_set_id is written into the QPC body the same way, with no
+     * optpar bit. Naming it in MLX5_QP_OPTPAR_COUNTER_SET_ID (bit 25) instead
+     * made firmware refuse the transition outright — every QP failed RST->INIT
+     * and the card came up unable to create a working pair. That refusal is
+     * itself the answer: for this transition the field is not optional, so it
+     * belongs in the QPC like p_key and port, and the mask stays empty. The
+     * bit exists for rebinding a live QP's counter from RTS, which is a
+     * different operation.
+     *
+     * Writing it at CREATE_QP alone was not enough, which reads as firmware
+     * applying the whole transition-relevant field set from the supplied QPC —
+     * so a zero here overwrites the counter set chosen at creation. */
+    mlxSetBits(qpc, 0x60, 8, counterSetId & 0xff);
     if (optParamMask) *optParamMask = 0;
     return true;
 }

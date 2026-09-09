@@ -27,8 +27,7 @@ struct MlxUAR::State {
     IOPCIDevice     *pci;
     IOMemoryDescriptor *barMem;
     uint8_t          barIndex;
-    uint16_t         logUarPageSize;
-    bool             uar4k;
+    uint32_t         uarPageSize;
     uint32_t         nextUarIdx;
     uint32_t         bootUarIdx;
     IOBufferMemoryDescriptor *dbRecordMem;
@@ -44,7 +43,7 @@ MlxUAR::~MlxUAR() { Free(); }
 
 kern_return_t
 MlxUAR::Init(MlxPCIDriver *core, IOPCIDevice *pci, uint8_t barIndex,
-             uint16_t logUarPageSize, bool uar4k)
+             uint32_t uarPageSize)
 {
     if (!core || !pci) return kIOReturnBadArgument;
     s = new State;
@@ -53,8 +52,7 @@ MlxUAR::Init(MlxPCIDriver *core, IOPCIDevice *pci, uint8_t barIndex,
     s->core = core;
     s->pci  = pci;
     s->barIndex = barIndex;
-    s->logUarPageSize = logUarPageSize;
-    s->uar4k = uar4k;
+    s->uarPageSize = uarPageSize ? uarPageSize : MLX_UAR_ADAPTER_PAGE_SIZE;
     s->nextUarIdx = 1;
     s->bootUarIdx = 0;
     s->dbRecordMem = NULL;
@@ -151,6 +149,9 @@ uint8_t
 MlxUAR::BarIndex() const { return s ? s->barIndex : 0; }
 
 uint32_t
+MlxUAR::UarPageSize() const { return s ? s->uarPageSize : 0; }
+
+uint32_t
 MlxUAR::GetBootUarIndex() const { return s ? s->bootUarIdx : 0; }
 
 uint64_t
@@ -221,8 +222,7 @@ MlxUAR::QuarantineDbPage(IOBufferMemoryDescriptor **mem, IODMACommand **dma)
 kern_return_t
 MlxUAR::RingSendDoorbell(uint32_t uarIdx, uint32_t bfOffset, uint64_t value)
 {
-    if (!s || !s->pci || bfOffset + sizeof(value) >
-        (s->uar4k ? 4096u : (1u << s->logUarPageSize)))
+    if (!s || !s->pci || bfOffset + sizeof(value) > s->uarPageSize)
         return kIOReturnBadArgument;
     mlxMemoryBarrier();
     s->pci->MemoryWrite64(s->barIndex,
@@ -234,8 +234,7 @@ MlxUAR::RingSendDoorbell(uint32_t uarIdx, uint32_t bfOffset, uint64_t value)
 kern_return_t
 MlxUAR::RingCQDoorbell(uint32_t uarIdx, uint32_t armWord, uint32_t cqn)
 {
-    if (!s || !s->pci || MLX_CQ_DOORBELL + sizeof(uint64_t) >
-        (s->uar4k ? 4096u : (1u << s->logUarPageSize)))
+    if (!s || !s->pci || MLX_CQ_DOORBELL + sizeof(uint64_t) > s->uarPageSize)
         return kIOReturnBadArgument;
     uint32_t words[2] = {
         OSSwapHostToBigInt32(armWord),
@@ -254,19 +253,66 @@ MlxUAR::RingCQDoorbell(uint32_t uarIdx, uint32_t armWord, uint32_t cqn)
 uintptr_t
 MlxUAR::UarOffset(uint32_t uarIdx) const
 {
-    /* UAR pages are at the BAR offset: uarIdx * (uar4k ? 4096 : system_page). */
-    uint32_t stride = s->uar4k ? 4096 : (1u << s->logUarPageSize);
-    return (uintptr_t)uarIdx * stride;
+    /* UAR pages are laid out contiguously from the start of the BAR, one
+     * uarPageSize apart. */
+    return (uintptr_t)uarIdx * s->uarPageSize;
 }
 
 kern_return_t
 MlxUAR::CreateClientSubrange(uint32_t uarIdx, IOMemoryDescriptor **out)
 {
     if (!s || !s->barMem || !out) return kIOReturnBadArgument;
-    uint64_t off = UarOffset(uarIdx);
-    uint64_t len = s->uar4k ? 4096 : (1u << s->logUarPageSize);
-    return IOMemoryDescriptor::CreateSubMemoryDescriptor(0, off, len,
+    /* One UAR page exactly. With the 16 KiB geometry this is also one host
+     * page, so the client's mapping cannot reach a neighbouring UAR. */
+    const uint64_t off = UarOffset(uarIdx);
+    uint64_t barLen = 0;
+    if (s->barMem->GetLength(&barLen) == kIOReturnSuccess && barLen &&
+        off + s->uarPageSize > barLen) {
+        /* Firmware sizes UAR indices to the page size we asked it for, so this
+         * should not happen — log it rather than letting the mapping fail with
+         * no explanation of which index went past the aperture. */
+        MLX_LOG("UAR[%u] at 0x%llx + %u past BAR length 0x%llx",
+                uarIdx, (unsigned long long)off, s->uarPageSize,
+                (unsigned long long)barLen);
+        return kIOReturnNoSpace;
+    }
+    return IOMemoryDescriptor::CreateSubMemoryDescriptor(0, off,
+                                                         s->uarPageSize,
                                                          s->barMem, out);
+}
+
+/* Allocate one 4 KiB doorbell-record page into the bundle's page array. The
+ * DMA work happens outside s->lock; the caller publishes the new count. */
+kern_return_t
+MlxUAR::AllocClientDbPage(MlxClientDoorbellBundle *bundle, uint32_t page)
+{
+    if (!s || !bundle || page >= MLX_CLIENT_MAX_DB_PAGES)
+        return kIOReturnBadArgument;
+    IOBufferMemoryDescriptor *mem = NULL;
+    IODMACommand *dma = NULL;
+    kern_return_t kr = mlxAllocDmaBuffer(MLX_CLIENT_DB_PAGE_SIZE,
+                                         MLX_CLIENT_DB_PAGE_SIZE,
+                                         kIOMemoryDirectionOutIn, &mem);
+    IOAddressSegment segs[4];
+    uint32_t segCount = 4;
+    if (kr == kIOReturnSuccess && mem)
+        kr = mlxPrepareDma(s->pci, mem, segs, &segCount, &dma);
+    uint64_t cpu = 0, length = 0;
+    if (kr == kIOReturnSuccess && segCount == 1 &&
+        segs[0].length >= MLX_CLIENT_DB_PAGE_SIZE)
+        kr = mem->Map(0, 0, 0, 0, &cpu, &length);
+    if (kr != kIOReturnSuccess || !cpu || length < MLX_CLIENT_DB_PAGE_SIZE) {
+        if (dma) mlxCompleteDma(dma);
+        if (mem) mem->release();
+        return kr ? kr : kIOReturnNoSpace;
+    }
+    memset((void *)(uintptr_t)cpu, 0, MLX_CLIENT_DB_PAGE_SIZE);
+    bundle->dbMemory[page] = mem;
+    bundle->dbDma[page] = dma;
+    bundle->dbIOVA[page] = segs[0].address;
+    bundle->dbCpu[page] = (volatile uint8_t *)(uintptr_t)cpu;
+    bundle->dbSlotBitmap[page] = 0;
+    return kIOReturnSuccess;
 }
 
 kern_return_t
@@ -274,50 +320,117 @@ MlxUAR::AllocClientBundle(MlxClientDoorbellBundle *bundle)
 {
     if (!s || !bundle) return kIOReturnBadArgument;
     memset(bundle, 0, sizeof(*bundle));
-    kern_return_t kr = AllocUAR(&bundle->uarIndex);
+    uint32_t slot = 0;
+    kern_return_t kr = AllocClientUar(bundle, &slot);
     if (kr != kIOReturnSuccess) return kr;
-    kr = CreateClientSubrange(bundle->uarIndex, &bundle->uarMemory);
-    if (kr != kIOReturnSuccess || !bundle->uarMemory) {
-        (void)FreeUAR(bundle->uarIndex);
-        memset(bundle, 0, sizeof(*bundle));
+    kr = AllocClientDbPage(bundle, 0);
+    if (kr != kIOReturnSuccess) {
+        FreeClientBundle(bundle);
+        return kr;
+    }
+    bundle->dbPageCount = 1;
+    MLX_LOG("client bundle allocated uar=%u db=0x%llx",
+            bundle->uarIndex[0], (unsigned long long)bundle->dbIOVA[0]);
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+MlxUAR::AllocClientUar(MlxClientDoorbellBundle *bundle, uint32_t *outSlot)
+{
+    if (!s || !bundle) return kIOReturnBadArgument;
+    if (bundle->uarCount >= MLX_CLIENT_MAX_UAR) return kIOReturnNoSpace;
+    uint32_t uarIdx = 0;
+    /* ALLOC_UAR is a firmware command with a multi-second timeout, so it stays
+     * off s->lock: one client growing its pool must not stall another's
+     * doorbell allocation. */
+    kern_return_t kr = AllocUAR(&uarIdx);
+    if (kr != kIOReturnSuccess) return kr;
+    IOMemoryDescriptor *mem = NULL;
+    kr = CreateClientSubrange(uarIdx, &mem);
+    if (kr != kIOReturnSuccess || !mem) {
+        (void)FreeUAR(uarIdx);
         return kr ? kr : kIOReturnNoMemory;
     }
-    kr = mlxAllocDmaBuffer(4096, 4096, kIOMemoryDirectionOutIn,
-                           &bundle->dbMemory);
-    IOAddressSegment segs[4];
-    uint32_t segCount = 4;
-    if (kr == kIOReturnSuccess && bundle->dbMemory)
-        kr = mlxPrepareDma(s->pci, bundle->dbMemory, segs, &segCount,
-                           &bundle->dbDma);
-    uint64_t cpu = 0, length = 0;
-    if (kr == kIOReturnSuccess && segCount == 1 && segs[0].length >= 4096) {
-        bundle->dbIOVA = segs[0].address;
-        kr = bundle->dbMemory->Map(0, 0, 0, 0, &cpu, &length);
+    IOLockLock(s->lock);
+    const uint32_t slot = bundle->uarCount;
+    if (slot >= MLX_CLIENT_MAX_UAR) {
+        IOLockUnlock(s->lock);
+        mem->release();
+        (void)FreeUAR(uarIdx);
+        return kIOReturnNoSpace;
     }
-    if (kr != kIOReturnSuccess || !bundle->dbIOVA || length < 4096) {
-        FreeClientBundle(bundle);
-        return kr ? kr : kIOReturnNoSpace;
-    }
-    bundle->dbCpu = (volatile uint8_t *)(uintptr_t)cpu;
-    memset((void *)(uintptr_t)bundle->dbCpu, 0, 4096);
-    MLX_LOG("client bundle allocated uar=%u db=0x%llx",
-            bundle->uarIndex, (unsigned long long)bundle->dbIOVA);
+    bundle->uarIndex[slot] = uarIdx;
+    bundle->uarMemory[slot] = mem;
+    bundle->uarCount = slot + 1;
+    IOLockUnlock(s->lock);
+    if (outSlot) *outSlot = slot;
+    MLX_LOG("client UAR slot %u = UAR[%u]", slot, uarIdx);
     return kIOReturnSuccess;
+}
+
+uint32_t
+MlxUAR::ClientUarCount(const MlxClientDoorbellBundle *bundle) const
+{
+    return bundle ? bundle->uarCount : 0;
+}
+
+uint32_t
+MlxUAR::ClientUarIndex(const MlxClientDoorbellBundle *bundle,
+                       uint32_t slot) const
+{
+    if (!bundle || slot >= bundle->uarCount) return 0;
+    return bundle->uarIndex[slot];
+}
+
+IOMemoryDescriptor *
+MlxUAR::ClientUarMemory(const MlxClientDoorbellBundle *bundle,
+                        uint32_t slot) const
+{
+    if (!bundle || slot >= bundle->uarCount) return NULL;
+    return bundle->uarMemory[slot];
+}
+
+IOBufferMemoryDescriptor *
+MlxUAR::ClientDbMemory(const MlxClientDoorbellBundle *bundle,
+                       uint32_t page) const
+{
+    if (!bundle || page >= bundle->dbPageCount) return NULL;
+    return bundle->dbMemory[page];
 }
 
 void
 MlxUAR::FreeClientBundle(MlxClientDoorbellBundle *bundle)
 {
     if (!s || !bundle) return;
-    if (s->core->DmaQuarantined()) {
-        s->core->RetainDmaUntilReset(bundle->dbMemory, bundle->dbDma, 0x55415244u);
-        bundle->dbMemory = NULL; bundle->dbDma = NULL;
-        bundle->uarIndex = 0; /* do not reuse a potentially live hardware UAR */
+    const bool quarantined = s->core->DmaQuarantined();
+    for (uint32_t p = 0; p < MLX_CLIENT_MAX_DB_PAGES; p++) {
+        if (quarantined) {
+            s->core->RetainDmaUntilReset(bundle->dbMemory[p], bundle->dbDma[p],
+                                         0x55415244u);
+            bundle->dbMemory[p] = NULL;
+            bundle->dbDma[p] = NULL;
+            continue;
+        }
+        if (bundle->dbDma[p]) {
+            mlxCompleteDma(bundle->dbDma[p]);
+            bundle->dbDma[p] = NULL;
+        }
+        if (bundle->dbMemory[p]) {
+            bundle->dbMemory[p]->release();
+            bundle->dbMemory[p] = NULL;
+        }
     }
-    if (bundle->dbDma) { mlxCompleteDma(bundle->dbDma); bundle->dbDma = NULL; }
-    if (bundle->dbMemory) { bundle->dbMemory->release(); bundle->dbMemory = NULL; }
-    if (bundle->uarMemory) { bundle->uarMemory->release(); bundle->uarMemory = NULL; }
-    if (bundle->uarIndex) (void)FreeUAR(bundle->uarIndex);
+    for (uint32_t u = 0; u < MLX_CLIENT_MAX_UAR; u++) {
+        if (bundle->uarMemory[u]) {
+            bundle->uarMemory[u]->release();
+            bundle->uarMemory[u] = NULL;
+        }
+        /* A quarantined device may still be reading through this UAR, so the
+         * index is deliberately leaked rather than handed back to firmware. */
+        if (bundle->uarIndex[u] && !quarantined)
+            (void)FreeUAR(bundle->uarIndex[u]);
+        bundle->uarIndex[u] = 0;
+    }
     memset(bundle, 0, sizeof(*bundle));
 }
 
@@ -325,37 +438,57 @@ kern_return_t
 MlxUAR::AllocClientDbSlot(MlxClientDoorbellBundle *bundle, uint64_t *outDMA,
                           uint32_t *outOffset)
 {
-    if (!s || !bundle || !bundle->dbCpu || !outDMA || !outOffset)
-        return kIOReturnBadArgument;
-    IOLockLock(s->lock);
-    uint32_t slot = 32;
-    for (uint32_t i = 0; i < 32; i++)
-        if (!(bundle->dbSlotBitmap & (1u << i))) { slot = i; break; }
-    if (slot == 32) { IOLockUnlock(s->lock); return kIOReturnNoSpace; }
-    bundle->dbSlotBitmap |= 1u << slot;
-    *outOffset = slot * 128;
-    *outDMA = bundle->dbIOVA + *outOffset;
-    memset((void *)(uintptr_t)(bundle->dbCpu + *outOffset), 0, 128);
-    IOLockUnlock(s->lock);
-    return kIOReturnSuccess;
+    if (!s || !bundle || !outDMA || !outOffset) return kIOReturnBadArgument;
+    for (;;) {
+        IOLockLock(s->lock);
+        for (uint32_t p = 0; p < bundle->dbPageCount; p++) {
+            if (!bundle->dbCpu[p]) continue;
+            for (uint32_t i = 0; i < MLX_CLIENT_DB_SLOTS_PER_PAGE; i++) {
+                if (bundle->dbSlotBitmap[p] & (1u << i)) continue;
+                bundle->dbSlotBitmap[p] |= 1u << i;
+                const uint32_t within = i * MLX_CLIENT_DB_SLOT_SIZE;
+                *outOffset = p * MLX_CLIENT_DB_PAGE_SIZE + within;
+                *outDMA = bundle->dbIOVA[p] + within;
+                memset((void *)(uintptr_t)(bundle->dbCpu[p] + within), 0,
+                       MLX_CLIENT_DB_SLOT_SIZE);
+                IOLockUnlock(s->lock);
+                return kIOReturnSuccess;
+            }
+        }
+        const uint32_t grow = bundle->dbPageCount;
+        IOLockUnlock(s->lock);
+        if (grow >= MLX_CLIENT_MAX_DB_PAGES) return kIOReturnNoSpace;
+        kern_return_t kr = AllocClientDbPage(bundle, grow);
+        if (kr != kIOReturnSuccess) return kr;
+        IOLockLock(s->lock);
+        bundle->dbPageCount = grow + 1;
+        IOLockUnlock(s->lock);
+    }
 }
 
 void
 MlxUAR::FreeClientDbSlot(MlxClientDoorbellBundle *bundle, uint32_t offset)
 {
-    if (!s || !bundle || !bundle->dbCpu || (offset & 127) || offset >= 4096)
-        return;
+    if (!s || !bundle || (offset & (MLX_CLIENT_DB_SLOT_SIZE - 1))) return;
     if (s->core->DmaQuarantined()) return;
+    const uint32_t page = offset / MLX_CLIENT_DB_PAGE_SIZE;
+    const uint32_t within = offset % MLX_CLIENT_DB_PAGE_SIZE;
     IOLockLock(s->lock);
-    memset((void *)(uintptr_t)(bundle->dbCpu + offset), 0, 128);
-    bundle->dbSlotBitmap &= ~(1u << (offset / 128));
+    if (page < bundle->dbPageCount && bundle->dbCpu[page]) {
+        memset((void *)(uintptr_t)(bundle->dbCpu[page] + within), 0,
+               MLX_CLIENT_DB_SLOT_SIZE);
+        bundle->dbSlotBitmap[page] &=
+            ~(1u << (within / MLX_CLIENT_DB_SLOT_SIZE));
+    }
     IOLockUnlock(s->lock);
 }
 
 volatile uint32_t *
 MlxUAR::GetClientDbRecord(MlxClientDoorbellBundle *bundle, uint32_t offset)
 {
-    if (!bundle || !bundle->dbCpu || (offset & 127) || offset >= 4096)
-        return NULL;
-    return (volatile uint32_t *)(bundle->dbCpu + offset);
+    if (!bundle || (offset & (MLX_CLIENT_DB_SLOT_SIZE - 1))) return NULL;
+    const uint32_t page = offset / MLX_CLIENT_DB_PAGE_SIZE;
+    const uint32_t within = offset % MLX_CLIENT_DB_PAGE_SIZE;
+    if (page >= bundle->dbPageCount || !bundle->dbCpu[page]) return NULL;
+    return (volatile uint32_t *)(bundle->dbCpu[page] + within);
 }

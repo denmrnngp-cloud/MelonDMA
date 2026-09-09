@@ -50,6 +50,10 @@ struct MlxP1GeneralCaps {
     bool atomic;
     bool roceRwSupported;
     bool uar4k;
+    uint16_t logUarPageSize;   /* log_uar_page_sz @0x490, in 4 KiB units */
+    /* Ticks per second of the card's internal timer, the clock behind every
+     * CQE timestamp. Without it a timestamp is a number with no unit. */
+    uint32_t deviceFrequencyKhz;  /* @0x4e0 */
     bool cacheLine128;
     bool bf;
     uint8_t logMaxSrqSz;
@@ -174,6 +178,8 @@ static inline bool mlxP1ParseGeneralCaps(const uint8_t *cap, size_t length,
     out->roce = mlxGetBits(cap, 0x21c, 1) != 0;
     out->atomic = mlxGetBits(cap, 0x21d, 1) != 0;
     out->uar4k = mlxGetBits(cap, 0x240, 1) != 0;
+    out->logUarPageSize = static_cast<uint16_t>(mlxGetBits(cap, 0x490, 16));
+    out->deviceFrequencyKhz = static_cast<uint32_t>(mlxGetBits(cap, 0x4e0, 32));
     out->cacheLine128 = mlxGetBits(cap, 0x164, 1) != 0;
     out->bf = mlxGetBits(cap, 0x260, 1) != 0;
     out->logMaxSrqSz = static_cast<uint8_t>(mlxGetBits(cap, 0x80, 8));

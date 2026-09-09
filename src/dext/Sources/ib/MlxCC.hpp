@@ -25,6 +25,11 @@ public:
     void            Free();
 
     kern_return_t   QueryParams(struct mlx_cc_params *out);
+    /* QUERY_CONG_STATUS (0x822) and QUERY_CONG_STATISTICS (0x826) together:
+     * whether firmware's loop is enabled for a priority, and what it has done
+     * since the counters were last cleared. Both are read-only. */
+    kern_return_t   QueryStats(const struct mlx_cc_stats_req *req,
+                               struct mlx_cc_stats_resp *out);
     kern_return_t   ModifyParams(const struct mlx_cc_params *in);
     bool            IsEnabled() const;
 

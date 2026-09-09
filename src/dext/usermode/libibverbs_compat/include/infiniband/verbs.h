@@ -11,7 +11,7 @@ extern "C" {
 #endif
 
 /* Values match rdma-core so consumer sources compile unchanged. */
-enum ibv_qp_type { IBV_QPT_RC = 2, IBV_QPT_UD = 4 };
+enum ibv_qp_type { IBV_QPT_RC = 2, IBV_QPT_UC = 3, IBV_QPT_UD = 4 };
 enum ibv_qp_state {
     IBV_QPS_RESET = 0, IBV_QPS_INIT = 1, IBV_QPS_RTR = 2,
     IBV_QPS_RTS = 3, IBV_QPS_SQD = 4, IBV_QPS_SQE = 5, IBV_QPS_ERR = 6
@@ -42,7 +42,8 @@ enum ibv_wr_opcode {
     IBV_WR_RDMA_READ = 4,
     IBV_WR_LOCAL_INV = 5,
     IBV_WR_ATOMIC_CMP_AND_SWP = 6,
-    IBV_WR_ATOMIC_FETCH_AND_ADD = 7
+    IBV_WR_ATOMIC_FETCH_AND_ADD = 7,
+    IBV_WR_SEND_WITH_INV = 8
 };
 enum ibv_wc_status {
     IBV_WC_SUCCESS = 0,
@@ -65,7 +66,7 @@ enum ibv_wc_opcode {
 /* IBV_WC_GRH marks a datagram receive whose buffer begins with 40 bytes of
  * global routing header; the payload starts after it. */
 enum { IBV_WC_WITH_IMM = 1 << 0, IBV_WC_WITH_ATOMIC = 1 << 1,
-       IBV_WC_GRH = 1 << 2 };
+       IBV_WC_GRH = 1 << 2, IBV_WC_WITH_INV = 1 << 3 };
 #define IBV_GRH_BYTES 40
 
 enum {
@@ -145,6 +146,7 @@ struct ibv_mlx5_perf {
      * to memory registration, QP creation and GID programming alike. */
     uint64_t fw_commands;
     uint64_t fw_command_sleeps;
+    uint64_t fw_command_slot_waits;
     uint64_t cq_event_wakeups;
 };
 
@@ -243,19 +245,31 @@ struct ibv_gid_entry {
 
 struct ibv_device { char name[64]; };
 struct ibv_context;
+struct ibv_srq;
 
 enum ibv_event_type {
     IBV_EVENT_CQ_ERR = 0,
     IBV_EVENT_QP_FATAL = 1,
+    IBV_EVENT_QP_REQ_ERR = 2,
+    IBV_EVENT_QP_ACCESS_ERR = 3,
+    IBV_EVENT_COMM_EST = 4,
+    IBV_EVENT_SQ_DRAINED = 5,
+    IBV_EVENT_PATH_MIG = 6,
+    IBV_EVENT_PATH_MIG_ERR = 7,
     IBV_EVENT_DEVICE_FATAL = 8,
     IBV_EVENT_PORT_ACTIVE = 9,
     IBV_EVENT_PORT_ERR = 10,
+    IBV_EVENT_SRQ_ERR = 13,
+    IBV_EVENT_SRQ_LIMIT_REACHED = 14,
+    IBV_EVENT_QP_LAST_WQE_REACHED = 16,
     IBV_EVENT_GID_CHANGE = 18,
+    IBV_EVENT_WQ_FATAL = 19,
 };
 
 struct ibv_async_event {
     enum ibv_event_type event_type;
-    union { struct ibv_cq *cq; struct ibv_qp *qp; uint8_t port_num; } element;
+    union { struct ibv_cq *cq; struct ibv_qp *qp; struct ibv_srq *srq;
+            uint8_t port_num; } element;
 };
 
 struct ibv_device_attr {
@@ -281,6 +295,11 @@ struct ibv_device_attr {
     int max_qp_init_rd_atom;
     int max_ee_init_rd_atom;
     uint8_t phys_port_cnt;
+    /* Identity, as rdma-core spells it: big-endian on the wire, so a consumer
+     * that prints or compares one gets the same bytes it would from a Linux
+     * host. Zero when firmware supplied none. */
+    uint64_t node_guid;
+    uint64_t sys_image_guid;
 };
 struct ibv_pd;
 struct ibv_cq;
@@ -316,7 +335,11 @@ struct ibv_send_wr {
     int num_sge;
     enum ibv_wr_opcode opcode;
     unsigned int send_flags;
-    uint32_t imm_data;
+    union {
+        uint32_t imm_data;
+        uint32_t invalidate_rkey;
+        struct { uint32_t invalidate_rkey; } ex;
+    };
     union {
         struct { uint64_t remote_addr; uint32_t rkey; } rdma;
         struct {
@@ -349,7 +372,10 @@ struct ibv_wc {
     enum ibv_wc_opcode opcode;
     uint32_t vendor_err;
     uint32_t byte_len;
-    uint32_t imm_data;
+    union {
+        uint32_t imm_data;
+        uint32_t invalidated_rkey;
+    };
     uint32_t qp_num;
     uint32_t src_qp;
     int wc_flags;
@@ -736,6 +762,7 @@ struct ibv_srq {
     struct ibv_pd *pd;
     uint32_t handle;
     void *priv;
+    struct ibv_srq *context_next;
 };
 
 struct ibv_flow { uint32_t comp_mask; struct ibv_context *context; uint32_t handle; };
@@ -774,6 +801,7 @@ struct ibv_qp_ex {
                               uint64_t remote_addr, __be32 imm_data);
     void (*wr_send)(struct ibv_qp_ex *qp);
     void (*wr_send_imm)(struct ibv_qp_ex *qp, __be32 imm_data);
+    void (*wr_send_inv)(struct ibv_qp_ex *qp, uint32_t invalidate_rkey);
     void (*wr_local_inv)(struct ibv_qp_ex *qp, uint32_t invalidate_rkey);
     void (*wr_set_inline_data)(struct ibv_qp_ex *qp, void *addr, size_t length);
     void (*wr_set_inline_data_list)(struct ibv_qp_ex *qp, size_t num_buf,
@@ -802,6 +830,8 @@ static inline void ibv_wr_rdma_read(struct ibv_qp_ex *qp, uint32_t rkey,
 static inline void ibv_wr_send(struct ibv_qp_ex *qp) { qp->wr_send(qp); }
 static inline void ibv_wr_send_imm(struct ibv_qp_ex *qp, __be32 imm_data)
 { qp->wr_send_imm(qp, imm_data); }
+static inline void ibv_wr_send_inv(struct ibv_qp_ex *qp, uint32_t invalidate_rkey)
+{ qp->wr_send_inv(qp, invalidate_rkey); }
 static inline void ibv_wr_local_inv(struct ibv_qp_ex *qp, uint32_t invalidate_rkey)
 { qp->wr_local_inv(qp, invalidate_rkey); }
 static inline void ibv_wr_atomic_cmp_swp(struct ibv_qp_ex *qp, uint32_t rkey,
@@ -859,6 +889,13 @@ int ibv_modify_srq(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr,
                    int srq_attr_mask);
 int ibv_query_srq(struct ibv_srq *srq, struct ibv_srq_attr *srq_attr);
 int ibv_get_srq_num(struct ibv_srq *srq, uint32_t *srq_num);
+/* Build a reply address from a received RoCEv2 GRH.  As on rdma-core, the
+ * caller may inspect the attributes first or create the AH in one call. */
+int ibv_init_ah_from_wc(struct ibv_context *context, uint8_t port_num,
+                        struct ibv_wc *wc, struct ibv_grh *grh,
+                        struct ibv_ah_attr *ah_attr);
+struct ibv_ah *ibv_create_ah_from_wc(struct ibv_pd *pd, struct ibv_wc *wc,
+                                     struct ibv_grh *grh, uint8_t port_num);
 
 enum { IBV_SRQ_MAX_WR = 1 << 0, IBV_SRQ_LIMIT = 1 << 1 };
 int ibv_attach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid);

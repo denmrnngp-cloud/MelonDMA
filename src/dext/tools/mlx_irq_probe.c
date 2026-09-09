@@ -39,17 +39,27 @@ static void print_index_map(const struct rdma_interrupt_attr *irq)
     printf("IRQ_MAP: probed %u indices after allocation, %u before; "
            "probe status 0x%x\n",
            irq->index_count, irq->index_count_pre, irq->index_probe_status);
-    printf("  idx  before      after       raw type\n");
+    printf("  idx  before      after       raw type      bind\n");
     for (unsigned i = 0; i < RDMA_IRQ_INDEX_MAP; i++) {
         if (irq->index_kind[i] == RDMA_IRQ_KIND_ABSENT &&
             irq->index_kind_pre[i] == RDMA_IRQ_KIND_ABSENT)
             continue;
-        printf("  %3u  %-10s  %-10s  0x%llx%s\n", i,
+        /* bind is the kern_return_t of a trial dispatch-source Create on an
+         * index the driver does not use: 0 means a vector really is available
+         * there, not merely allocated and programmed. */
+        char bind[24];
+        if (irq->index_bind[i] == RDMA_IRQ_BIND_NOT_TRIED)
+            snprintf(bind, sizeof(bind), "%-12s", "-");
+        else if (irq->index_bind[i] == 0)
+            snprintf(bind, sizeof(bind), "%-12s", "BINDS");
+        else
+            snprintf(bind, sizeof(bind), "0x%-10x", irq->index_bind[i]);
+        printf("  %3u  %-10s  %-10s  0x%-9llx  %s%s\n", i,
                kind_name(irq->index_kind_pre[i]),
                kind_name(irq->index_kind[i]),
-               (unsigned long long)irq->index_type_raw[i],
-               i == irq->async_index ? "   <- async source"
-               : i == irq->completion_index ? "   <- completion source" : "");
+               (unsigned long long)irq->index_type_raw[i], bind,
+               i == irq->async_index ? "  <- async source"
+               : i == irq->completion_index ? "  <- completion source" : "");
     }
     if (irq->msix_index_base == RDMA_IRQ_INDEX_NONE)
         printf("IRQ_MAP: no messaged pair found — the DEXT kept the historical "
@@ -57,7 +67,17 @@ static void print_index_map(const struct rdma_interrupt_attr *irq)
                "is legacy INTx and cannot fire.\n",
                irq->async_index, irq->completion_index);
     else
-        printf("IRQ_MAP: firmware vector V arrives on host index %u + V; "
+        if (irq->completion_eq_count > 1) {
+        printf("COMP_EQ: %u queues, interrupts each:", irq->completion_eq_count);
+        for (unsigned i = 0; i < irq->completion_eq_count &&
+                             i < RDMA_IRQ_COMP_EQ_MAX; i++)
+            printf(" [%u]=%llu", i,
+                   (unsigned long long)irq->completion_irq_by_eq[i]);
+        printf("\n");
+    } else {
+        printf("COMP_EQ: 1 queue (no extra completion vectors came up)\n");
+    }
+    printf("IRQ_MAP: firmware vector V arrives on host index %u + V; "
                "async bound to %u, completion to %u\n",
                irq->msix_index_base, irq->async_index, irq->completion_index);
 }
@@ -126,7 +146,7 @@ int main(int argc, char **argv)
     else if (argc == 2 && argv[1][0] >= '0' && argv[1][0] <= '9')
         rebind = (int)strtoul(argv[1], NULL, 10);   /* historical form */
     else if (argc != 1) {
-        fprintf(stderr, "usage: %s [--rebind <0|1>]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--rebind <vector>]   (0..8 here; see the bind column)\n", argv[0]);
         return 2;
     }
 

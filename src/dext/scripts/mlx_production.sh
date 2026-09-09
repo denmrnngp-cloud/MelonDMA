@@ -5,7 +5,7 @@
 #
 # RELEASE-REQUIRED (2026-09-02): the boot-time startup improvement is not yet
 # wired here — see docs/production-release-notes.md. The package/install must
-# place the flat .dext at /Library/DriverExtensions/com.mlx5.rdma.dext.dext/
+# place the flat .dext at /Library/DriverExtensions/com.melondma.rdma.dext.dext/
 # (Info.plist + executable at bundle root, NOT a Contents/ bundle) so the DEXT
 # captures the card automatically at cold boot via kernelmanagerd's guess-scan.
 set -euo pipefail
@@ -13,8 +13,8 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
-APP_ID=com.mlx5.rdma.loader
-DEXT_ID=com.mlx5.rdma.dext
+APP_ID=com.melondma.rdma.loader
+DEXT_ID=com.melondma.rdma.dext
 APP_NAME=MlxRDMA.app
 INSTALL_APP=/Applications/$APP_NAME
 DIST_DIR=${DIST_DIR:-$ROOT/dist}

@@ -5,7 +5,7 @@
 	<key>CFBundleExecutable</key>
 	<string>mlx_activate</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.mlx5.rdma.loader</string>
+	<string>com.melondma.rdma.loader</string>
 	<key>CFBundleName</key>
 	<string>MlxRDMA Loader</string>
 	<key>CFBundlePackageType</key>
@@ -13,7 +13,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.1</string>
 	<key>CFBundleVersion</key>
-	<string>0.479</string>
+	<string>0.539</string>
 	<key>LSBackgroundOnly</key>
 	<true/>
 </dict>

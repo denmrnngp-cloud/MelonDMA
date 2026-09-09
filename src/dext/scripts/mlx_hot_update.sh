@@ -12,12 +12,12 @@ owner() {
 }
 
 active_pid() {
-    pgrep -f '/Library/SystemExtensions/.*/com.mlx5.rdma.dext.systemextension/Contents/MacOS/MlxRDMA' |
+    pgrep -f '/Library/SystemExtensions/.*/com.melondma.rdma.dext.systemextension/Contents/MacOS/MlxRDMA' |
         head -1 || true
 }
 
 swap_stuck() {
-    systemextensionsctl list 2>/dev/null | grep -i 'com.mlx5.rdma.dext' |
+    systemextensionsctl list 2>/dev/null | grep -i 'com.melondma.rdma.dext' |
         grep -E 'terminating|waiting to upgrade' || true
 }
 
@@ -41,7 +41,7 @@ recover_swap() {
     done
 
     echo "ERROR: DEXT swap did not recover after terminating PID $pid." >&2
-    systemextensionsctl list 2>/dev/null | grep -i 'com.mlx5.rdma.dext' >&2 || true
+    systemextensionsctl list 2>/dev/null | grep -i 'com.melondma.rdma.dext' >&2 || true
     return 1
 }
 
@@ -65,7 +65,7 @@ if [ "${1:-}" = "--check" ]; then
         exit 1
     }
     echo "HOT_UPDATE_CHECK PASS: one active MlxRDMA process owns ethernet@0"
-    systemextensionsctl list 2>/dev/null | grep -i 'com.mlx5.rdma.dext'
+    systemextensionsctl list 2>/dev/null | grep -i 'com.melondma.rdma.dext'
     exit 0
 fi
 
@@ -85,4 +85,4 @@ recover_swap
 recover_swap
 
 echo "=== hot update PASS ==="
-systemextensionsctl list 2>/dev/null | grep -i 'com.mlx5.rdma.dext'
+systemextensionsctl list 2>/dev/null | grep -i 'com.melondma.rdma.dext'

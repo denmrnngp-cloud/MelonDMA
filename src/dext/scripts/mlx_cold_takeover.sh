@@ -10,7 +10,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 APP=/Applications/MlxRDMA.app
 ACT="$APP/Contents/MacOS/mlx_activate"
 TEAM="${MLX_TEAM_ID:-}"
-BUNDLE=com.mlx5.rdma.dext
+BUNDLE=com.melondma.rdma.dext
 APPLE=AppleEthernetMLX5
 
 cd "$ROOT"

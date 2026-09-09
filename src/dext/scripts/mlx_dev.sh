@@ -5,7 +5,7 @@
 #   build         build a new version (auto-bump 0.N -> 0.N+1) + install app
 #   release       build + activation (REPLACE) + card takeover + verification
 #   takeover      card takeover only (no build) — the main state-machine
-#   release       safely return the card to AppleEthernetMLX5 without reboot
+#   driver-release request a live return of the card to AppleEthernetMLX5
 #   status        card owner, counters, dext version, processes
 #   log [N]       tail of the kernel log (MlxPCIDriver/MlxCmd)
 #   rematch       synonym for takeover (compatibility with the old script)
@@ -43,7 +43,7 @@ PLIST_LOADER=loader/LoaderInfo.plist
 SIGN_ID="${MLX_SIGN_ID:-Apple Development}"
 PROBE_TOOL="$PWD/build/mlx_rematch_probe"
 APPLE_PAT="AppleEthernetMLX5"
-OUR_PAT="com.mlx5.rdma.dext.systemextension/Contents/MacOS/MlxRDMA"
+OUR_PAT="com.melondma.rdma.dext.systemextension/Contents/MacOS/MlxRDMA"
 
 MAX_ROUNDS="${MLX_MAX_ROUNDS:-12}"
 LOCK_DIR="${TMPDIR:-/tmp}/melon-mlx-dev-${UID}.lock"
@@ -146,8 +146,14 @@ wait_userclient_ready() {
             return 2
         fi
         if ioreg -r -c MlxPCIDriver -l -w 0 2>/dev/null \
-            | grep -Fq "\"MlxBuildTag\" = \"$expected_tag\""; then
-            return 0
+            | grep -Fq "\"MlxBuildTag\" = \"$expected_tag\"" &&
+           [ -x build/mlx_phase2_gate ]; then
+            out=$(./build/mlx_phase2_gate --preflight 2>&1)
+            status=$?
+            if [ "$status" -eq 0 ]; then
+                echo "$out"
+                return 0
+            fi
         fi
         sleep 0.25
     done
@@ -237,7 +243,7 @@ takeover() {
     if [ -z "$MC" ] || [ "$MC" -lt 2 ]; then
         log "OUR PERSONA IS NOT in the kernel catalog (IODEXTMatchCount=${MC:-0})."
         log "  takeover without a persona is impossible. You need ONE of:"
-        log "  (a) a new version: sudo ./scripts/mlx_dev.sh release"
+        log "  (a) a new version: ./scripts/mlx_dev.sh release"
         log "  (b) a full cleanup:  systemextensionsctl reset → reboot →"
         log "                      activation → reboot → takeover"
         diagnose "${O:-orphan}"
@@ -307,7 +313,7 @@ takeover() {
         MC=$(ext_match)
         if [ -z "$MC" ] || [ "$MC" -lt 2 ]; then
             log "  UNRECOVERABLE without a reboot: no persona in the catalog."
-            log "  → DO A REBOOT, then again: sudo ./scripts/mlx_dev.sh takeover"
+            log "  → DO A REBOOT, then again: ./scripts/mlx_dev.sh takeover"
             diagnose "orphan"
             return 1
         fi
@@ -357,17 +363,21 @@ do_driver_release() {
     strings "$ACT" 2>/dev/null | grep -Fq 'REQUEST: deactivate' ||
         fail "installed loader is outdated and does not support deactivation; first run ./scripts/mlx_dev.sh release, then repeat driver-release"
     log "requesting proper deactivation of the system extension from /Applications without reboot"
-    out=$("$ACT" --deactivate 2>&1) || {
-        echo "$out"
-        fail "deactivation request failed"
-    }
+    # OSSystemExtensionRequest can report rawValue: 1 while sysextd is still
+    # completing the in-flight unload.  The authoritative result is ownership
+    # of the PCI nub below, not the loader process exit status alone.
+    out=$("$ACT" --deactivate 2>&1)
+    local request_rc=$?
     echo "$out"
-    echo "$out" | grep -q 'REQUEST: deactivate com.mlx5.rdma.dext' ||
+    echo "$out" | grep -q 'REQUEST: deactivate com.melondma.rdma.dext' ||
         fail "loader did not send the deactivation request; check a fresh build/MlxRDMA.app"
     echo "$out" | grep -q 'REPLACE:' &&
         fail "loader sent replace instead of deactivation"
-    echo "$out" | grep -q 'RESULT: completed' ||
-        fail "deactivation did not complete successfully; reset/reboot were not performed"
+    if ! echo "$out" | grep -q 'RESULT: completed'; then
+        echo "$out" | grep -q 'rawValue: 1' ||
+            fail "deactivation did not complete successfully (loader exit=$request_rc)"
+        log "deactivation is completing asynchronously; waiting for Apple ownership"
+    fi
     for ((i=0; i<40; i++)); do
         sleep 0.5
         O=$(owner)
@@ -428,17 +438,17 @@ do_doctor() {
         echo "    2) sudo reboot"
         echo "    3) systemextensionsctl list  → expect 0 extension(s)"
         echo "    4) sudo rm -rf /Applications/MlxRDMA.app"
-        echo "    5) sudo ./scripts/mlx_dev.sh build   (builds a new version + installs the app)"
+        echo "    5) ./scripts/mlx_dev.sh build   (builds a new version + installs the app)"
         echo "    6) sudo /Applications/MlxRDMA.app/Contents/MacOS/mlx_activate"
         echo "       → NEEDS APPROVAL → System Settings > Login Items & Extensions > Allow"
         echo "       → repeat the activation → RESULT: completed"
         echo "    7) sudo reboot   (so the persona gets into the kernel catalog)"
-        echo "    8) sudo ./scripts/mlx_dev.sh takeover"
+        echo "    8) ./scripts/mlx_dev.sh takeover"
     elif [ -n "$mc" ] && [ "$mc" -ge 2 ]; then
-        echo "  ✅ persona in the catalog. Action: sudo ./scripts/mlx_dev.sh takeover"
+        echo "  ✅ persona in the catalog. Action: ./scripts/mlx_dev.sh takeover"
     else
         echo "  ⚠️  our persona is not in the catalog (IODEXTMatchCount=${mc:-0})."
-        echo "     New version:  sudo ./scripts/mlx_dev.sh release"
+        echo "     New version:  ./scripts/mlx_dev.sh release"
         echo "     Full cleanup: see above (reset → reboot → activation → reboot → takeover)"
     fi
 }
@@ -459,7 +469,7 @@ do_build() {
     # One dependency graph builds and validates the portable encoders, IIG,
     # DEXT, signed gate and app.  Do not pipe make through grep: that used to
     # hide make's exit status and could install a stale binary after a failure.
-    if ! make SIGN_ID="$SIGN_ID" check-dext app; then
+    if ! make SIGN_ID="$SIGN_ID" check-host check-dext phase2-gate phase3-gate p3-gate app; then
         plutil -replace CFBundleVersion -string "$ver" "$PLIST_DEXT"
         plutil -replace CFBundleShortVersionString -string "$ver" "$PLIST_DEXT"
         plutil -replace CFBundleVersion -string "$loader_ver" "$PLIST_LOADER"
@@ -508,7 +518,7 @@ do_release() {
         log "after activation the persona is still not in the catalog (IODEXTMatchCount=${MC:-0})."
         log "This is a fresh install → a reboot is needed, then takeover:"
         log "  sudo reboot"
-        log "  sudo ./scripts/mlx_dev.sh takeover"
+        log "  ./scripts/mlx_dev.sh takeover"
         return 1
     fi
 

@@ -73,12 +73,70 @@ struct MlxInitSeg {
  * at the smallest legal register size, so 64 is headroom, not a limit. */
 #define MLX_BF_MAX_REGS         64u
 
+/* The card always lays its BAR out in 4 KiB adapter pages (mlx5's
+ * MLX5_ADAPTER_PAGE_SIZE), and a UAR page larger than that is padding, not
+ * more hardware. Measured on ConnectX-4 Lx with a 16 KiB UAR: a QP handed a
+ * blue-flame register at 0x1800 posts without error and never completes —
+ * mlx_qp_scale at 8 lanes left exactly the four lanes above 0x1000 spinning
+ * in ibv_poll_cq. So the registers of a UAR live in its first adapter page
+ * whatever page size firmware granted, and a larger page buys isolation
+ * rather than parallelism. More registers per client come from allocating
+ * more UAR indices, not from striding inside one. */
+#define MLX_UAR_ADAPTER_PAGE_SIZE 4096u
+
+/* log_uar_page_sz we ask firmware for in SET_HCA_CAP. Every Apple silicon host
+ * has 16 KiB pages, and Apple's own mlx5 DEXT writes 2 here (handleHCACap at
+ * 0x100010c44) and then addresses UAR pages as index << 14. Matching it makes
+ * a client's UAR mapping exactly one host page: a 4 KiB sub-range handed to a
+ * 16 KiB-page process cannot map only 4 KiB, so the window used to cover three
+ * neighbouring UARs. */
+#define MLX_LOG_UAR_PAGE_SZ     2u
+
+/* UAR page size in bytes. uar_4k makes firmware hand out UAR indices in 4 KiB
+ * units (mlx5's uar2pfn shifts the index down by PAGE_SHIFT-12 in that case);
+ * with it clear the index counts whole log_uar_page_sz pages, which is the
+ * configuration Apple runs. */
+static inline uint32_t mlxUarPageSizeBytes(bool uar4k, uint16_t logUarPageSz)
+{
+    if (uar4k || logUarPageSz > 8) return MLX_UAR_ADAPTER_PAGE_SIZE;
+    return MLX_UAR_ADAPTER_PAGE_SIZE << logUarPageSz;
+}
+
+/* The window inside a UAR page that actually carries registers. */
+static inline uint32_t mlxUarRegisterWindow(uint32_t uarPageSize)
+{
+    return uarPageSize < MLX_UAR_ADAPTER_PAGE_SIZE ?
+        uarPageSize : MLX_UAR_ADAPTER_PAGE_SIZE;
+}
+
 static inline uint32_t mlxBfRegsPerUar(uint32_t uarPageSize, uint32_t bfRegSize)
 {
-    if (!bfRegSize || uarPageSize <= MLX_BF_OFFSET) return 0;
-    uint32_t n = (uarPageSize - MLX_BF_OFFSET) / bfRegSize;
+    const uint32_t window = mlxUarRegisterWindow(uarPageSize);
+    if (!bfRegSize || window <= MLX_BF_OFFSET) return 0;
+    const uint32_t n = (window - MLX_BF_OFFSET) / bfRegSize;
     return n > MLX_BF_MAX_REGS ? MLX_BF_MAX_REGS : n;
 }
+
+/* Byte offset of blue-flame register `index` within the UAR page, and its
+ * inverse. mlxBfRegIndex returns MLX_BF_MAX_REGS for anything that is not a
+ * register start, so a caller reverse-mapping a stored offset can tell a
+ * stale or out-of-window value from a real one. */
+static inline uint32_t mlxBfRegOffset(uint32_t index, uint32_t uarPageSize,
+                                      uint32_t bfRegSize)
+{
+    (void)uarPageSize;
+    return MLX_BF_OFFSET + index * bfRegSize;
+}
+
+static inline uint32_t mlxBfRegIndex(uint32_t offset, uint32_t uarPageSize,
+                                     uint32_t bfRegSize)
+{
+    if (!bfRegSize || offset < MLX_BF_OFFSET ||
+        offset >= mlxUarRegisterWindow(uarPageSize) ||
+        (offset - MLX_BF_OFFSET) % bfRegSize != 0) return MLX_BF_MAX_REGS;
+    return (offset - MLX_BF_OFFSET) / bfRegSize;
+}
+
 #define MLX_CQ_DOORBELL         0x20    /* CQ doorbell */
 #define MLX_EQ_DOORBELL         0x40    /* EQ doorbell */
 
@@ -94,6 +152,7 @@ static inline uint32_t mlxBfRegsPerUar(uint32_t uarPageSize, uint32_t bfRegSize)
  */
 enum {
     MLX_CMD_OP_QUERY_HCA_CAP          = 0x100,
+    MLX_CMD_OP_QUERY_ADAPTER          = 0x101,
     MLX_CMD_OP_SET_HCA_CAP            = 0x109,
     MLX_CMD_OP_ENABLE_HCA             = 0x104,
     MLX_CMD_OP_DISABLE_HCA            = 0x105,
@@ -109,6 +168,9 @@ enum {
     /* ACCESS_REG register ids. PPCNT carries the port counter sets; MPEIN
      * describes the PCIe link the card sits behind, which on this host is a
      * Thunderbolt tunnel rather than a slot. */
+    MLX_REG_ID_PTYS                   = 0x5004,
+    MLX_REG_ID_PAOS                   = 0x5006,
+    MLX_REG_ID_PFCC                   = 0x5007,
     MLX_REG_ID_PPCNT                  = 0x5008,
     MLX_REG_ID_MPEIN                  = 0x9050,
     MLX_CMD_OP_CREATE_MKEY            = 0x200,
@@ -144,6 +206,12 @@ enum {
     MLX_CMD_OP_QUERY_ROCE_ADDRESS     = 0x760,
     MLX_CMD_OP_QUERY_VPORT_STATE      = 0x750,
     MLX_CMD_OP_QUERY_NIC_VPORT_CONTEXT = 0x754,
+    /* Per-vport queue counters. The set a QP belongs to is its QPC
+     * counter_set_id, which is zero unless something sets it, so set 0 is
+     * where this driver's traffic lands without allocating anything. */
+    MLX_CMD_OP_ALLOC_Q_COUNTER        = 0x771,
+    MLX_CMD_OP_DEALLOC_Q_COUNTER      = 0x772,
+    MLX_CMD_OP_QUERY_Q_COUNTER        = 0x773,
     MLX_CMD_OP_MODIFY_NIC_VPORT_CONTEXT = 0x755,
     MLX_CMD_OP_MODIFY_CONG_PARAMS     = 0x825,
     MLX_CMD_OP_QUERY_CONG_PARAMS      = 0x824,
@@ -206,14 +274,24 @@ enum {
     MLX_EVENT_TYPE_COMM_EST       = 0x02,
     MLX_EVENT_TYPE_SQ_DRAINED     = 0x03,
     MLX_EVENT_TYPE_WQ_CATAS_ERROR = 0x05,
+    MLX_EVENT_TYPE_PATH_MIG_FAILED = 0x07,
     MLX_EVENT_TYPE_CMD            = 0x0a,   /* command completion */
     MLX_EVENT_TYPE_PAGE_REQUEST   = 0x0b,   /* firmware requests pages */
+    MLX_EVENT_TYPE_WQ_INVAL_REQ_ERROR = 0x10,
+    MLX_EVENT_TYPE_WQ_ACCESS_ERROR = 0x11,
     MLX_EVENT_TYPE_SRQ_LAST_WQE   = 0x13,
     MLX_EVENT_TYPE_SRQ_RQ_LIMIT   = 0x14,
     MLX_EVENT_TYPE_NIC_VPORT_CHANGE = 0x0d,
     /* port/device-level events (See Linux device.h:354 mlx5_event) */
     MLX_EVENT_TYPE_DEVICE_FATAL      = 0x08,
     MLX_EVENT_TYPE_PORT_STATE_CHANGE = 0x09,
+    /* Values from mlx5's own enum mlx5_event (device.h). Decoding these instead
+     * of dropping them is the difference between a log line naming an unplugged
+     * transceiver and silence. */
+    MLX_EVENT_TYPE_CQ_ERROR          = 0x04,
+    MLX_EVENT_TYPE_SRQ_CATAS_ERROR   = 0x12,
+    MLX_EVENT_TYPE_PORT_MODULE_EVENT = 0x16,
+    MLX_EVENT_TYPE_TEMP_WARN_EVENT   = 0x17,
 };
 
 /* Transport type st field (QPC) — mlx5_ifc.h: MLX5_QPC_ST_* */
@@ -227,6 +305,14 @@ enum {
     MLX_GRH_BYTES             = 40,
     MLX_QPC_QKEY_BIT_OFFSET   = 0x540,
     MLX_QPC_SQ_PSN_BIT_OFFSET = 0x3c8,
+    /* Scatter-to-CQE QPC fields (mlx5_ifc.h mlx5_ifc_qpc_bits) and the values
+     * the kernel writes (drivers/infiniband/hw/mlx5/mlx5_ib.h). */
+    MLX_QPC_CS_REQ_BIT_OFFSET = 0x630,
+    MLX_QPC_CS_RES_BIT_OFFSET = 0x638,
+    MLX_REQ_SCAT_DATA32_CQE   = 0x11,
+    MLX_REQ_SCAT_DATA64_CQE   = 0x22,
+    MLX_RES_SCAT_DATA32_CQE   = 0x1,
+    MLX_RES_SCAT_DATA64_CQE   = 0x2,
     MLX_QP_OPTPAR_Q_KEY       = 1u << 5,
     MLX_QP_OPTPAR_PKEY_INDEX  = 1u << 4,
     MLX_QP_OPTPAR_PRI_PORT    = 1u << 16,

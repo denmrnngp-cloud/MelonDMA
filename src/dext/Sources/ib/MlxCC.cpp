@@ -159,6 +159,78 @@ MlxCC::CmdModify(uint32_t regId, const void *in)
     return kr;
 }
 
+/* QUERY_CONG_STATUS (0x822) + QUERY_CONG_STATISTICS (0x826).
+ *
+ * Layouts from mlx5_ifc.h on the Spark, not from memory:
+ *   query_cong_status_in:   opcode@0x0, op_mod@0x30, priority@0x58 (4b),
+ *                           cong_protocol@0x5c (4b); 16 bytes.
+ *   query_cong_status_out:  status@0x0, syndrome@0x20, enable@0x60 (1b),
+ *                           tag_enable@0x61 (1b); 16 bytes.
+ *   query_cong_statistics_in:  opcode@0x0, op_mod@0x30, clear@0x40 (1b).
+ *   query_cong_statistics_out: rp_cur_flows@0x80, sum_flows@0xa0,
+ *                           rp_cnp_ignored_high@0xc0 / _low@0xe0,
+ *                           rp_cnp_handled_high@0x100 / _low@0x120,
+ *                           time_stamp_high@0x240 / _low@0x260,
+ *                           accumulators_period@0x280,
+ *                           np_ecn_marked_roce_packets_high@0x2a0 / _low@0x2c0,
+ *                           np_cnp_sent_high@0x2e0 / _low@0x300; 272 bytes.
+ *
+ * The high/low pairs are one 64-bit counter each, which is why they are joined
+ * here rather than reported as two halves nobody can add up later.
+ */
+kern_return_t
+MlxCC::QueryStats(const struct mlx_cc_stats_req *req,
+                  struct mlx_cc_stats_resp *out)
+{
+    if (!s || !req || !out) return kIOReturnBadArgument;
+    if (req->priority > 7) return kIOReturnBadArgument;
+    if (!s->core || !s->core->GetCmd()) return kIOReturnNotReady;
+    memset(out, 0, sizeof(*out));
+
+    /* Status first: the counters mean little without knowing whether the
+     * firmware loop is even switched on for this priority. */
+    {
+        uint8_t in[16] = {};
+        uint8_t sout[16] = {};
+        mlxSetBits(in, 0x00, 16, MLX_CMD_OP_QUERY_CONG_STATUS);
+        mlxSetBits(in, 0x58, 4, req->priority);
+        mlxSetBits(in, 0x5c, 4, MLX_CC_PROTOCOL_ROCE_ECN_RP);
+        kern_return_t kr = s->core->Exec(MLX_CMD_OP_QUERY_CONG_STATUS,
+                                         in, sizeof(in), sout, sizeof(sout), 5000);
+        if (kr != kIOReturnSuccess) return kr;
+        out->enable    = (uint32_t)mlxGetBits(sout, 0x60, 1);
+        out->tagEnable = (uint32_t)mlxGetBits(sout, 0x61, 1);
+    }
+
+    const uint32_t statsOutBytes = 272;
+    uint8_t in[16] = {};
+    uint8_t *sout = static_cast<uint8_t *>(IOMallocZero(statsOutBytes));
+    if (!sout) return kIOReturnNoMemory;
+    mlxSetBits(in, 0x00, 16, MLX_CMD_OP_QUERY_CONG_STATISTICS);
+    if (req->clear) mlxSetBits(in, 0x40, 1, 1);
+    kern_return_t kr = s->core->Exec(MLX_CMD_OP_QUERY_CONG_STATISTICS,
+                                     in, sizeof(in), sout, statsOutBytes, 5000);
+    if (kr != kIOReturnSuccess) {
+        IOFree(sout, statsOutBytes);
+        return kr;
+    }
+    out->rpCurFlows = (uint32_t)mlxGetBits(sout, 0x80, 32);
+    out->sumFlows   = (uint32_t)mlxGetBits(sout, 0xa0, 32);
+    out->rpCnpIgnored = ((uint64_t)mlxGetBits(sout, 0xc0, 32) << 32) |
+                        (uint64_t)mlxGetBits(sout, 0xe0, 32);
+    out->rpCnpHandled = ((uint64_t)mlxGetBits(sout, 0x100, 32) << 32) |
+                        (uint64_t)mlxGetBits(sout, 0x120, 32);
+    out->timeStamp    = ((uint64_t)mlxGetBits(sout, 0x240, 32) << 32) |
+                        (uint64_t)mlxGetBits(sout, 0x260, 32);
+    out->accumulatorsPeriod = (uint32_t)mlxGetBits(sout, 0x280, 32);
+    out->npEcnMarkedRocePackets = ((uint64_t)mlxGetBits(sout, 0x2a0, 32) << 32) |
+                                  (uint64_t)mlxGetBits(sout, 0x2c0, 32);
+    out->npCnpSent = ((uint64_t)mlxGetBits(sout, 0x2e0, 32) << 32) |
+                     (uint64_t)mlxGetBits(sout, 0x300, 32);
+    IOFree(sout, statsOutBytes);
+    return kIOReturnSuccess;
+}
+
 kern_return_t
 MlxCC::QueryParams(struct mlx_cc_params *out)
 {

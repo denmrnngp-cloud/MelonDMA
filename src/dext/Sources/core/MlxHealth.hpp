@@ -20,6 +20,22 @@
 
 class MlxPCIDriver;
 
+/* The init-segment health buffer, decoded. Firmware fills it only when it
+ * asserts, so on a healthy card every field reads zero. */
+struct MlxHealthSnapshot {
+    uint32_t assertVar[6];
+    uint32_t assertExitPtr;
+    uint32_t assertCallra;
+    uint32_t time;
+    uint32_t fwVer;
+    uint32_t hwId;
+    uint8_t  rfrSeverity;
+    uint8_t  iriscIndex;
+    uint8_t  synd;
+    uint16_t extSynd;
+    bool     deviceRemoved;
+};
+
 class MlxHealth {
 public:
     MlxHealth();
@@ -36,6 +52,10 @@ public:
     bool            IsHealthy() const;
     uint8_t         Syndrome() const;
     uint16_t        ExtSynd() const;
+    /* True once the health counter and fw_rev have both read all-ones, which
+     * is how a card that has fallen off the bus looks over MMIO. Latched. */
+    bool            DeviceRemoved() const;
+    void            ReadBuffer(MlxHealthSnapshot *snap) const;
 
     /* Called by the timer: check counter, parse syndrome/RFR severity. */
     void            Check();

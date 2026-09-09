@@ -6,7 +6,7 @@
     <true/>
     <key>com.apple.developer.driverkit.userclient-access</key>
     <array>
-        <string>com.mlx5.rdma.dext</string>
+        <string>com.melondma.rdma.dext</string>
     </array>
 </dict>
 </plist>

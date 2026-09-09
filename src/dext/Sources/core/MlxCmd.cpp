@@ -54,6 +54,37 @@ xor8(const void *buf, size_t off, size_t len)
  * core for meaningful time. */
 #define MLX_CMD_SPIN_NS 400000ull   /* 400 us */
 
+/* One direction of one command slot. The block arrays are what makes a slot
+ * expensive (1024 entries so a 149 MiB registration fits inline), which is why
+ * slots are allocated on first use rather than up front. */
+struct MlxCmdChain {
+    IOBufferMemoryDescriptor *desc[MLX_CMD_MAX_BLOCKS];
+    IODMACommand             *dma[MLX_CMD_MAX_BLOCKS];
+    MlxCmdMailbox            *box[MLX_CMD_MAX_BLOCKS];
+    uint64_t                  iova[MLX_CMD_MAX_BLOCKS];
+    IOBufferMemoryDescriptor *singleDesc;
+    IODMACommand             *singleDma;
+    uint32_t                  blocks;   /* blocks the current command uses */
+    uint32_t                  cached;   /* blocks allocated and kept for reuse */
+    bool                      single;   /* cached chain is one contiguous buffer */
+};
+
+/* A command slot owns one hardware descriptor in the command queue and the
+ * mailbox chains that go with it. Apple keeps a 32-entry bitmap of these and
+ * completes them from the command EQ (AppleEthernetMLX5Cmd::compHandler); this
+ * is the same slot bitmap with polling completion, which is what the two
+ * interrupt vectors this nub was granted leave room for. */
+struct MlxCmdSlot {
+    MlxCmdChain in;
+    MlxCmdChain out;
+    uint8_t     token;
+    bool        poisoned;   /* timed out: firmware may still own it, never reuse */
+    /* Set by the command-completion event for this slot. It shortens the wait;
+     * the descriptor's ownership bit stays the authority for reading the
+     * result, because the event says "finished", not "the outbox is yours". */
+    uint32_t    done;
+};
+
 struct MlxCmd::State {
     MlxPCIDriver              *core;
     IOPCIDevice               *pci;
@@ -65,9 +96,12 @@ struct MlxCmd::State {
     uint16_t                  cmdifRev;
     uint8_t                   logSz;
     uint8_t                   logStride;
-    uint8_t                   token;
     bool                      up;
     bool                      quarantined;
+    /* Last-command diagnostics, device-wide. With more than one slot in flight
+     * these describe whichever command finished last, so a caller that needs
+     * its own status must read them immediately after its own Exec — which is
+     * what the bring-up paths do, and they run before any client exists. */
     uint32_t                  lastOpcode;
     uint32_t                  lastSyndrome;
     uint8_t                   lastDeliveryStatus;
@@ -76,27 +110,20 @@ struct MlxCmd::State {
      * short for this firmware or this command mix. */
     uint64_t                  commandsIssued;
     uint64_t                  spinFellThrough;
+    /* How often a command found every regular slot busy and had to wait. Zero
+     * on a serial workload; a rising count is the signal to raise
+     * MLX_CMD_REG_SLOTS. */
+    uint64_t                  slotWaits;
     uint8_t                   lastFwStatus;
-    IOLock                   *execLock;
 
-    /* In-flight mailbox chains for the current command (single-slot MVP).
-     * Each block is a full DMA page; this is the proven DriverKit layout. */
-    IOBufferMemoryDescriptor *inMailboxDesc[MLX_CMD_MAX_BLOCKS];
-    IOBufferMemoryDescriptor *outMailboxDesc[MLX_CMD_MAX_BLOCKS];
-    IODMACommand            *inMailboxDma[MLX_CMD_MAX_BLOCKS];
-    IODMACommand            *outMailboxDma[MLX_CMD_MAX_BLOCKS];
-    MlxCmdMailbox           *inMailbox[MLX_CMD_MAX_BLOCKS];
-    MlxCmdMailbox           *outMailbox[MLX_CMD_MAX_BLOCKS];
-    uint64_t                 inMailboxIOVA[MLX_CMD_MAX_BLOCKS];
-    uint64_t                 outMailboxIOVA[MLX_CMD_MAX_BLOCKS];
-    uint32_t                 inNumBlocks;
-    uint32_t                 outNumBlocks;
-    IOBufferMemoryDescriptor *inMailboxSingleDesc;
-    IOBufferMemoryDescriptor *outMailboxSingleDesc;
-    IODMACommand             *inMailboxSingleDma;
-    IODMACommand             *outMailboxSingleDma;
-    bool                      inMailboxSingle;
-    bool                      outMailboxSingle;
+    /* Slot arbitration. execLock guards the busy mask and the slot array, not
+     * the command itself: a slow command must not block a fast one on another
+     * slot, which is the whole point of having more than one. */
+    IOLock                   *execLock;
+    MlxCmdSlot               *slot[MLX_CMD_HW_SLOTS];
+    uint64_t                  busyMask;
+    uint32_t                  regSlots;   /* usable slots for regular commands */
+    uint32_t                  pagesSlot;  /* reserved for MANAGE_PAGES */
 };
 
 MlxCmd::MlxCmd() : s(NULL) {}
@@ -207,10 +234,22 @@ MlxCmd::Init(MlxPCIDriver *core)
     }
 
     memset(s->cmdqBuf, 0, MLX_CMDQ_SIZE);
-    s->token = 1;
+    /* Slot geometry. The last hardware slot belongs to MANAGE_PAGES; whatever
+     * is left, up to the cap, carries regular commands. A queue with a single
+     * descriptor collapses to one shared slot, which is exactly the behaviour
+     * this driver had before the ring existed. */
+    {
+        const uint32_t hwSlots = 1u << s->logSz;
+        s->pagesSlot = hwSlots ? hwSlots - 1 : 0;
+        uint32_t reg = hwSlots > 1 ? hwSlots - 1 : 1;
+        if (reg > MLX_CMD_REG_SLOTS) reg = MLX_CMD_REG_SLOTS;
+        if (reg > MLX_CMD_HW_SLOTS) reg = MLX_CMD_HW_SLOTS;
+        s->regSlots = reg;
+    }
     s->up = true;
-    MLX_LOG("ready (rev=%u, log_sz=%u, stride=%u, iova=0x%llx)",
-            s->cmdifRev, s->logSz, s->logStride, s->cmdqIOVA);
+    MLX_LOG("ready (rev=%u, log_sz=%u, stride=%u, iova=0x%llx, reg_slots=%u, pages_slot=%u)",
+            s->cmdifRev, s->logSz, s->logStride, s->cmdqIOVA,
+            s->regSlots, s->pagesSlot);
     return kIOReturnSuccess;
 }
 
@@ -219,8 +258,13 @@ MlxCmd::Free()
 {
     if (!s) return;
     s->up = false;
-    FreeMailbox(false);
-    FreeMailbox(true);
+    for (uint32_t i = 0; i < MLX_CMD_HW_SLOTS; i++) {
+        if (!s->slot[i]) continue;
+        ReleaseChain(&s->slot[i]->in);
+        ReleaseChain(&s->slot[i]->out);
+        IODelete(s->slot[i], MlxCmdSlot, 1);
+        s->slot[i] = NULL;
+    }
     if ((s->quarantined || s->core->DmaQuarantined()) && (s->cmdqDma || s->cmdqMem)) {
         s->core->RetainDmaUntilReset(s->cmdqMem, s->cmdqDma, 0x434d4451u);
         s->cmdqDma = NULL; s->cmdqMem = NULL;
@@ -233,10 +277,45 @@ MlxCmd::Free()
 
 /* ---- mailbox chain helpers (cmd.c:allocMailbox / freeMailbox) ---- */
 
-kern_return_t
-MlxCmd::AllocMailbox(bool out, uint32_t size)
+/* Give a chain's blocks back to the allocator. Only teardown and quarantine
+ * take this path: a completed command leaves its chain cached. */
+void
+MlxCmd::ReleaseChain(MlxCmdChain *c)
 {
-    /* Number of blocks needed for `size` bytes after the 16B inline header. */
+    const bool keep = s->quarantined || s->core->DmaQuarantined();
+    if (c->single) {
+        if (keep && (c->singleDma || c->singleDesc)) {
+            s->core->RetainDmaUntilReset(c->singleDesc, c->singleDma, 0x434d424fu);
+            c->singleDesc = NULL; c->singleDma = NULL;
+        }
+        if (c->singleDma) { mlxCompleteDma(c->singleDma); c->singleDma = NULL; }
+        if (c->singleDesc) { c->singleDesc->release(); c->singleDesc = NULL; }
+    } else {
+        for (uint32_t i = 0; i < c->cached; i++) {
+            if (keep && (c->dma[i] || c->desc[i])) {
+                s->core->RetainDmaUntilReset(c->desc[i], c->dma[i], 0x434d424fu);
+                c->desc[i] = NULL; c->dma[i] = NULL;
+            }
+            if (c->dma[i]) { mlxCompleteDma(c->dma[i]); c->dma[i] = NULL; }
+            if (c->desc[i]) { c->desc[i]->release(); c->desc[i] = NULL; }
+        }
+    }
+    for (uint32_t i = 0; i < c->cached; i++) { c->box[i] = NULL; c->iova[i] = 0; }
+    c->cached = 0;
+    c->blocks = 0;
+    c->single = false;
+}
+
+/* Make the chain hold at least `size` bytes of command data.
+ *
+ * The blocks are kept across commands. Before this, every command paid an
+ * IODMACommand create + PrepareForDMA + Map and the matching teardown twice
+ * over, on top of the firmware round trip — Apple pools them the same way
+ * (AppleEthernetMLX5Cmd::allocCmdMsg reuses a cached message whose block count
+ * already covers the request, and only allocates when it does not). */
+kern_return_t
+MlxCmd::AllocMailbox(MlxCmdChain *c, uint32_t size)
+{
     uint32_t numBlocks = 0;
     if (size > 16)
         numBlocks = (size - 16 + MLX_CMD_DATA_BLOCK_SIZE - 1) / MLX_CMD_DATA_BLOCK_SIZE;
@@ -244,29 +323,40 @@ MlxCmd::AllocMailbox(bool out, uint32_t size)
         MLX_LOG("command too large: needs %u blocks (max %u)", numBlocks, MLX_CMD_MAX_BLOCKS);
         return kIOReturnNoSpace;
     }
-    if (out) s->outNumBlocks = numBlocks; else s->inNumBlocks = numBlocks;
-    if (numBlocks == 0)
+    /* blocks is published only once every ReleaseChain below has run, because
+     * ReleaseChain clears it: setting it first would leave the chain reporting
+     * no blocks and send a command with a null mailbox pointer. */
+    c->blocks = 0;
+    if (numBlocks == 0) return kIOReturnSuccess;
+    /* Give an oversized chain back rather than pinning it for the life of the
+     * driver. Two registrations of the same shape still reuse, because the
+     * chain is only dropped when this command needs strictly less. */
+    if (c->cached > MLX_CMD_CACHE_MAX_BLOCKS && numBlocks < c->cached)
+        ReleaseChain(c);
+    if (numBlocks <= c->cached) {
+        /* Reuse. The blocks are rewritten in full by the caller: input blocks
+         * get data plus a fresh descriptor and signature, output blocks get a
+         * descriptor and signature, so no zeroing is needed here. */
+        c->blocks = numBlocks;
         return kIOReturnSuccess;
+    }
+    ReleaseChain(c);
 
     /* Fast path: one page-aligned buffer, blocks at 4096-byte stride. If
      * DriverKit/DART cannot expose that buffer as one contiguous IOVA range,
      * discard it and use the proven per-block layout below. */
     {
-        IOBufferMemoryDescriptor **singleDesc = out ? &s->outMailboxSingleDesc : &s->inMailboxSingleDesc;
-        IODMACommand **singleDma = out ? &s->outMailboxSingleDma : &s->inMailboxSingleDma;
-        MlxCmdMailbox **boxes = out ? s->outMailbox : s->inMailbox;
-        uint64_t *iovas = out ? s->outMailboxIOVA : s->inMailboxIOVA;
         uint32_t bytes = numBlocks * 4096;
         kern_return_t singleKr = mlxAllocDmaBuffer(bytes, 4096,
                                                    kIOMemoryDirectionOutIn,
-                                                   singleDesc);
+                                                   &c->singleDesc);
         IOAddressSegment *segments = NULL;
-        if (singleKr == kIOReturnSuccess && *singleDesc) {
+        if (singleKr == kIOReturnSuccess && c->singleDesc) {
             segments = IONew(IOAddressSegment, MLX_CMD_MAX_BLOCKS + 2);
             uint32_t segmentCount = MLX_CMD_MAX_BLOCKS + 2;
             if (segments)
-                singleKr = mlxPrepareDma(s->pci, *singleDesc, segments,
-                                         &segmentCount, singleDma);
+                singleKr = mlxPrepareDma(s->pci, c->singleDesc, segments,
+                                         &segmentCount, &c->singleDma);
             else
                 singleKr = kIOReturnNoMemory;
             bool contiguous = singleKr == kIOReturnSuccess && segmentCount > 0;
@@ -281,96 +371,61 @@ MlxCmd::AllocMailbox(bool out, uint32_t size)
             }
             uint64_t addr = 0, mappedLength = 0;
             if (contiguous && span >= bytes)
-                singleKr = (*singleDesc)->Map(0, 0, 0, 0, &addr, &mappedLength);
+                singleKr = c->singleDesc->Map(0, 0, 0, 0, &addr, &mappedLength);
             else
                 singleKr = kIOReturnNoSpace;
             if (singleKr == kIOReturnSuccess && mappedLength >= bytes) {
                 memset((void *)(uintptr_t)addr, 0, bytes);
                 for (uint32_t i = 0; i < numBlocks; i++) {
-                    boxes[i] = (MlxCmdMailbox *)(uintptr_t)(addr + (uint64_t)i * 4096);
-                    iovas[i] = iovaBase + (uint64_t)i * 4096;
+                    c->box[i] = (MlxCmdMailbox *)(uintptr_t)(addr + (uint64_t)i * 4096);
+                    c->iova[i] = iovaBase + (uint64_t)i * 4096;
                 }
-                if (out) s->outMailboxSingle = true; else s->inMailboxSingle = true;
+                c->single = true;
+                c->cached = numBlocks;
+                c->blocks = numBlocks;
                 if (segments) IODelete(segments, IOAddressSegment, MLX_CMD_MAX_BLOCKS + 2);
                 return kIOReturnSuccess;
             }
-            if (*singleDma) { mlxCompleteDma(*singleDma); *singleDma = NULL; }
-            if (*singleDesc) { (*singleDesc)->release(); *singleDesc = NULL; }
+            if (c->singleDma) { mlxCompleteDma(c->singleDma); c->singleDma = NULL; }
+            if (c->singleDesc) { c->singleDesc->release(); c->singleDesc = NULL; }
         }
         if (segments) IODelete(segments, IOAddressSegment, MLX_CMD_MAX_BLOCKS + 2);
     }
 
     for (uint32_t i = 0; i < numBlocks; i++) {
-        IOBufferMemoryDescriptor **descp = out ? &s->outMailboxDesc[i] : &s->inMailboxDesc[i];
-        IODMACommand            **dmap   = out ? &s->outMailboxDma[i]   : &s->inMailboxDma[i];
-        MlxCmdMailbox           **boxp   = out ? &s->outMailbox[i]      : &s->inMailbox[i];
-        uint64_t                *iovap   = out ? &s->outMailboxIOVA[i] : &s->inMailboxIOVA[i];
-
         kern_return_t kr = mlxAllocDmaBuffer(4096, 4096,
-                                             kIOMemoryDirectionOutIn, descp);
-        if (kr != kIOReturnSuccess || !*descp) {
+                                             kIOMemoryDirectionOutIn, &c->desc[i]);
+        if (kr != kIOReturnSuccess || !c->desc[i]) {
             MLX_LOG("mailbox alloc failed: 0x%x", kr);
-            FreeMailbox(out);
+            c->cached = i;
+            ReleaseChain(c);
             return kr ? kr : kIOReturnNoMemory;
         }
-
         IOAddressSegment segs[32];
         uint32_t segCount = 32;
-        kr = mlxPrepareDma(s->pci, *descp, segs, &segCount, dmap);
+        kr = mlxPrepareDma(s->pci, c->desc[i], segs, &segCount, &c->dma[i]);
         if (kr != kIOReturnSuccess || segCount == 0) {
             MLX_LOG("mailbox DMA prepare failed: 0x%x", kr);
-            (*descp)->release(); *descp = NULL;
-            FreeMailbox(out);
+            c->desc[i]->release(); c->desc[i] = NULL;
+            c->cached = i;
+            ReleaseChain(c);
             return kr ? kr : kIOReturnNoMemory;
         }
-        *iovap = segs[0].address;
-
+        c->iova[i] = segs[0].address;
         uint64_t addr = 0, len = 0;
-        kr = (*descp)->Map(0, 0, 0, 0, &addr, &len);
+        kr = c->desc[i]->Map(0, 0, 0, 0, &addr, &len);
         if (kr != kIOReturnSuccess) {
             MLX_LOG("mailbox CPU map failed: 0x%x", kr);
-            FreeMailbox(out);
+            c->cached = i + 1;
+            ReleaseChain(c);
             return kr;
         }
-        *boxp = (MlxCmdMailbox *)(uintptr_t)addr;
-        memset(*boxp, 0, sizeof(MlxCmdMailbox));
+        c->box[i] = (MlxCmdMailbox *)(uintptr_t)addr;
+        memset(c->box[i], 0, sizeof(MlxCmdMailbox));
     }
+    c->cached = numBlocks;
+    c->blocks = numBlocks;
     return kIOReturnSuccess;
-}
-
-void
-MlxCmd::FreeMailbox(bool out)
-{
-    uint32_t n = out ? s->outNumBlocks : s->inNumBlocks;
-    bool single = out ? s->outMailboxSingle : s->inMailboxSingle;
-    const bool keep = s->quarantined || s->core->DmaQuarantined();
-    if (single) {
-        IODMACommand **dmap = out ? &s->outMailboxSingleDma : &s->inMailboxSingleDma;
-        IOBufferMemoryDescriptor **descp = out ? &s->outMailboxSingleDesc : &s->inMailboxSingleDesc;
-        if (keep && (*dmap || *descp)) {
-            s->core->RetainDmaUntilReset(*descp, *dmap, 0x434d424fu);
-            *descp = NULL; *dmap = NULL;
-        }
-        if (*dmap) { mlxCompleteDma(*dmap); *dmap = NULL; }
-        if (*descp) { (*descp)->release(); *descp = NULL; }
-        for (uint32_t i = 0; i < n; i++)
-            if (out) s->outMailbox[i] = NULL; else s->inMailbox[i] = NULL;
-        if (out) { s->outMailboxSingle = false; s->outNumBlocks = 0; }
-        else { s->inMailboxSingle = false; s->inNumBlocks = 0; }
-        return;
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        IODMACommand **dmap = out ? &s->outMailboxDma[i] : &s->inMailboxDma[i];
-        IOBufferMemoryDescriptor **descp = out ? &s->outMailboxDesc[i] : &s->inMailboxDesc[i];
-        if (keep && (*dmap || *descp)) {
-            s->core->RetainDmaUntilReset(*descp, *dmap, 0x434d424fu);
-            *descp = NULL; *dmap = NULL;
-        }
-        if (*dmap) { mlxCompleteDma(*dmap); *dmap = NULL; }
-        if (*descp) { (*descp)->release(); *descp = NULL; }
-        if (out) s->outMailbox[i] = NULL; else s->inMailbox[i] = NULL;
-    }
-    if (out) s->outNumBlocks = 0; else s->inNumBlocks = 0;
 }
 
 /* Set mailbox ctrl/sig checksums (cmd.c:207 calc_block_sig). */
@@ -383,22 +438,97 @@ MlxCmd::SetMailboxSignature(MlxCmdMailbox *mb)
     mb->sig = (uint8_t)~xor8(mb, 0, sizeof(*mb) - 1);
 }
 
+/* Reserve a command slot.
+ *
+ * MANAGE_PAGES keeps the dedicated last hardware slot it has always used:
+ * firmware refuses it anywhere else with delivery_status 6. Everything else
+ * takes any free regular slot, so a 30 ms memory registration no longer stands
+ * in front of a QP transition on another thread — that serialisation was the
+ * point of this change. Slots are allocated on first use because each one
+ * carries block arrays big enough for a 149 MiB registration. */
+void
+MlxCmd::CompleteFromEvent(uint32_t mask)
+{
+    if (!s) return;
+    for (uint32_t i = 0; i < MLX_CMD_HW_SLOTS && i < 32; i++) {
+        if (!(mask & (1u << i))) continue;
+        if (s->slot[i]) __atomic_store_n(&s->slot[i]->done, 1, __ATOMIC_RELEASE);
+    }
+}
+
+kern_return_t
+MlxCmd::AcquireSlot(uint32_t opcode, uint32_t timeoutMs, uint32_t *outSlot)
+{
+    const bool pages = (opcode == MLX_CMD_OP_MANAGE_PAGES);
+    const uint64_t spinDeadline =
+        clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + MLX_CMD_SPIN_NS;
+    uint32_t waitBudget = timeoutMs > 1000 ? timeoutMs : 1000;
+    bool counted = false;
+    for (;;) {
+        IOLockLock(s->execLock);
+        uint32_t chosen = MLX_CMD_HW_SLOTS;
+        if (pages) {
+            if (!(s->busyMask & (1ull << s->pagesSlot))) chosen = s->pagesSlot;
+        } else {
+            for (uint32_t i = 0; i < s->regSlots; i++)
+                if (!(s->busyMask & (1ull << i))) { chosen = i; break; }
+        }
+        if (chosen < MLX_CMD_HW_SLOTS) {
+            if (!s->slot[chosen]) {
+                s->slot[chosen] = IONewZero(MlxCmdSlot, 1);
+                if (!s->slot[chosen]) {
+                    IOLockUnlock(s->execLock);
+                    return kIOReturnNoMemory;
+                }
+                s->slot[chosen]->token = 1;
+            }
+            s->busyMask |= 1ull << chosen;
+            IOLockUnlock(s->execLock);
+            *outSlot = chosen;
+            return kIOReturnSuccess;
+        }
+        if (!counted) { s->slotWaits++; counted = true; }   /* under execLock */
+        IOLockUnlock(s->execLock);
+        if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < spinDeadline) continue;
+        if (!waitBudget) return kIOReturnBusy;
+        waitBudget--;
+        IOSleep(1);
+    }
+}
+
+void
+MlxCmd::ReleaseSlot(uint32_t slot)
+{
+    IOLockLock(s->execLock);
+    s->busyMask &= ~(1ull << slot);
+    IOLockUnlock(s->execLock);
+}
+
 kern_return_t
 MlxCmd::Exec(uint32_t opcode, const void *in, uint32_t inSize,
              void *out, uint32_t outSize, uint32_t timeoutMs)
 {
     if (!s || !s->up || !s->execLock) return kIOReturnNotReady;
-    IOLockLock(s->execLock);
-    kern_return_t kr = ExecLocked(opcode, in, inSize, out, outSize, timeoutMs);
-    IOLockUnlock(s->execLock);
+    if (s->quarantined || s->core->DmaQuarantined()) return kIOReturnNotReady;
+    uint32_t slot = 0;
+    kern_return_t kr = AcquireSlot(opcode, timeoutMs, &slot);
+    if (kr != kIOReturnSuccess) return kr;
+    kr = ExecOnSlot(slot, opcode, in, inSize, out, outSize, timeoutMs);
+    /* A timed-out slot is never released: firmware may still own its
+     * descriptor and mailboxes, so nothing may reuse them. The device is
+     * quarantined by then anyway, which stops new commands at the door. */
+    if (kr != kIOReturnTimeout) ReleaseSlot(slot);
     return kr;
 }
 
 kern_return_t
-MlxCmd::ExecLocked(uint32_t opcode, const void *in, uint32_t inSize,
-                   void *out, uint32_t outSize, uint32_t timeoutMs)
+MlxCmd::ExecOnSlot(uint32_t slot, uint32_t opcode, const void *in,
+                   uint32_t inSize, void *out, uint32_t outSize,
+                   uint32_t timeoutMs)
 {
     if (!s || !s->up) return kIOReturnNotReady;
+    MlxCmdSlot *sl = s->slot[slot];
+    if (!sl) return kIOReturnNotReady;
     s->lastOpcode = opcode;
     s->lastSyndrome = 0;
     s->lastDeliveryStatus = 0;
@@ -410,18 +540,11 @@ MlxCmd::ExecLocked(uint32_t opcode, const void *in, uint32_t inSize,
     if (s->quarantined || s->core->DmaQuarantined())
         return kIOReturnNotReady;
 
-    /* Allocate mailbox chains for large commands. */
-    kern_return_t kr = AllocMailbox(false, inSize);
+    /* Mailbox chains for large commands. Cached across commands on this slot. */
+    kern_return_t kr = AllocMailbox(&sl->in, inSize);
     if (kr != kIOReturnSuccess) return kr;
-    kr = AllocMailbox(true, outSize);
-    if (kr != kIOReturnSuccess) { FreeMailbox(false); return kr; }
-
-    /* Slot selection (cmd.c:1032): regular commands use slots 0..N-2, the
-     * LAST slot (max_reg_cmds = (1<<log_sz)-1) is reserved exclusively for
-     * MANAGE_PAGES. Firmware rejects MANAGE_PAGES on any other slot with
-     * delivery_status=6 (FW_ERR) — exactly what we saw on GIVE. */
-    uint32_t slot = (opcode == MLX_CMD_OP_MANAGE_PAGES) ?
-        ((1u << s->logSz) - 1) : 0;
+    kr = AllocMailbox(&sl->out, outSize);
+    if (kr != kIOReturnSuccess) return kr;
 
     MlxCmdLayout *lay = (MlxCmdLayout *)
         ((uint8_t *)s->cmdqBuf + ((size_t)slot << s->logStride));
@@ -430,43 +553,52 @@ MlxCmd::ExecLocked(uint32_t opcode, const void *in, uint32_t inSize,
     /* Command header: first 16 bytes. */
     memcpy(lay->in, in, (inSize < 16) ? inSize : 16);
 
-    /* Large input → mailbox chain (cmd.c:980). */
-    for (uint32_t i = 0; i < s->inNumBlocks; i++) {
-        MlxCmdMailbox *mb = s->inMailbox[i];
+    /* Large input -> mailbox chain (cmd.c:980). A reused block still holds the
+     * previous command's bytes, so a short tail is zeroed rather than left. */
+    for (uint32_t i = 0; i < sl->in.blocks; i++) {
+        MlxCmdMailbox *mb = sl->in.box[i];
         uint32_t copied = 16 + i * MLX_CMD_DATA_BLOCK_SIZE;
         uint32_t dataLen = inSize - copied;
         if (dataLen > MLX_CMD_DATA_BLOCK_SIZE) dataLen = MLX_CMD_DATA_BLOCK_SIZE;
         memcpy(mb->data, (const uint8_t *)in + copied, dataLen);
+        if (dataLen < MLX_CMD_DATA_BLOCK_SIZE)
+            memset(mb->data + dataLen, 0, MLX_CMD_DATA_BLOCK_SIZE - dataLen);
         mb->next      = OSSwapHostToBigInt64(
-            (i + 1 < s->inNumBlocks) ? s->inMailboxIOVA[i + 1] : 0);
+            (i + 1 < sl->in.blocks) ? sl->in.iova[i + 1] : 0);
         mb->block_num = OSSwapHostToBigInt32(i);   /* big-endian order (AppleMCX) */
-        mb->token     = s->token;
+        mb->token     = sl->token;
         SetMailboxSignature(mb);
     }
-    lay->in_ptr = OSSwapHostToBigInt64(
-        s->inNumBlocks ? s->inMailboxIOVA[0] : 0);
+    lay->in_ptr = OSSwapHostToBigInt64(sl->in.blocks ? sl->in.iova[0] : 0);
     lay->inlen  = OSSwapHostToBigInt32(inSize);
 
-    /* Output mailbox chain (pre-linked, no data yet). */
-    for (uint32_t i = 0; i < s->outNumBlocks; i++) {
-        MlxCmdMailbox *mb = s->outMailbox[i];
+    /* Output mailbox chain (pre-linked, no data yet). Cleared for the same
+     * reason: the reply is copied out by length and a short one would
+     * otherwise hand back the previous command's bytes. */
+    for (uint32_t i = 0; i < sl->out.blocks; i++) {
+        MlxCmdMailbox *mb = sl->out.box[i];
+        memset(mb->data, 0, MLX_CMD_DATA_BLOCK_SIZE);
         mb->next      = OSSwapHostToBigInt64(
-            (i + 1 < s->outNumBlocks) ? s->outMailboxIOVA[i + 1] : 0);
+            (i + 1 < sl->out.blocks) ? sl->out.iova[i + 1] : 0);
         mb->block_num = OSSwapHostToBigInt32(i);   /* big-endian order (AppleMCX) */
-        mb->token     = s->token;
+        mb->token     = sl->token;
         SetMailboxSignature(mb);
     }
-    lay->out_ptr = OSSwapHostToBigInt64(
-        s->outNumBlocks ? s->outMailboxIOVA[0] : 0);
+    lay->out_ptr = OSSwapHostToBigInt64(sl->out.blocks ? sl->out.iova[0] : 0);
     lay->outlen = OSSwapHostToBigInt32(outSize);
 
     lay->type  = MLX_CMD_TYPE_XPORT;
-    lay->token = s->token++;
+    lay->token = sl->token++;
 
     /* Hand ownership to firmware + signature (cmd.c:228). */
     lay->status_own = MLX_CMD_OWNER_HW;
     lay->sig = 0;
     lay->sig = (uint8_t)~xor8(lay, 0, sizeof(*lay));
+
+    /* Clear the event flag and take the generation before the doorbell, so a
+     * completion that lands between the two is not missed. */
+    __atomic_store_n(&sl->done, 0, __ATOMIC_RELEASE);
+    uint64_t cmdGeneration = s->core->CommandGeneration();
 
     /* Doorbell: set slot bit (cmd.c:1069 writes 1 << ent->idx). */
     mlxMemoryBarrier();
@@ -481,20 +613,29 @@ MlxCmd::ExecLocked(uint32_t opcode, const void *in, uint32_t inSize,
      * 4 KiB region cost 1.31 ms and deregistering it 1.18 ms, essentially all
      * of it this sleep. Spin for a bounded window first and only then sleep,
      * so the common case is measured in microseconds while a slow or stuck
-     * command still yields the CPU rather than burning it.
-     *
-     * The spin budget is deliberately short: a command slot is serialised, so
-     * the caller is blocked either way, and the cost of overshooting is CPU
-     * burnt on a core that has nothing else to do for this client. */
+     * command still yields the CPU rather than burning it. */
     uint32_t waited = 0;
-    const uint64_t spinDeadline =
-        clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + MLX_CMD_SPIN_NS;
+    const uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const uint64_t spinDeadline = start + MLX_CMD_SPIN_NS;
+    /* The timeout is wall-clock, not a count of loop iterations.
+     *
+     * It used to count iterations on the assumption that each one slept a
+     * millisecond, which held while the only wait was IOSleep(1). Adding an
+     * event wait broke that silently: the wait returns immediately whenever
+     * the completion generation has already moved, which another command's
+     * completion does routinely — so the loop spun, charged itself a
+     * millisecond per pass, and declared a five-second command timed out in
+     * under a second. QUERY_VPORT_STATE died that way at bring-up and took the
+     * device into DMA quarantine with it. Elapsed time cannot be fooled by
+     * how, or whether, the wait actually sleeps. */
+    const uint64_t deadline = timeoutMs
+        ? start + (uint64_t)timeoutMs * 1000000ULL : 0;
     while (true) {
         mlxMemoryBarrier();
         if (!(*(volatile uint8_t *)&lay->status_own & MLX_CMD_OWNER_HW)) break;
-        if (timeoutMs && waited >= timeoutMs) {
+        if (deadline && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) >= deadline) {
             s->quarantined = true;
-            MLX_LOG("opcode 0x%x timed out; quarantined", opcode);
+            MLX_LOG("opcode 0x%x timed out on slot %u; quarantined", opcode, slot);
             /* The firmware may still own both mailboxes and the command
              * slot. Do not free or reuse them, including for TEARDOWN_HCA. */
             s->core->EnterDmaQuarantine(0x434d4454u);
@@ -504,10 +645,24 @@ MlxCmd::ExecLocked(uint32_t opcode, const void *in, uint32_t inSize,
          * milliseconds actually slept and its meaning is unchanged. */
         if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < spinDeadline) continue;
         waited++;
-        s->spinFellThrough++;
-        IOSleep(1);
+        __atomic_fetch_add(&s->spinFellThrough, 1, __ATOMIC_RELAXED);
+        /* Sleep the same millisecond the poll always slept, but wake early
+         * when the completion event arrives. The polled sleep remains the
+         * fallback for every path with no event queue yet, which is all of
+         * Start. `waited` is now only a statistic: the timeout above is
+         * wall-clock. */
+        /* Consume the flag rather than testing it: an event names the slot
+         * slightly before the descriptor's ownership bit is visible, and a
+         * flag left set would spin on that gap for the whole timeout. Taking
+         * it means at most one extra pass per event. */
+        if (__atomic_exchange_n(&sl->done, 0, __ATOMIC_ACQ_REL)) continue;
+        uint64_t newGeneration = cmdGeneration;
+        if (s->core->WaitCommandEvent(cmdGeneration, 1, &newGeneration) ==
+            kIOReturnNotReady)
+            IOSleep(1);
+        cmdGeneration = newGeneration;
     }
-    s->commandsIssued++;
+    __atomic_fetch_add(&s->commandsIssued, 1, __ATOMIC_RELAXED);
 
     mlxDmaReadBarrier();
     s->lastDeliveryStatus = (lay->status_own >> 1) & 0x7f;
@@ -523,15 +678,12 @@ MlxCmd::ExecLocked(uint32_t opcode, const void *in, uint32_t inSize,
     /* Copy response header + output mailbox blocks (cmd.c:1007). */
     uint32_t copyLen = (outSize < 16) ? outSize : 16;
     memcpy(out, lay->out, copyLen);
-    for (uint32_t i = 0; i < s->outNumBlocks; i++) {
+    for (uint32_t i = 0; i < sl->out.blocks; i++) {
         uint32_t copied = 16 + i * MLX_CMD_DATA_BLOCK_SIZE;
         uint32_t mbLen = outSize - copied;
         if (mbLen > MLX_CMD_DATA_BLOCK_SIZE) mbLen = MLX_CMD_DATA_BLOCK_SIZE;
-        memcpy((uint8_t *)out + copied, s->outMailbox[i]->data, mbLen);
+        memcpy((uint8_t *)out + copied, sl->out.box[i]->data, mbLen);
     }
-
-    FreeMailbox(false);
-    FreeMailbox(true);
 
     /* Descriptor delivery status (bits [7:1]). */
     uint8_t status = (lay->status_own >> 1) & 0x7F;
@@ -611,10 +763,12 @@ MlxCmd::IsQuarantined() const
 uint32_t MlxCmd::LastOpcode() const { return s ? s->lastOpcode : 0; }
 uint32_t MlxCmd::LastSyndrome() const { return s ? s->lastSyndrome : 0; }
 void
-MlxCmd::CommandStats(uint64_t *issued, uint64_t *slept) const
+MlxCmd::CommandStats(uint64_t *issued, uint64_t *slept,
+                     uint64_t *slotWaits) const
 {
     if (issued) *issued = s ? s->commandsIssued : 0;
     if (slept)  *slept  = s ? s->spinFellThrough : 0;
+    if (slotWaits) *slotWaits = s ? s->slotWaits : 0;
 }
 uint8_t MlxCmd::LastDeliveryStatus() const
 { return s ? s->lastDeliveryStatus : 0; }

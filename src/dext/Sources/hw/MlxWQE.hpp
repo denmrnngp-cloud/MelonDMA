@@ -244,6 +244,13 @@ struct MlxCqe64 {
 /* CQE opcode bits: op_own >> 4 */
 #define MLX_CQE_GET_OPCODE(cqe) ((cqe)->op_own >> 4)
 
+/* Scatter-to-CQE inline-data flags (op_own bits 2..3, the CQE-format bits).
+ * From mlx5dv.h MLX5_INLINE_SCATTER_32/64 and rdma-core providers/mlx5/cq.c:
+ * SCATTER_32 overlays the current CQE bytes 0..31, SCATTER_64 the previous
+ * 64-byte slot. This driver uses DATA32 with its 64-byte CQE. */
+#define MLX_CQE_INLINE_SCATTER_32  0x4u
+#define MLX_CQE_INLINE_SCATTER_64  0x8u
+
 enum {
     MLX_CQE_REQ      = 0,
     MLX_CQE_RESP_WR_IMM = 1,
@@ -275,6 +282,7 @@ static_assert(sizeof(struct MlxCqe64) == 64,       "CQE64 must be 64 bytes");
 enum {
     MLX_OPCODE_SEND             = 0x0A,
     MLX_OPCODE_SEND_IMM         = 0x0B,
+    MLX_OPCODE_SEND_INVAL       = 0x01,
     MLX_OPCODE_LOCAL_INVAL      = 0x1B,
     MLX_OPCODE_RDMA_WRITE       = 0x08,
     MLX_OPCODE_RDMA_WRITE_IMM   = 0x09,
@@ -308,11 +316,13 @@ mlxEncodeRcSendWqe(void *buffer, size_t bufferBytes, uint32_t qpn,
     if (!buffer || !qpn || (!zeroWriteImm && (!sges || !numSge)) ||
         numSge > MLX_RC_MAX_SGE ||
         (opcode != MLX_OPCODE_SEND && opcode != MLX_OPCODE_SEND_IMM &&
+         opcode != MLX_OPCODE_SEND_INVAL &&
          opcode != MLX_OPCODE_RDMA_WRITE && opcode != MLX_OPCODE_RDMA_WRITE_IMM &&
          opcode != MLX_OPCODE_RDMA_READ && opcode != MLX_OPCODE_LOCAL_INVAL))
         return 0;
     uint32_t ds = opcode == MLX_OPCODE_LOCAL_INVAL ? 2 :
-        1 + ((opcode == MLX_OPCODE_SEND || opcode == MLX_OPCODE_SEND_IMM) ? 0 : 1) + numSge;
+        1 + ((opcode == MLX_OPCODE_SEND || opcode == MLX_OPCODE_SEND_IMM ||
+              opcode == MLX_OPCODE_SEND_INVAL) ? 0 : 1) + numSge;
     size_t bytes = (size_t)ds * sizeof(struct MlxWqeDataSeg);
     size_t wqebbBytes = (bytes + 63u) & ~63u;
     if (bufferBytes < wqebbBytes) return 0;
@@ -329,7 +339,8 @@ mlxEncodeRcSendWqe(void *buffer, size_t bufferBytes, uint32_t qpn,
         struct MlxWqeDataSeg *invalidate = (struct MlxWqeDataSeg *)(wqe + offset);
         invalidate->lkey = MLX_BE32(sges[0].lkey);
         offset += sizeof(*invalidate);
-    } else if (opcode != MLX_OPCODE_SEND && opcode != MLX_OPCODE_SEND_IMM) {
+    } else if (opcode != MLX_OPCODE_SEND && opcode != MLX_OPCODE_SEND_IMM &&
+               opcode != MLX_OPCODE_SEND_INVAL) {
         struct MlxWqeRaddrSeg *remote = (struct MlxWqeRaddrSeg *)(wqe + offset);
         remote->raddr = MLX_BE64(remoteAddr);
         remote->rkey = MLX_BE32(rkey);
@@ -343,6 +354,24 @@ mlxEncodeRcSendWqe(void *buffer, size_t bufferBytes, uint32_t qpn,
         data->addr = MLX_BE64(sges[i].addr);
         offset += sizeof(*data);
     }
+    return ds;
+}
+
+/* SEND_WITH_INV carries a normal SEND payload; the rkey to invalidate is in
+ * the control segment. It is not SEND_IMM: RESP_SEND_INV has distinct CQE
+ * semantics at the peer. */
+static inline uint32_t
+mlxEncodeRcSendInvalidateWqe(void *buffer, size_t bufferBytes, uint32_t qpn,
+                             uint16_t wqeCounter,
+                             const struct MlxRcSge *sges, uint32_t numSge,
+                             uint32_t invalidateRkey, bool signaled,
+                             bool fenced, bool solicited)
+{
+    if (!invalidateRkey) return 0;
+    uint32_t ds = mlxEncodeRcSendWqe(buffer, bufferBytes, qpn, wqeCounter,
+                                     MLX_OPCODE_SEND_INVAL, sges, numSge,
+                                     0, 0, signaled, fenced, solicited);
+    if (ds) ((struct MlxWqeCtrlSeg *)buffer)->imm = MLX_BE32(invalidateRkey);
     return ds;
 }
 

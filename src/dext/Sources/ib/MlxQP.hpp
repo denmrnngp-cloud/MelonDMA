@@ -52,7 +52,8 @@ struct MlxQPContext {
     uint32_t    udMaskTried;    /* how many masks the datagram walk tried */
     uint32_t    udMaskUsed;     /* the one firmware accepted, 0 if none */
     uint32_t    dbRecordOffset;
-    uint32_t    bfOffset;
+    uint32_t    bfOffset;      /* within this QP's own UAR page */
+    uint32_t    bfUarSlot;     /* which of the client's UAR pages */
     uint64_t    sqPhys;
     uint64_t    rqPhys;
     volatile uint8_t *sqCpu;

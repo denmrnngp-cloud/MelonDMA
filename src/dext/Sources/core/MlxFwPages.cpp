@@ -421,6 +421,15 @@ MlxFwPages::HandleRuntimePageRequest(uint32_t functionId, int32_t numPages)
     }
     if (numPages < 0) {
         uint32_t n = (uint32_t)(-(int64_t)numPages);
+        /* A negative TAKE larger than the pages this driver actually handed
+         * firmware is an ownership ambiguity, not a normal reclaim: refuse
+         * before issuing any MANAGE_PAGES round-trip (ownership over speed). */
+        if (n > GetFirmwareOwned()) {
+            MLX_LOG("PAGE_REQUEST: TAKE %u pages exceeds firmware-owned %u — quarantine",
+                    n, GetFirmwareOwned());
+            EnterQuarantine();
+            return kIOReturnBadArgument;
+        }
         IOLockLock(s->lock);
         s->negativeTakeRequests++;
         s->negativeTakePages += n;

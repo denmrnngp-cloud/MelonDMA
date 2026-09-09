@@ -189,7 +189,7 @@ app: check-plist sign
 	cp loader/LoaderInfo.plist $(APP)/Contents/Info.plist
 	# modern macOS scans *.systemextension (the .dext name is pre-Catalina);
 	# sysextd requires the directory name to match CFBundleIdentifier
-	cp -R $(DEXT_BUNDLE) $(APP)/Contents/Library/SystemExtensions/com.mlx5.rdma.dext.systemextension
+	cp -R $(DEXT_BUNDLE) $(APP)/Contents/Library/SystemExtensions/com.melondma.rdma.dext.systemextension
 	codesign --force --options runtime --timestamp=none \
 	    --entitlements loader/Loader.entitlements -s "$(SIGN_ID)" $(APP)
 	@echo "=== built $(APP) — run: $(APP)/Contents/MacOS/mlx_activate ==="

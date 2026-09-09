@@ -42,9 +42,23 @@ struct ibv_context {
     uint64_t wc_cache_prefetched;
     struct ibv_cq *cq_list;
     struct ibv_qp *qp_list;
+    struct ibv_srq *srq_list;
     uint64_t live_objects; /* PD/CQ/channels retain the context */
     pthread_mutex_t mr_cache_lock;
     struct melondma_mr_cache *mr_cache;
+    /* Cache budget. Entries with no leases are kept for reuse and released
+     * only when a new registration needs the room, so a client that reuses a
+     * bounded working set never pays twice and one that walks through distinct
+     * buffers does not accumulate registrations until the driver refuses. Both
+     * ceilings come from the driver rather than being invented here: the mkey
+     * count from QueryLimits and the pinned-byte quota from the runtime
+     * status, taken at three quarters so the client keeps headroom for the
+     * registration it is about to make. */
+    uint64_t mr_cache_bytes;
+    uint32_t mr_cache_entries;
+    uint32_t mr_cache_max_entries;
+    uint64_t mr_cache_max_bytes;
+    uint64_t mr_cache_evictions;
 };
 
 static inline void context_stat_add(uint64_t *counter, uint64_t value)
@@ -110,6 +124,73 @@ static struct melondma_mr_cache *mr_cache_find(struct ibv_context *context,
             entry->access == access)
             return entry;
     return NULL;
+}
+
+/* Release one cached registration. Caller holds mr_cache_lock and has already
+ * unlinked the entry; the firmware commands happen outside the lock in
+ * mr_cache_evict_locked, which is why this takes the detached pieces. */
+static void mr_priv_release(struct melondma_mr_priv *priv)
+{
+    if (!priv) return;
+    if (priv->mr) (void)rdma_dereg_mr(priv->mr);
+    for (uint32_t i = 0; i < priv->nchildren; i++)
+        if (priv->children && priv->children[i])
+            (void)rdma_dereg_mr(priv->children[i]);
+    free(priv->children);
+    free(priv->cache);
+    free(priv);
+}
+
+/* Make room for one more entry of `want` bytes by releasing lease-free entries,
+ * least recently used first. The list is kept in most-recent-first order, so
+ * the last lease-free entry is the oldest. Entries that still have leases are
+ * skipped: the client is using them.
+ *
+ * Called with mr_cache_lock held; returns a detached list the caller releases
+ * after dropping the lock, because deregistration is a firmware command and
+ * holding a mutex across it would serialise every other registration. */
+static struct melondma_mr_priv **mr_cache_evict_locked(
+    struct ibv_context *context, uint64_t want, uint32_t *out_count)
+{
+    *out_count = 0;
+    if (!context->mr_cache_max_entries && !context->mr_cache_max_bytes)
+        return NULL;
+    struct melondma_mr_priv **doomed = NULL;
+    uint32_t doomed_count = 0, doomed_cap = 0;
+    for (;;) {
+        int over_entries = context->mr_cache_max_entries &&
+            context->mr_cache_entries + 1 > context->mr_cache_max_entries;
+        int over_bytes = context->mr_cache_max_bytes &&
+            context->mr_cache_bytes + want > context->mr_cache_max_bytes;
+        if (!over_entries && !over_bytes) break;
+        struct melondma_mr_cache **victim = NULL;
+        for (struct melondma_mr_cache **link = &context->mr_cache; *link;
+             link = &(*link)->next)
+            if ((*link)->priv && (*link)->priv->leases == 0) victim = link;
+        if (!victim) break;   /* everything left is in use */
+        struct melondma_mr_cache *entry = *victim;
+        *victim = entry->next;
+        context->mr_cache_entries--;
+        context->mr_cache_bytes -= context->mr_cache_bytes < entry->length ?
+            context->mr_cache_bytes : entry->length;
+        context->mr_cache_evictions++;
+        if (doomed_count == doomed_cap) {
+            uint32_t cap = doomed_cap ? doomed_cap * 2 : 8;
+            struct melondma_mr_priv **grown =
+                realloc(doomed, cap * sizeof(*grown));
+            if (!grown) {
+                /* Cannot record it for deferred release; do it inline rather
+                 * than leak, accepting the lock hold for this one entry. */
+                mr_priv_release(entry->priv);
+                continue;
+            }
+            doomed = grown;
+            doomed_cap = cap;
+        }
+        doomed[doomed_count++] = entry->priv;
+    }
+    *out_count = doomed_count;
+    return doomed;
 }
 
 static int activate_cached_mrs(struct ibv_qp *qp)
@@ -464,6 +545,19 @@ struct ibv_context *ibv_open_device(struct ibv_device *device)
     context->device = device;
     context->dev = rdma;
     pthread_mutex_init(&context->mr_cache_lock, NULL);
+    /* Cache ceilings from the driver's own limits, at three quarters so the
+     * client keeps room for the registration it is about to make. Zero on
+     * either side means "unknown", and the cache then only bounds itself by
+     * the other one. */
+    {
+        struct rdma_limits limits = {0};
+        if (rdma_query_limits(rdma, &limits) == 0 && limits.max_mr)
+            context->mr_cache_max_entries = limits.max_mr - limits.max_mr / 4;
+        struct rdma_runtime_status runtime = {0};
+        if (rdma_query_runtime(rdma, &runtime) == 0 && runtime.client_pinned_limit)
+            context->mr_cache_max_bytes = runtime.client_pinned_limit -
+                                          runtime.client_pinned_limit / 4;
+    }
 
     /* Legacy environment configuration is deliberately optional. New clients
      * call ibv_mlx5_configure_roce() after resolving their control endpoint. */
@@ -485,15 +579,9 @@ int ibv_close_device(struct ibv_context *context)
     pthread_mutex_unlock(&context->mr_cache_lock);
     while (entry) {
         struct melondma_mr_cache *next = entry->next;
-        struct melondma_mr_priv *priv = entry->priv;
-        if (priv) {
-            if (priv->mr) (void)rdma_dereg_mr(priv->mr);
-            for (uint32_t i = 0; i < priv->nchildren; i++)
-                if (priv->children && priv->children[i]) (void)rdma_dereg_mr(priv->children[i]);
-            free(priv->children);
-            free(priv);
-        }
-        free(entry);
+        /* mr_priv_release frees the list node too: it is priv->cache. */
+        if (entry->priv) mr_priv_release(entry->priv);
+        else free(entry);
         entry = next;
     }
     pthread_mutex_destroy(&context->mr_cache_lock);
@@ -532,6 +620,7 @@ int ibv_mlx5_query_perf(struct ibv_context *context,
     perf->cq_events = native.cq_events;
     perf->fw_commands = native.fw_commands;
     perf->fw_command_sleeps = native.fw_command_sleeps;
+    perf->fw_command_slot_waits = native.fw_command_slot_waits;
     perf->cq_event_wakeups = native.cq_event_wakeups;
     return 0;
 }
@@ -874,6 +963,11 @@ int ibv_query_device(struct ibv_context *context,
     attr->page_size_cap = 4096;
     attr->phys_port_cnt = source.num_ports > UINT8_MAX ?
         UINT8_MAX : (uint8_t)source.num_ports;
+    /* rdma-core keeps these big-endian; the driver hands them over in host
+     * order, so swap rather than leave a consumer comparing different bytes
+     * to the same GUID read on Linux. */
+    attr->node_guid = __builtin_bswap64(source.node_guid);
+    attr->sys_image_guid = __builtin_bswap64(source.sys_image_guid);
     return 0;
 }
 
@@ -985,6 +1079,15 @@ int ibv_get_async_event(struct ibv_context *context,
              candidate; candidate = candidate->context_next) {
             if (candidate->priv == qp) {
                 event->element.qp = candidate;
+                return 0;
+            }
+        }
+        return ENODEV;
+    } else if (native.element_type == 4) { /* MLX_ASYNC_ELEMENT_SRQ */
+        for (struct ibv_srq *candidate = context->srq_list;
+             candidate; candidate = candidate->context_next) {
+            if (candidate->handle == native.element_handle) {
+                event->element.srq = candidate;
                 return 0;
             }
         }
@@ -1334,7 +1437,8 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
                              struct ibv_qp_init_attr *init)
 {
     if (!pd || !init || !init->send_cq || !init->recv_cq ||
-        (init->qp_type != IBV_QPT_RC && init->qp_type != IBV_QPT_UD) ||
+        (init->qp_type != IBV_QPT_RC && init->qp_type != IBV_QPT_UC &&
+         init->qp_type != IBV_QPT_UD) ||
         init->cap.max_send_sge > RDMA_MAX_SGE ||
         init->cap.max_recv_sge > RDMA_MAX_RECV_SGE) {
         errno = EINVAL;
@@ -1343,7 +1447,8 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
     struct rdma_qp_init_attr native = {
         .send_cq = (rdma_cq *)init->send_cq->priv,
         .recv_cq = (rdma_cq *)init->recv_cq->priv,
-        .qp_type = init->qp_type == IBV_QPT_UD ? RDMA_QPT_UD : RDMA_QPT_RC,
+        .qp_type = init->qp_type == IBV_QPT_UD ? RDMA_QPT_UD :
+                   init->qp_type == IBV_QPT_UC ? RDMA_QPT_UC : RDMA_QPT_RC,
         .cap_sq = round_queue_depth(init->cap.max_send_wr),
         .cap_rq = round_queue_depth(init->cap.max_recv_wr),
         .max_inline_data = init->cap.max_inline_data,
@@ -1484,6 +1589,50 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
     /* No alignment requirement: the DEXT pins client pages and the PAS walk
      * handles partial first/last pages (MlxDMA::Pin → mlxAppendMttPages). */
 
+    /* Look before registering. This used to happen the other way round: the
+     * region was registered first and the cache consulted afterwards, so a
+     * repeat registration of the same buffer paid a full CREATE_MKEY and then
+     * dropped the result on the floor without deregistering it — one leaked
+     * mkey per repeat, until the per-client quota refused the next one. The
+     * race path further down already deregistered its redundant registration;
+     * this path simply never happened to. Checking first also makes the cache
+     * do what its name says: a hit now costs a lease, not 265 microseconds. */
+    {
+        pthread_mutex_lock(&pd->context->mr_cache_lock);
+        struct melondma_mr_cache *hit =
+            mr_cache_find(pd->context, pd, addr, length, access);
+        if (hit) {
+            hit->priv->leases++;
+            struct melondma_mr_priv *priv = hit->priv;
+            /* Move to the front: eviction takes the last lease-free entry, so
+             * this is what makes the order least-recently-used. */
+            if (pd->context->mr_cache != hit) {
+                for (struct melondma_mr_cache **link = &pd->context->mr_cache;
+                     *link; link = &(*link)->next)
+                    if (*link == hit) { *link = hit->next; break; }
+                hit->next = pd->context->mr_cache;
+                pd->context->mr_cache = hit;
+            }
+            pthread_mutex_unlock(&pd->context->mr_cache_lock);
+            struct ibv_mr *mr = calloc(1, sizeof(*mr));
+            if (!mr) {
+                pthread_mutex_lock(&pd->context->mr_cache_lock);
+                if (priv->leases) priv->leases--;
+                pthread_mutex_unlock(&pd->context->mr_cache_lock);
+                errno = ENOMEM;
+                return NULL;
+            }
+            mr->context = pd->context; mr->pd = pd;
+            mr->addr = addr; mr->length = length;
+            mr->handle = priv->handle;
+            mr->lkey = priv->lkey;
+            mr->rkey = priv->rkey;
+            mr->priv = priv;
+            return mr;
+        }
+        pthread_mutex_unlock(&pd->context->mr_cache_lock);
+    }
+
     rdma_mr *native = NULL;
     rdma_mr **children = NULL;
     uint32_t nchildren = 0;
@@ -1539,18 +1688,26 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
         }
     }
 
+    /* Only reachable when another thread registered the same region while this
+     * one was in the firmware command. Give back what we registered rather
+     * than leaking it — the same thing the second race check below does. */
     pthread_mutex_lock(&pd->context->mr_cache_lock);
     struct melondma_mr_cache *cached = mr_cache_find(pd->context, pd, addr, length, access);
     if (cached) {
         cached->priv->leases++;
+        struct melondma_mr_priv *priv = cached->priv;
         pthread_mutex_unlock(&pd->context->mr_cache_lock);
+        (void)rdma_dereg_mr(native);
+        for (uint32_t j = 0; j < nchildren; j++)
+            if (children && children[j]) (void)rdma_dereg_mr(children[j]);
+        free(children);
         struct ibv_mr *mr = calloc(1, sizeof(*mr));
         if (!mr) { errno = ENOMEM; return NULL; }
         mr->context = pd->context; mr->pd = pd; mr->addr = addr; mr->length = length;
-        mr->handle = cached->priv->handle;
-        mr->lkey = cached->priv->lkey;
-        mr->rkey = cached->priv->rkey;
-        mr->priv = cached->priv;
+        mr->handle = priv->handle;
+        mr->lkey = priv->lkey;
+        mr->rkey = priv->rkey;
+        mr->priv = priv;
         return mr;
     }
     pthread_mutex_unlock(&pd->context->mr_cache_lock);
@@ -1599,9 +1756,18 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
         mr->priv = race->priv;
         return mr;
     }
+    uint32_t doomed_count = 0;
+    struct melondma_mr_priv **doomed =
+        mr_cache_evict_locked(pd->context, (uint64_t)length, &doomed_count);
     priv->cache->next = pd->context->mr_cache;
     pd->context->mr_cache = priv->cache;
+    pd->context->mr_cache_entries++;
+    pd->context->mr_cache_bytes += (uint64_t)length;
     pthread_mutex_unlock(&pd->context->mr_cache_lock);
+    /* Deregistration is a firmware command; do it outside the lock so it does
+     * not serialise every other registration on this context. */
+    for (uint32_t i = 0; i < doomed_count; i++) mr_priv_release(doomed[i]);
+    free(doomed);
     mr->context = pd->context;
     mr->pd = pd;
     mr->addr = addr;
@@ -1699,6 +1865,7 @@ static int native_send_opcode(enum ibv_wr_opcode opcode, uint32_t *native)
     case IBV_WR_RDMA_WRITE: *native = RDMA_WR_RDMA_WRITE; return 0;
     case IBV_WR_RDMA_WRITE_WITH_IMM: *native = RDMA_WR_RDMA_WRITE_IMM; return 0;
     case IBV_WR_RDMA_READ: *native = RDMA_WR_RDMA_READ; return 0;
+    case IBV_WR_SEND_WITH_INV: *native = RDMA_WR_SEND_INV; return 0;
     case IBV_WR_LOCAL_INV: *native = RDMA_WR_LOCAL_INV; return 0;
     case IBV_WR_ATOMIC_CMP_AND_SWP: *native = RDMA_WR_ATOMIC_CS; return 0;
     case IBV_WR_ATOMIC_FETCH_AND_ADD: *native = RDMA_WR_ATOMIC_FA; return 0;
@@ -1714,12 +1881,49 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
     if (!qp || !wr) { if (bad_wr) *bad_wr = wr; return EINVAL; }
     struct melondma_qp_priv *priv = qp->priv;
     while (wr) {
+        if (qp->qp_type == IBV_QPT_UC &&
+            (wr->opcode == IBV_WR_RDMA_READ ||
+             wr->opcode == IBV_WR_LOCAL_INV ||
+             wr->opcode == IBV_WR_ATOMIC_CMP_AND_SWP ||
+             wr->opcode == IBV_WR_ATOMIC_FETCH_AND_ADD)) {
+            if (bad_wr) *bad_wr = wr;
+            return EOPNOTSUPP;
+        }
         if (wr->opcode == IBV_WR_LOCAL_INV) {
             if (rdma_post_local_inv(priv->qp, wr->wr_id,
                                     wr->wr.local_inv.invalidate_rkey) != 0) {
                 if (bad_wr) *bad_wr = wr;
                 return EIO;
             }
+            wr = wr->next;
+            continue;
+        }
+        if (wr->opcode == IBV_WR_SEND_WITH_INV) {
+            if (qp->qp_type != IBV_QPT_RC || wr->num_sge < 1 ||
+                wr->num_sge > (int)RDMA_MAX_SGE || !wr->sg_list ||
+                !wr->ex.invalidate_rkey ||
+                (wr->send_flags & ~(IBV_SEND_SIGNALED | IBV_SEND_FENCE |
+                                    IBV_SEND_SOLICITED))) {
+                if (bad_wr) *bad_wr = wr;
+                return EINVAL;
+            }
+            struct rdma_sge sges[RDMA_MAX_SGE] = {};
+            for (int i = 0; i < wr->num_sge; i++) {
+                sges[i].addr = wr->sg_list[i].addr;
+                sges[i].length = wr->sg_list[i].length;
+                sges[i].lkey = wr->sg_list[i].lkey;
+            }
+            struct rdma_send_wr native = {
+                .wr_id = wr->wr_id, .opcode = RDMA_WR_SEND_INV,
+                .num_sge = (uint32_t)wr->num_sge, .sg_list = sges,
+                .rkey = wr->ex.invalidate_rkey,
+                .send_flags = ((wr->send_flags & IBV_SEND_SIGNALED) || priv->sq_sig_all ?
+                    RDMA_SEND_SIGNALED : 0) |
+                    ((wr->send_flags & IBV_SEND_FENCE) ? RDMA_SEND_FENCE : 0) |
+                    ((wr->send_flags & IBV_SEND_SOLICITED) ? RDMA_SEND_SOLICITED : 0),
+            };
+            int rc = rdma_post_send_sge(priv->qp, &native);
+            if (rc) { if (bad_wr) *bad_wr = wr; return rc == -EAGAIN ? EAGAIN : EIO; }
             wr = wr->next;
             continue;
         }
@@ -2074,12 +2278,14 @@ static void copy_native_wc(struct ibv_wc *out, const struct rdma_wc *native)
     out->opcode = wc_opcode(native->opcode);
     out->byte_len = native->byte_len;
     out->imm_data = native->imm_data;
+    out->invalidated_rkey = native->imm_data;
     /* Translated one flag at a time rather than copied, so a flag added on the
      * native side is inert until it is mapped here on purpose. That is why the
      * routing-header flag went missing after the driver started setting it. */
     out->wc_flags =
         (native->wc_flags & RDMA_WC_WITH_IMM ? IBV_WC_WITH_IMM : 0) |
         (native->wc_flags & RDMA_WC_WITH_ATOMIC ? IBV_WC_WITH_ATOMIC : 0) |
+        (native->wc_flags & RDMA_WC_WITH_INV ? IBV_WC_WITH_INV : 0) |
         (native->wc_flags & RDMA_WC_GRH ? IBV_WC_GRH : 0);
     out->qp_num = native->qp_num;
     out->atomic_result = native->atomic_result;
@@ -2191,10 +2397,20 @@ const char *ibv_event_type_str(enum ibv_event_type event)
     switch (event) {
     case IBV_EVENT_CQ_ERR:       return "CQ error";
     case IBV_EVENT_QP_FATAL:     return "local work queue catastrophic error";
+    case IBV_EVENT_QP_REQ_ERR:   return "invalid request";
+    case IBV_EVENT_QP_ACCESS_ERR:return "local access violation";
+    case IBV_EVENT_COMM_EST:     return "communication established";
+    case IBV_EVENT_SQ_DRAINED:   return "send queue drained";
+    case IBV_EVENT_PATH_MIG:     return "path migrated";
+    case IBV_EVENT_PATH_MIG_ERR: return "path migration error";
     case IBV_EVENT_DEVICE_FATAL: return "local catastrophic error";
     case IBV_EVENT_PORT_ACTIVE:  return "port active";
     case IBV_EVENT_PORT_ERR:     return "port error";
+    case IBV_EVENT_SRQ_ERR:      return "SRQ catastrophic error";
+    case IBV_EVENT_SRQ_LIMIT_REACHED: return "SRQ limit reached";
+    case IBV_EVENT_QP_LAST_WQE_REACHED: return "last WQE reached";
     case IBV_EVENT_GID_CHANGE:   return "GID table change";
+    case IBV_EVENT_WQ_FATAL:     return "work queue fatal error";
     default:                     return "unknown";
     }
 }
@@ -2289,6 +2505,8 @@ struct ibv_srq *ibv_create_srq(struct ibv_pd *pd,
     srq->srq_context = srq_init_attr->srq_context;
     srq->handle = rdma_srq_number(native);
     srq->priv = native;
+    srq->context_next = pd->context->srq_list;
+    pd->context->srq_list = srq;
     /* Report what was granted, not what was asked for. */
     srq_init_attr->attr.max_wr = got.max_wr;
     srq_init_attr->attr.max_sge = got.max_sge;
@@ -2300,6 +2518,9 @@ int ibv_destroy_srq(struct ibv_srq *srq)
     if (!srq) return EINVAL;
     int rc = rdma_destroy_srq((rdma_srq *)srq->priv);
     if (rc) return rc == -EINVAL ? EINVAL : EIO;
+    struct ibv_srq **list = &srq->context->srq_list;
+    while (*list && *list != srq) list = &(*list)->context_next;
+    if (*list == srq) *list = srq->context_next;
     free(srq);
     return 0;
 }
@@ -2372,14 +2593,67 @@ int ibv_detach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid)
     return EOPNOTSUPP;
 }
 
-/* Builds an address handle from the GRH of a UD receive. There are no UD
- * receives here, so there is never a work completion to build one from. */
+/* RoCEv2 receives carry the sender in GRH.sgid and the local destination in
+ * GRH.dgid.  The existing provider setup already owns the peer MAC explicitly
+ * (there is no safe raw-ARP fallback in a library), so this completes the
+ * standard reply-AH helper without widening its authority or inventing L2
+ * routing. */
+int ibv_init_ah_from_wc(struct ibv_context *context, uint8_t port_num,
+                        struct ibv_wc *wc, struct ibv_grh *grh,
+                        struct ibv_ah_attr *ah_attr)
+{
+    if (!context || !wc || !grh || !ah_attr || port_num != 1 ||
+        !(wc->wc_flags & IBV_WC_GRH)) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint32_t version_tclass_flow = ntohl(grh->version_tclass_flow);
+    if ((version_tclass_flow >> 28) != 6 || grh->next_hdr != 17) {
+        errno = EPROTONOSUPPORT;
+        return -1;
+    }
+
+    uint32_t sgid_index = UINT32_MAX;
+    if (context->gid_programmed &&
+        !memcmp(context->gid.raw, grh->dgid.raw, sizeof(context->gid.raw))) {
+        sgid_index = context->gid_index;
+    } else {
+        /* The received destination must be one of this context's GIDs.  Do
+         * not guess index zero: a reply through the wrong GID is a packet to
+         * the wrong source address on a multi-GID RoCE host. */
+        for (uint32_t i = 0; i < RDMA_MAX_GID_TABLE; i++) {
+            union ibv_gid local = {};
+            if (ibv_query_gid(context, port_num, (int)i, &local) == 0 &&
+                !memcmp(local.raw, grh->dgid.raw, sizeof(local.raw))) {
+                sgid_index = i;
+                break;
+            }
+        }
+    }
+    if (sgid_index == UINT32_MAX) {
+        errno = ENODATA;
+        return -1;
+    }
+
+    memset(ah_attr, 0, sizeof(*ah_attr));
+    ah_attr->is_global = 1;
+    ah_attr->port_num = port_num;
+    ah_attr->grh.dgid = grh->sgid;
+    ah_attr->grh.sgid_index = (uint8_t)sgid_index;
+    ah_attr->grh.flow_label = version_tclass_flow & 0xfffffu;
+    ah_attr->grh.traffic_class = (uint8_t)((version_tclass_flow >> 20) & 0xffu);
+    ah_attr->grh.hop_limit = grh->hop_limit;
+    return 0;
+}
+
 struct ibv_ah *ibv_create_ah_from_wc(struct ibv_pd *pd, struct ibv_wc *wc,
                                      struct ibv_grh *grh, uint8_t port_num)
 {
-    (void)pd; (void)wc; (void)grh; (void)port_num;
-    errno = EOPNOTSUPP;
-    return NULL;
+    if (!pd) { errno = EINVAL; return NULL; }
+    struct ibv_ah_attr attr = {};
+    if (ibv_init_ah_from_wc(pd->context, port_num, wc, grh, &attr) != 0)
+        return NULL;
+    return ibv_create_ah(pd, &attr);
 }
 
 /* Flow steering rules are programmed into firmware steering tables, which this
@@ -2543,6 +2817,13 @@ static void melondma_wr_send_imm(struct ibv_qp_ex *qpx, __be32 imm_data)
     wr->imm_data = imm_data;
 }
 
+static void melondma_wr_send_inv(struct ibv_qp_ex *qpx, uint32_t invalidate_rkey)
+{
+    struct ibv_send_wr *wr = wrb_begin(qpx, IBV_WR_SEND_WITH_INV);
+    if (!wr) return;
+    wr->invalidate_rkey = invalidate_rkey;
+}
+
 static void melondma_wr_local_inv(struct ibv_qp_ex *qpx, uint32_t invalidate_rkey)
 {
     struct ibv_send_wr *wr = wrb_begin(qpx, IBV_WR_LOCAL_INV);
@@ -2622,6 +2903,7 @@ static void melondma_qp_ex_init(struct ibv_qp_ex *qpx)
     qpx->wr_rdma_read            = melondma_wr_rdma_read;
     qpx->wr_send                 = melondma_wr_send;
     qpx->wr_send_imm             = melondma_wr_send_imm;
+    qpx->wr_send_inv             = melondma_wr_send_inv;
     qpx->wr_local_inv            = melondma_wr_local_inv;
     qpx->wr_atomic_cmp_swp       = melondma_wr_atomic_cmp_swp;
     qpx->wr_atomic_fetch_add     = melondma_wr_atomic_fetch_add;

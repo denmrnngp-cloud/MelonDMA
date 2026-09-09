@@ -26,7 +26,7 @@ data path runs inside a PCI DriverKit extension that owns the ConnectX HCA.
 
 ## What it is
 
-* **A DEXT (DriverKit system extension)**, `com.mlx5.rdma.dext`, built with
+* **A DEXT (DriverKit system extension)**, `com.melondma.rdma.dext`, built with
   `PCIDriverKit`. It is a port of Apple's own `AppleEthernetMLX5` mlx5 driver
   concept to the PCI DriverKit surface. When active, it *replaces* Apple's
   `AppleEthernetMLX5` as the owner of the ConnectX card.
@@ -38,18 +38,21 @@ data path runs inside a PCI DriverKit extension that owns the ConnectX HCA.
   `docs/inference-client-guide.md` for the client-side performance contract.
 
 The driver implements the verbs primitives you expect: protection domains (PD),
-memory regions (MR), queue pairs (QP) — both reliable-connected (RC) and
-datagram (UD) — completion queues (CQ), shared receive queues (SRQ), send/recv
+memory regions (MR), queue pairs (QP) — reliable-connected (RC),
+unreliable-connected (UC) and datagram (UD) — completion queues (CQ), shared
+receive queues (SRQ), send/recv
 work requests and work completions, GID resolution, RC atomics, MSI-X completion
 delivery, and QoS/service-level. The userspace layer exports all 44 verbs
 symbols real consumers need, including a real `ibv_qp_to_qp_ex`.
 
 ## Honest current status
 
-* **v0.3.0** — MSI-X interrupts are delivered (the earlier "platform limit" was
-  our own FLR wiping the MSI-X table), SRQ (RMP) and UD (datagram) QPs are
-  implemented and hardware-gated, and the userspace layer exports all 44 verbs
-  symbols real consumers need. See `CHANGELOG.md` for the full record.
+* **Current tree (post-v0.3.0)** — on top of MSI-X delivery, SRQ (RMP) and UD
+  QPs, and the full 44-symbol verbs export, the tree adds UC QPs,
+  SEND_WITH_INV (`IBV_WR_SEND_WITH_INV` / `ibv_wr_send_inv` → `WC_WITH_INV`),
+  cross-machine UD/SRQ peer tests PASS, port link control (PAOS/PTYS/PFCC),
+  Apple-parity capability/PTYS/PFCC decode, per-client UAR and doorbell pools,
+  and multiple completion queues. See `CHANGELOG.md` for the full record.
 * **P0 / P1 / P2 / P3 production gates pass on the maintainer's hardware**
   (ConnectX-4 Lx on an ADT-Link PCIe Gen3 adapter ↔ NVIDIA DGX Spark peer over 40G).
   This includes the SEND/RECV, one-sided WRITE, one-sided READ, RC atomics,

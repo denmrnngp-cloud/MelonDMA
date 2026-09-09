@@ -209,7 +209,7 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     if (!req->sqSize || !req->rqSize || req->sqSize < 64 || req->rqSize < 64 ||
         req->sqBufAddr || req->rqBufAddr ||
         req->maxInlineData > MLX_UC_MAX_INLINE_DATA ||
-        (req->rsvd & ~MLX_UC_QP_TRUSTED) ||
+        (req->rsvd & ~(MLX_UC_QP_TRUSTED | MLX_UC_QP_SCATTER_CQE)) ||
         (req->sqSize & (req->sqSize - 1)) || (req->rqSize & (req->rqSize - 1)))
         return kIOReturnBadArgument;
     uint32_t logSq = 31u - __builtin_clz(req->sqSize);
@@ -218,9 +218,9 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     /* The external user client owns its own firmware PD.  Ownership and
      * client isolation are checked by MlxUserClient before reaching here;
      * comparing against the provider's bootstrap PD rejects valid clients. */
-    /* Connected (0) and datagram (1) are the two transports this driver
-     * carries; anything else is refused rather than encoded blindly. */
-    if (!req->pd || req->qpType > 1 || !s->roce->GetCQ() ||
+    /* RC, UD and UC are the supported transports. UC shares RC's connected
+     * RoCE address path, but never inherits RC-only READ/atomic/retry paths. */
+    if (!req->pd || req->qpType > 2 || !s->roce->GetCQ() ||
         !s->roce->GetCQ()->Lookup(req->sendCq) ||
         !s->roce->GetCQ()->Lookup(req->recvCq))
         return kIOReturnNotPermitted;
@@ -252,8 +252,54 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     mlxSetBits(in, 0x80, 32, 0);            /* opt_param_mask */
 
     uint8_t *qpc = in + qpcOff;
-    uint32_t st = (req->qpType == 0) ? MLX_QP_ST_RC : MLX_QP_ST_UD;
-    uint32_t uarPage = bundle ? bundle->uarIndex :
+    uint32_t st = req->qpType == 0 ? MLX_QP_ST_RC :
+                  req->qpType == 1 ? MLX_QP_ST_UD : MLX_QP_ST_UC;
+    /* The blue-flame register has to be chosen before the QPC is built: a QPC
+     * names one uar_page, and ringing a register that belongs to a different
+     * UAR than the QPC declares is simply the wrong doorbell. Selection is
+     * serialised per client by the user client's method lock, so counting
+     * without holding tableLock across the grow is safe.
+     *
+     * Policy: take the least-loaded register across every UAR page this client
+     * already holds; if all of them are taken, grow the pool by one page and
+     * take its first register; if the pool is full, share the least-loaded. */
+    const MlxHcaCaps *hcaCaps = s->core->GetHCA() ?
+        &s->core->GetHCA()->Caps() : NULL;
+    const uint8_t logBf = hcaCaps ? hcaCaps->logBfRegSize : 0;
+    const uint32_t bfRegSize = logBf && logBf < 13 ? (1u << logBf) : 0;
+    const uint32_t uarPageSize = hcaCaps && hcaCaps->uarPageSize ?
+        hcaCaps->uarPageSize : MLX_UAR_ADAPTER_PAGE_SIZE;
+    const uint32_t bfRegs = mlxBfRegsPerUar(uarPageSize, bfRegSize);
+    uint32_t bfUarSlot = 0, bfIndex = 0, bfPeers = 0;
+    if (bundle && bfRegs) {
+        MlxUAR *uar = s->core->GetUAR();
+        for (int attempt = 0; attempt < 2; attempt++) {
+            const uint32_t slots = uar->ClientUarCount(bundle);
+            uint32_t best = 0xffffffffu;
+            IOLockLock(s->tableLock);
+            for (uint32_t sl = 0; sl < slots; sl++) {
+                const uint32_t page = uar->ClientUarIndex(bundle, sl);
+                uint32_t counts[MLX_BF_MAX_REGS] = {};
+                for (int i = 0; i < s->tableCap; i++) {
+                    if (!s->used[i] || s->table[i].clientBundle != bundle ||
+                        s->table[i].uarPage != page) continue;
+                    const uint32_t idx = mlxBfRegIndex(s->table[i].bfOffset,
+                                                       uarPageSize, bfRegSize);
+                    if (idx < bfRegs) counts[idx]++;
+                }
+                for (uint32_t r = 0; r < bfRegs; r++)
+                    if (counts[r] < best) { best = counts[r]; bfUarSlot = sl; bfIndex = r; }
+            }
+            IOLockUnlock(s->tableLock);
+            bfPeers = best == 0xffffffffu ? 0 : best;
+            if (bfPeers == 0 || attempt == 1) break;
+            /* Every register in the pool is already in use — try to grow. */
+            uint32_t grown = 0;
+            if (uar->AllocClientUar(bundle, &grown) != kIOReturnSuccess) break;
+        }
+    }
+    uint32_t uarPage = bundle ?
+        s->core->GetUAR()->ClientUarIndex(bundle, bfUarSlot) :
         (s->core->GetUAR() ? s->core->GetUAR()->GetBootUarIndex() : 0);
     uint64_t dbDma = 0;
     uint32_t dbOffset = 0;
@@ -286,6 +332,20 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     mlxSetBits(qpc, 0x51, 4, logSq);
     mlxSetBits(qpc, 0x5b, 1, 1);            /* rlky (relaxed ordering) */
     mlxSetBits(qpc, 0x68, 24, uarPage);     /* uar_page — a QP without UAR is invalid */
+    /* counter_set_id @0x60. Traffic on this QP accumulates in the device's
+     * queue-counter set, which is what makes out_of_buffer and the RC error
+     * counters mean anything. Zero when firmware refused to allocate a set,
+     * which is exactly the value the field had before. */
+    mlxSetBits(qpc, 0x60, 8, s->core->QCounterSet());
+    /* Scatter-to-CQE (opt-in, RC only). The kernel sets these in
+     * create_user_qp's QPC and they persist across the transitions. DATA32
+     * matches this driver's 64-byte CQE; DATA64 would need a 128-byte CQE
+     * and is not used. Requester value 0x11, responder 0x1 (mlx5_ib.h). */
+    if ((req->rsvd & MLX_UC_QP_SCATTER_CQE) &&
+        (st == MLX_QP_ST_RC || st == MLX_QP_ST_UC)) {
+        mlxSetBits(qpc, MLX_QPC_CS_REQ_BIT_OFFSET, 8, MLX_REQ_SCAT_DATA32_CQE);
+        mlxSetBits(qpc, MLX_QPC_CS_RES_BIT_OFFSET, 8, MLX_RES_SCAT_DATA32_CQE);
+    }
     mlxSetBits(qpc, 0xa3, 5, 0);            /* log_page_size = 4 KiB */
     mlxSetBits(qpc, 0x380, 4, 8);           /* Linux MLX5_IB_ACK_REQ_FREQ */
     mlxSetBits(qpc, 0x394, 1, 1);           /* fre (fast reg enable) */
@@ -372,17 +432,16 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     resp->qpn = qpn;
     resp->sqStrideSize = 64;
     resp->dbRecordOffset = dbOffset;
-    resp->bfOffset = MLX_BF_OFFSET;
-    resp->bfFlags = 0;
+    /* Offsets handed out here are flat across the client's pools: the client
+     * divides by the page size to pick the mapping and takes the remainder
+     * inside it. dbRecordOffset already arrives flat from AllocClientDbSlot. */
+    const uint32_t bfWithin = bfRegs ?
+        mlxBfRegOffset(bfIndex, uarPageSize, bfRegSize) : MLX_BF_OFFSET;
+    resp->bfOffset = bundle ?
+        mlxFlatOffset(bfUarSlot, uarPageSize, bfWithin) : bfWithin;
+    resp->bfFlags = bfPeers ? MLX_QP_BF_SHARED : 0;
     resp->mappingVersion = bundle ? MLX_FAST_PATH_ABI_VERSION : 0;
     resp->uarPage = uarPage;
-    const MlxHcaCaps *hcaCaps = s->core->GetHCA() ?
-        &s->core->GetHCA()->Caps() : NULL;
-    const uint8_t logBf = hcaCaps ? hcaCaps->logBfRegSize : 0;
-    const uint32_t bfRegSize = logBf && logBf < 13 ? (1u << logBf) : 0;
-    const uint32_t uarPageSize = !hcaCaps ? 4096u :
-        (hcaCaps->uar4k ? 4096u : (1u << hcaCaps->logUarPageSize));
-    const uint32_t bfRegs = mlxBfRegsPerUar(uarPageSize, bfRegSize);
     resp->bfBufSize = bfRegSize / 2u;
 
     /* Record the context. */
@@ -390,25 +449,6 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     int slot = -1;
     for (int i = 0; i < s->tableCap; i++)
         if (!s->used[i]) { slot = i; break; }
-    /* Pick the least-loaded blue-flame register on this client's UAR page.
-     * Done under tableLock so a concurrent CreateQP cannot pick the same one,
-     * and by counting live contexts so a destroyed QP frees its register. */
-    uint32_t bfIndex = 0, bfPeers = 0;
-    if (slot >= 0 && bfRegs > 1) {
-        uint32_t counts[MLX_BF_MAX_REGS] = {};
-        for (int i = 0; i < s->tableCap; i++) {
-            if (!s->used[i] || s->table[i].uarPage != uarPage) continue;
-            uint32_t off = s->table[i].bfOffset;
-            if (off < MLX_BF_OFFSET) continue;
-            uint32_t idx = (off - MLX_BF_OFFSET) / bfRegSize;
-            if (idx < bfRegs) counts[idx]++;
-        }
-        for (uint32_t i = 1; i < bfRegs; i++)
-            if (counts[i] < counts[bfIndex]) bfIndex = i;
-        bfPeers = counts[bfIndex];
-        resp->bfOffset = MLX_BF_OFFSET + bfIndex * bfRegSize;
-    }
-    if (bfPeers) resp->bfFlags |= MLX_QP_BF_SHARED;
     if (slot < 0) {
         IOLockUnlock(s->tableLock);
         uint8_t din[16] = {}, dout[16] = {};
@@ -460,7 +500,11 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     ctx->srqn = req->srqn;
     ctx->sqBufAddr = req->sqBufAddr;
     ctx->rqBufAddr = req->rqBufAddr;
-    ctx->bfOffset = resp->bfOffset;
+    /* The context keeps the offset inside its own UAR page: RingSendDoorbell
+     * takes a firmware UAR index plus an in-page offset, so the kernel path
+     * never handles the flat form the client was given. */
+    ctx->bfOffset = bfWithin;
+    ctx->bfUarSlot = bfUarSlot;
     ctx->dbRecordOffset = dbOffset;
     ctx->sqCpu = (volatile uint8_t *)(uintptr_t)sqAddr;
     ctx->rqCpu = (volatile uint8_t *)(uintptr_t)rqAddr;
@@ -481,7 +525,8 @@ MlxQP::CreateQP(const struct mlx_create_qp_req *req,
     IOLockUnlock(s->tableLock);
 
     MLX_DBG("QP[%u] created type=%s sq=%u rq=%u (sqPages=%u rqPages=%u)", qpn,
-            (req->qpType == 0) ? "RC" : "UD", req->sqSize, req->rqSize,
+            req->qpType == 0 ? "RC" : req->qpType == 1 ? "UD" : "UC",
+            req->sqSize, req->rqSize,
             sqDma.numPages, rqDma.numPages);
     return kIOReturnSuccess;
 }
@@ -525,6 +570,7 @@ MlxQP::ModifyQP(const struct mlx_modify_qp_req *req)
      * adds the queue key and INIT->RTR is a bare state change, with none of
      * the RoCE path validation and encoding a connected pair needs. */
     const bool isUd = ctx->st == MLX_QP_ST_UD;
+    const bool isUc = ctx->st == MLX_QP_ST_UC;
 
     if (opcode == MLX_CMD_OP_RST2INIT_QP) {
         /* The encoder answers with a single bool, and the driver's log does not
@@ -535,7 +581,8 @@ MlxQP::ModifyQP(const struct mlx_modify_qp_req *req)
         if (!req->portNum || req->portNum > 0xff) { UnlockQp(ctx); return kIOReturnNotAligned; }
         if (req->pkeyIndex > 0xffff) { UnlockQp(ctx); return kIOReturnBadMedia; }
         ok = mlxEncodeRst2InitQpc(qpc, MLX_QPC_BYTES, req->pkeyIndex,
-                                  req->portNum, ctx->st, &optParamMask);
+                                  req->portNum, ctx->st, &optParamMask,
+                                  s->core->QCounterSet());
         if (ok && isUd) {
             mlxSetBits(qpc, MLX_QPC_QKEY_BIT_OFFSET, 32, req->qkey);
             ctx->qkey = req->qkey;
@@ -614,10 +661,23 @@ MlxQP::ModifyQP(const struct mlx_modify_qp_req *req)
         path.sl = (uint8_t)req->sl;
         ok = mlxEncodeInit2RtrQpc(qpc, MLX_QPC_BYTES, &path, req->destQpn,
                                   req->pathMtu, req->rqPsn,
-                                  req->minRnrTimer, req->maxDestRdAtomic,
-                                  s->core->GetHCA()->Caps().atomicMode,
+                                  isUc ? 0 : req->minRnrTimer,
+                                  isUc ? 0 : req->maxDestRdAtomic,
+                                  isUc ? 0 : s->core->GetHCA()->Caps().atomicMode,
                                   s->core->GetHCA()->Caps().logMaxMsg,
                                   &optParamMask);
+        /* The portable RC encoder supplies the common connected RoCE path.
+         * UC's legal INIT->RTR optional parameter set is RWE only; RRE/RAE
+         * would make firmware accept an operation the transport cannot carry. */
+        if (ok && isUc) {
+            mlxSetBits(qpc, 0x08, 8, MLX_QP_ST_UC);
+            mlxSetBits(qpc, 0x488, 3, 0);  /* log_rra_max */
+            mlxSetBits(qpc, 0x48c, 4, 0);  /* atomic_mode */
+            mlxSetBits(qpc, 0x490, 1, 0);  /* rre */
+            mlxSetBits(qpc, 0x492, 1, 0);  /* rae */
+            mlxSetBits(qpc, 0x491, 1, 1);  /* rwe */
+            optParamMask = MLX_QP_OPTPAR_RWE;
+        }
     } else if (opcode == MLX_CMD_OP_RTR2RTS_QP && isUd) {
         /* Only the send sequence number matters; retry and atomic limits are
          * properties of a connected pair. The service type is written for the
@@ -628,10 +688,15 @@ MlxQP::ModifyQP(const struct mlx_modify_qp_req *req)
         ok = true;
     } else if (opcode == MLX_CMD_OP_RTR2RTS_QP) {
         ok = mlxEncodeRtr2RtsQpc(qpc, MLX_QPC_BYTES, req->sqPsn,
-                                 req->maxRdAtomic,
-                                 req->ackTimeout, req->retryCount,
-                                 req->rnrRetry,
+                                 isUc ? 0 : req->maxRdAtomic,
+                                 isUc ? 0 : req->ackTimeout,
+                                 isUc ? 0 : req->retryCount,
+                                 isUc ? 0 : req->rnrRetry,
                                  &optParamMask);
+        if (ok && isUc) {
+            mlxSetBits(qpc, 0x08, 8, MLX_QP_ST_UC);
+            mlxSetBits(qpc, 0x491, 1, 1);  /* retain remote-write permission */
+        }
     }
     if (!ok) {
         /* One code for every rejected transition tells the caller nothing about
@@ -808,11 +873,17 @@ MlxQP::DestroyQP(uint32_t qpn)
     MlxQPContext *ctx = LockQp(qpn);
     if (!ctx) return kIOReturnNotFound;
     if (!RefreshFastPathStateLocked(ctx)) {
+        /* A trusted client can leave a stale shadow after a kernel-owned CQ
+         * drains a UD receive: the DEXT advanced the tails past the client
+         * snapshot, so the shadow fails validation. Reset is the authoritative
+         * flush; after it succeeds the pair is idle. */
         UnlockQp(ctx);
-        MLX_LOG("QP[%u] destroy refused: unstable/invalid fast-path shadow", qpn);
-        return kIOReturnBusy;
-    }
-    if (ctx->sqHead != ctx->sqTail || ctx->rqHead != ctx->rqTail) {
+        if (ResetQP(qpn) != kIOReturnSuccess)
+            return kIOReturnBusy;
+        ctx = LockQp(qpn);
+        if (!ctx) return kIOReturnNotFound;
+    } else if (ctx->sqHead != ctx->sqTail || ctx->rqHead != ctx->rqTail) {
+        /* Genuine in-flight WQEs: refuse, per the P0 lifetime invariant. */
         UnlockQp(ctx);
         MLX_LOG("QP[%u] destroy refused with in-flight WQEs", qpn);
         return kIOReturnBusy;
@@ -924,6 +995,16 @@ MlxQP::QueryQP(uint32_t qpn, void *outPtr)
     memset(resp, 0, sizeof(*resp));
     resp->qpn = qpn;
     resp->state = (uint32_t)mlxGetBits(qpc, 0x00, 4);
+    /* Diagnostic for the queue counters, which read zero through every kind of
+     * traffic. counter_set_id sits at 0x60, immediately before uar_page at
+     * 0x68 — logging both together makes the readback self-checking: a sane
+     * uar_page proves the QPC parse is aligned, so a zero counter_set_id
+     * beside it is the field's real value and not a misread. */
+    MLX_LOG("QUERY_QP %u: state=%u counter_set_id=%u uar_page=%u cs_req=0x%x cs_res=0x%x", qpn,
+            resp->state, (uint32_t)mlxGetBits(qpc, 0x60, 8),
+            (uint32_t)mlxGetBits(qpc, 0x68, 24),
+            (uint32_t)mlxGetBits(qpc, MLX_QPC_CS_REQ_BIT_OFFSET, 8),
+            (uint32_t)mlxGetBits(qpc, MLX_QPC_CS_RES_BIT_OFFSET, 8));
     resp->pathMtu = (uint32_t)mlxGetBits(qpc, 0x40, 3);
     resp->destQpn = (uint32_t)mlxGetBits(qpc, 0xa8, 24);
     resp->sqPsn = (uint32_t)mlxGetBits(qpc, 0x3c8, 24);
@@ -992,11 +1073,18 @@ MlxQP::PostSendSge(const struct mlx_post_send_sge_req *req)
          req->opcode != MLX_UC_WR_RDMA_READ &&
          req->opcode != MLX_UC_WR_SEND_IMM &&
          req->opcode != MLX_UC_WR_RDMA_WRITE_IMM &&
+         req->opcode != MLX_UC_WR_SEND_INV &&
          req->opcode != MLX_UC_WR_LOCAL_INV) ||
         ((req->opcode == MLX_UC_WR_RDMA_WRITE || req->opcode == MLX_UC_WR_RDMA_READ ||
           req->opcode == MLX_UC_WR_RDMA_WRITE_IMM) &&
-         (!req->remoteAddr || !req->rkey))) {
+         (!req->remoteAddr || !req->rkey)) ||
+        (req->opcode == MLX_UC_WR_SEND_INV && (!req->rkey || req->remoteAddr))) {
         UnlockQp(ctx); return kIOReturnBadArgument;
+    }
+    if (ctx->st == MLX_QP_ST_UC &&
+        (req->opcode == MLX_UC_WR_RDMA_READ ||
+         req->opcode == MLX_UC_WR_LOCAL_INV || req->opcode == MLX_UC_WR_SEND_INV)) {
+        UnlockQp(ctx); return kIOReturnUnsupported;
     }
     MlxRcSge sges[MLX_UC_MAX_SGE] = {};
     for (uint32_t i = 0; i < req->numSge; i++) {
@@ -1012,13 +1100,21 @@ MlxQP::PostSendSge(const struct mlx_post_send_sge_req *req)
     }
     uint8_t flat[128] = {};
     uint8_t hwOpcode = req->opcode == MLX_UC_WR_LOCAL_INV ? MLX_OPCODE_LOCAL_INVAL :
+                       req->opcode == MLX_UC_WR_SEND_INV ? MLX_OPCODE_SEND_INVAL :
                        req->opcode == MLX_UC_WR_RDMA_WRITE ? MLX_OPCODE_RDMA_WRITE :
                        req->opcode == MLX_UC_WR_RDMA_READ ? MLX_OPCODE_RDMA_READ :
                        req->opcode == MLX_UC_WR_RDMA_WRITE_IMM ? MLX_OPCODE_RDMA_WRITE_IMM :
                        req->opcode == MLX_UC_WR_SEND_IMM ? MLX_OPCODE_SEND_IMM :
                                                              MLX_OPCODE_SEND;
     uint64_t head = ctx->sqHead;
-    uint32_t ds = (req->opcode == MLX_UC_WR_SEND_IMM ||
+    uint32_t ds = req->opcode == MLX_UC_WR_SEND_INV ?
+        mlxEncodeRcSendInvalidateWqe(flat, sizeof(flat), ctx->qpNum,
+                                     (uint16_t)head, sges, req->numSge,
+                                     req->rkey,
+                                     (req->sendFlags & MLX_UC_SEND_SIGNALED) != 0,
+                                     (req->sendFlags & MLX_UC_SEND_FENCE) != 0,
+                                     (req->sendFlags & MLX_UC_SEND_SOLICITED) != 0) :
+        (req->opcode == MLX_UC_WR_SEND_IMM ||
                    req->opcode == MLX_UC_WR_RDMA_WRITE_IMM) ?
         mlxEncodeRcSendWqeImm(flat, sizeof(flat), ctx->qpNum, (uint16_t)head,
                               hwOpcode, sges, req->numSge, req->remoteAddr,
@@ -1066,15 +1162,18 @@ MlxQP::PostSendBatch(const struct mlx_post_send_req *req, uint32_t count)
     if (!s || !req || !count || count > MLX_UC_MAX_POST_BATCH)
         return kIOReturnBadArgument;
     MlxQPContext *ctx = LockQp(req->qpn);
+    const bool udQp = ctx && ctx->st == MLX_QP_ST_UD;
+    const uint64_t requiredSlots = (uint64_t)count * (udQp ? 2u : 1u);
     if (!ctx || ctx->state != MLX_QP_STATE_RTS || !ctx->sqCpu ||
-        !ctx->dbRecord || ctx->sqHead - ctx->sqTail + count > ctx->sqSize) {
+        !ctx->dbRecord || ctx->sqHead - ctx->sqTail + requiredSlots > ctx->sqSize) {
         UnlockQp(ctx);
         return ctx ? kIOReturnBusy : kIOReturnNotFound;
     }
     /* Validate the complete batch before publishing any producer index. */
     for (uint32_t i = 0; i < count; i++) {
         const struct mlx_post_send_req *wr = &req[i];
-        if (wr->qpn != ctx->qpNum || (wr->sendFlags &
+        if (wr->qpn != ctx->qpNum || (ctx->st == MLX_QP_ST_UC &&
+            wr->opcode == MLX_UC_WR_RDMA_READ) || (wr->sendFlags &
             ~(MLX_UC_SEND_SIGNALED | MLX_UC_SEND_FENCE | MLX_UC_SEND_SOLICITED)) ||
             wr->opcode > MLX_UC_WR_RDMA_READ || !wr->sge.length ||
             !s->roce->GetMR() ||
@@ -1091,7 +1190,8 @@ MlxQP::PostSendBatch(const struct mlx_post_send_req *req, uint32_t count)
 
     uint64_t head = ctx->sqHead;
     struct MlxWqeCtrlSeg *lastCtrl = NULL;
-    const bool udQp = ctx->st == MLX_QP_ST_UD;
+    /* UD sends consume two 64-byte slots. The capacity guard above reserves
+     * that worst case; the encoder still supplies the exact span below. */
     /* A datagram request is 80 bytes and takes two slots, so the producer
      * advances by what the encoder consumed rather than by one per request. */
     uint64_t producer = head;
@@ -1182,7 +1282,8 @@ MlxQP::SyncFastPath(const struct mlx_post_send_req *req, uint32_t count)
     uint64_t head = ctx->sqHead;
     for (uint32_t i = 0; i < count; i++) {
         const struct mlx_post_send_req *wr = &req[i];
-        if (wr->qpn != ctx->qpNum || (wr->sendFlags &
+        if (wr->qpn != ctx->qpNum || (ctx->st == MLX_QP_ST_UC &&
+            wr->opcode == MLX_UC_WR_RDMA_READ) || (wr->sendFlags &
             ~(MLX_UC_SEND_SIGNALED | MLX_UC_SEND_FENCE | MLX_UC_SEND_SOLICITED)) ||
             wr->opcode > MLX_UC_WR_RDMA_READ || !wr->sge.length ||
             !s->roce->GetMR() || !s->roce->GetMR()->ValidateRange(
@@ -1224,17 +1325,19 @@ MlxQP::SyncSendSge(const struct mlx_sync_send_sge_req *req)
     MlxQPContext *ctx = LockQp(req->qpn);
     bool valid = ctx && ctx->state == MLX_QP_STATE_RTS && ctx->sqCpu &&
                  ctx->dbRecord && s->roce->GetMR() &&
-                 req->opcode <= MLX_UC_WR_LOCAL_INV &&
+                 req->opcode <= MLX_UC_WR_SEND_INV &&
                  !(req->sendFlags & ~(MLX_UC_SEND_SIGNALED | MLX_UC_SEND_FENCE |
                                       MLX_UC_SEND_SOLICITED));
     for (uint32_t i = 0; valid && i < req->numSge; i++)
         valid = req->sge[i].length && s->roce->GetMR()->ValidateRange(
             req->sge[i].lkey, ctx->pd, req->sge[i].addr, req->sge[i].length,
             req->opcode == MLX_UC_WR_RDMA_READ);
-    if (!valid || req->opcode > MLX_UC_WR_RDMA_WRITE_IMM ||
+    if (!valid || req->opcode > MLX_UC_WR_SEND_INV ||
         ((req->opcode == MLX_UC_WR_RDMA_WRITE || req->opcode == MLX_UC_WR_RDMA_READ ||
           req->opcode == MLX_UC_WR_RDMA_WRITE_IMM) &&
-         (!req->remoteAddr || !req->rkey))) {
+         (!req->remoteAddr || !req->rkey)) ||
+        (req->opcode == MLX_UC_WR_SEND_INV && (!req->rkey || req->remoteAddr)) ||
+        (ctx->st == MLX_QP_ST_UC && req->opcode == MLX_UC_WR_SEND_INV)) {
         UnlockQp(ctx); return kIOReturnBadArgument;
     }
     uint32_t idx = (uint32_t)ctx->sqHead & (ctx->sqSize - 1);
@@ -1270,6 +1373,7 @@ MlxQP::PostLocalInv(const struct mlx_post_local_inv_req *req)
         !ctx->dbRecord || ctx->sqHead - ctx->sqTail + 1 > ctx->sqSize) {
         UnlockQp(ctx); return kIOReturnBusy;
     }
+    if (ctx->st == MLX_QP_ST_UC) { UnlockQp(ctx); return kIOReturnUnsupported; }
     uint8_t wqe[128] = {};
     if (!mlxEncodeLocalInvWqe(wqe, sizeof(wqe), ctx->qpNum,
                               (uint16_t)ctx->sqHead, req->invalidateRkey,
@@ -1372,6 +1476,10 @@ MlxQP::PostSendAtomic(const struct mlx_post_send_atomic_req *req)
     if (!ctx || ctx->state != MLX_QP_STATE_RTS || !ctx->sqCpu || !ctx->dbRecord) {
         UnlockQp(ctx);
         return ctx ? kIOReturnBusy : kIOReturnNotFound;
+    }
+    if (ctx->st == MLX_QP_ST_UC) {
+        UnlockQp(ctx);
+        return kIOReturnUnsupported;
     }
     if (!s->roce->GetMR() ||
         !s->roce->GetMR()->ValidateRange(req->resultLkey, ctx->pd,
@@ -1569,6 +1677,7 @@ MlxQP::PostBindMW(uint32_t qpn, uint32_t mwKey, uint32_t origRkey,
     if (!ctx || ctx->state != MLX_QP_STATE_RTS || ctx->sqHead - ctx->sqTail) {
         UnlockQp(ctx); return kIOReturnBusy;
     }
+    if (ctx->st == MLX_QP_ST_UC) { UnlockQp(ctx); return kIOReturnUnsupported; }
     uint8_t flat[MLX_UMR_WQE_FIXED_BYTES + MLX_UMR_KLM_ALIGN_BYTES] = {};
     uint32_t ds = mlxEncodeUmrKlmWqe(flat, sizeof(flat), qpn, (uint16_t)ctx->sqHead,
         bindKey, accessFlags, addr, length, &klm, 1, true);
@@ -1635,6 +1744,7 @@ MlxQP::PostUmrKlm(uint32_t qpn, uint32_t mrHandle, const uint32_t *childHandles,
         UnlockQp(ctx);
         return ctx ? kIOReturnNotReady : kIOReturnNotFound;
     }
+    if (ctx->st == MLX_QP_ST_UC) { UnlockQp(ctx); return kIOReturnUnsupported; }
     /* Keep this operation simple: require the SQ idle. A UMR activation is
      * a one-time step right after RegMRIndirect/QP bring-up, before any
      * other traffic — this avoids interleaving multi-WQEBB span accounting
@@ -1867,6 +1977,19 @@ MlxQP::CompleteCQE(uint32_t cqHandle, const struct MlxCqe64 *cqe,
             cqeOpcode == MLX_CQE_RESP_SEND_IMM) {
             wc->immData = cqe->imm_inval_pkey;
             wc->wcFlags |= MLX_UC_WC_WITH_IMM;
+        } else if (cqeOpcode == MLX_CQE_RESP_SEND_INV) {
+            wc->immData = OSSwapBigToHostInt32(cqe->imm_inval_pkey);
+            wc->wcFlags |= MLX_UC_WC_WITH_INV;
+        }
+        /* Scatter-to-CQE (DATA32): the <=32-byte payload lives in the CQE
+         * bytes 0..31 instead of the receive buffer. Copy it to the recv
+         * WQE's first SGE so the caller finds the data where it posted it. */
+        if (!errorCqe && (cqe->op_own & MLX_CQE_INLINE_SCATTER_32) &&
+            wc->byteLen && wc->byteLen <= 32) {
+            const struct MlxWqeDataSeg *seg = (const struct MlxWqeDataSeg *)
+                (const void *)(uintptr_t)(ctx->rqCpu + (uint64_t)idx * 64);
+            uint64_t dst = MLX_BE64(seg->addr);
+            if (dst) memcpy((void *)(uintptr_t)dst, cqe, wc->byteLen);
         }
         uint64_t done = mlxQpExpandCounter(ctx->rqHead, counter) + 1;
         if (done > ctx->rqTail) ctx->rqTail = done;

@@ -60,6 +60,12 @@ public:
     MlxCmd *        GetCmd()   LOCALONLY { return fCmd; }
     MlxEQ *         GetEQ()    LOCALONLY { return fEQ; }
     MlxEQ *         GetCompletionEQ() LOCALONLY { return fCompletionEQ; }
+    /* The EQ a new CQ should be bound to. Round-robin across the primary
+     * completion EQ and any extra vectors, so completion interrupts spread
+     * over queues instead of funnelling through one. */
+    MlxEQ *         NextCompletionEQ() LOCALONLY;
+    void            BringUpExtraCompletionEqs() LOCALONLY;
+    void            TeardownExtraCompletionEqs(bool destroyFirmware) LOCALONLY;
     MlxUAR *        GetUAR()   LOCALONLY { return fUAR; }
     MlxHCA *        GetHCA()   LOCALONLY { return fHCA; }
     MlxHealth *     GetHealth()LOCALONLY { return fHealth; }
@@ -81,6 +87,8 @@ public:
     uint32_t        GetDevIdx() const LOCALONLY { return fDevIdx; }
     const char *    GetDevName() const LOCALONLY { return fDevName; }
 
+    const char *    GetBoardId() const LOCALONLY;
+    uint32_t        GetIeeeVendorId() const LOCALONLY;
     bool            RoCEPublicationAllowed() const LOCALONLY;
     bool            Phase2Ready() const LOCALONLY;
     bool            DmaQuarantined() const LOCALONLY;
@@ -120,7 +128,10 @@ public:
                                          uint32_t *completionIndex,
                                          uint32_t *probeStatus,
                                          uint8_t *kind, uint8_t *kindPre,
-                                         uint64_t *typeRaw) const LOCALONLY;
+                                         uint64_t *typeRaw,
+                                         uint32_t *bind,
+                                         uint32_t *compEqCount,
+                                         uint64_t *compIrqByEq) const LOCALONLY;
     /* Reads the device's MSI-X capability, table head and pending bits. */
     kern_return_t   ReadMsixState(struct mlx_msix_state_resp *out) LOCALONLY;
     /* Negotiated PCIe generation and lane count from the Link Status
@@ -162,6 +173,24 @@ private:
     bool    TeardownHca() LOCALONLY;
     bool    DisableHca() LOCALONLY;
     bool    QueryHcaCaps() LOCALONLY;
+    bool    QueryAdapter() LOCALONLY;
+    bool    AllocQCounter() LOCALONLY;
+    uint32_t QCounterSet() const LOCALONLY;
+    kern_return_t   QueryQCounters(const struct mlx_q_counters_req *req,
+                                   struct mlx_q_counters_resp *out) LOCALONLY;
+    kern_return_t   ReadHcaClock(struct mlx_hca_clock_resp *out) LOCALONLY;
+    uint64_t        NodeGuid() const LOCALONLY;
+    uint64_t        PortGuid() const LOCALONLY;
+    uint64_t        SysImageGuid() const LOCALONLY;
+    void            SetVportGuids(uint64_t node, uint64_t port,
+                                  uint64_t sysImage) LOCALONLY;
+    /* Firmware command completion delivered as an event rather than polled.
+     * mask is the bitmap of completed command slots from the EQE. */
+    void            CommandEventArrived(uint32_t mask) LOCALONLY;
+    kern_return_t   WaitCommandEvent(uint64_t generation, uint32_t timeoutMs,
+                                     uint64_t *newGeneration) LOCALONLY;
+    uint64_t        CommandGeneration() const LOCALONLY;
+    void    ProbeSpareInterruptSources() LOCALONLY;
     bool    QueryHcaCap(uint16_t type, uint16_t mode, uint8_t *capability) LOCALONLY;
     bool    SetAtomicReqEndianness() LOCALONLY;
     bool    AllocPd() LOCALONLY;
@@ -211,6 +240,7 @@ private:
     IOTimerDispatchSource *fEqTimer;
     IODispatchQueue *fInterruptQueue;
     IODispatchQueue *fCompletionWaitQueue;
+    IODispatchQueue *fCmdWaitQueue;
     IOInterruptDispatchSource *fAsyncInterrupt;
     IOInterruptDispatchSource *fCompletionInterrupt;
     uint64_t         fCompletionGeneration;

@@ -35,7 +35,7 @@ let delegate = RequestDelegate()
 let arguments = Set(CommandLine.arguments.dropFirst())
 let deactivate = arguments.contains("--deactivate")
 if arguments.contains("--help") || arguments.contains("-h") {
-    print("usage: mlx_activate [--activate|--deactivate]")
+    print("usage: mlx_activate [--activate|--deactivate] [bundle-identifier]")
     exit(0)
 }
 if arguments.contains("--activate") && deactivate {
@@ -43,15 +43,23 @@ if arguments.contains("--activate") && deactivate {
     exit(2)
 }
 
+/* The identifier is an argument so the extension that used to be called
+ * com.mlx5.rdma.dext can still be deactivated after the rename — a
+ * deactivation request has to name the identifier that is actually installed,
+ * and that one is no longer this bundle's. Anything that is not a flag is
+ * taken as the identifier. */
+let defaultIdentifier = "com.melondma.rdma.dext"
+let identifier = arguments.first(where: { !$0.hasPrefix("-") }) ?? defaultIdentifier
+
 let request: OSSystemExtensionRequest
 if deactivate {
-    print("REQUEST: deactivate com.mlx5.rdma.dext")
+    print("REQUEST: deactivate \(identifier)")
     request = OSSystemExtensionRequest.deactivationRequest(
-        forExtensionWithIdentifier: "com.mlx5.rdma.dext", queue: DispatchQueue.main)
+        forExtensionWithIdentifier: identifier, queue: DispatchQueue.main)
 } else {
-    print("REQUEST: activate com.mlx5.rdma.dext")
+    print("REQUEST: activate \(identifier)")
     request = OSSystemExtensionRequest.activationRequest(
-        forExtensionWithIdentifier: "com.mlx5.rdma.dext", queue: DispatchQueue.main)
+        forExtensionWithIdentifier: identifier, queue: DispatchQueue.main)
 }
 request.delegate = delegate
 OSSystemExtensionManager.shared.submitRequest(request)

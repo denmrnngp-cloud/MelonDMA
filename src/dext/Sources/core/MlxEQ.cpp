@@ -150,7 +150,23 @@ MlxEQ::Init(MlxPCIDriver *core, uint32_t vector, bool completionOnly,
         mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_PORT_STATE_CHANGE);
         mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_NIC_VPORT_CHANGE);
         mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_DEVICE_FATAL);
+        /* Standard verbs QP/SRQ async events.  They share this async EQ;
+         * completion EQs remain event-mask zero by construction. */
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_PATH_MIG);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_COMM_EST);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_SQ_DRAINED);
         mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_WQ_CATAS_ERROR);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_PATH_MIG_FAILED);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_WQ_INVAL_REQ_ERROR);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_WQ_ACCESS_ERROR);
+        /* Subscribed so the handler can name them; none of the three is
+         * fatal on its own, and an unplugged transceiver reported as a port
+         * going down with no reason is what this avoids. */
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_SRQ_CATAS_ERROR);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_SRQ_LAST_WQE);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_SRQ_RQ_LIMIT);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_PORT_MODULE_EVENT);
+        mlxP1SetEvent(s->mask, MLX_EVENT_TYPE_CQ_ERROR);
     }
 
     return kIOReturnSuccess;

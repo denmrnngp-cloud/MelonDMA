@@ -94,7 +94,7 @@ struct MlxUserClient_IVars {
     uint32_t        fDataInflight;
     bool            fDataTeardown;
     bool            fPrivilegedDiagnostics;
-    /* com.mlx5.rdma.entitlement: raise QP/CQ/MR/MW quotas to the firmware
+    /* com.melondma.rdma.entitlement: raise QP/CQ/MR/MW quotas to the firmware
      * capability instead of the default per-client policy ceilings. */
     bool            fEntitledQuotas;
     /* P1.1 per-client quota counters (see MLX_UC_MAX_*_PER_CLIENT). */
@@ -331,6 +331,30 @@ static uint32_t TokenForRaw(MlxUserClient_IVars *v, uint32_t type, uint32_t raw)
     return 0;
 }
 
+/* Called under MlxRoCE's event lock. TokenForRaw takes this client's own lock
+ * only long enough to inspect its generation table; it neither publishes a
+ * raw handle nor mutates ownership. Device and port state remain device-wide
+ * notifications, as they were before QP/CQ/SRQ events became tokenized. */
+static bool AsyncEventBelongsToClient(void *context,
+                                      const struct mlx_async_event *event)
+{
+    MlxUserClient_IVars *v = (MlxUserClient_IVars *)context;
+    if (!v || !event) return false;
+    switch (event->elementType) {
+    case MLX_ASYNC_ELEMENT_CQ:
+        return TokenForRaw(v, MLX_T_CQ, event->elementHandle) != 0;
+    case MLX_ASYNC_ELEMENT_QP:
+        return TokenForRaw(v, MLX_T_QP, event->elementHandle) != 0;
+    case MLX_ASYNC_ELEMENT_SRQ:
+        return TokenForRaw(v, MLX_T_SRQ, event->elementHandle) != 0;
+    case MLX_ASYNC_ELEMENT_DEVICE:
+    case MLX_ASYNC_ELEMENT_PORT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* ---- P1.1 per-client quotas (DoS protection) ----
  * Reserving BEFORE the firmware command is the guarantee that a refused
  * request never leaves a partially-created resource. Counters are protected
@@ -380,7 +404,7 @@ static uint32_t CapLimit(uint32_t policy, uint32_t firmware)
 }
 
 /* Front C, task 2: quotas are policy, not constants. A client signed with
- * com.mlx5.rdma.entitlement gets the firmware capability as its ceiling
+ * com.melondma.rdma.entitlement gets the firmware capability as its ceiling
  * (still bounded by the DEXT-wide tables and, for QP/CQ, the DB-record
  * capacity). Everyone else keeps the default MLX_UC_MAX_* policy ceiling.
  * firmware==0 means the caps were never read: fall back to the policy. */
@@ -399,8 +423,15 @@ static const MlxHcaCaps *ClientCaps(MlxUserClient_IVars *v)
 
 static uint32_t DbRecordLimit(MlxUserClient_IVars *v)
 {
-    return v && v->fCore && v->fCore->GetUAR()
-        ? v->fCore->GetUAR()->GetDbSlotCapacity() : 0;
+    if (!v || !v->fCore || !v->fCore->GetUAR()) return 0;
+    /* A fast-path client draws doorbell records from its own growable pool,
+     * so its ceiling is the pool, not the one device-global page that clients
+     * without a bundle still share. Before the pool existed this returned 32
+     * for everyone, which silently capped QPs and CQs at 32 apiece even though
+     * the ABI and the firmware both allowed more. */
+    if (v->fFastBundle)
+        return MLX_CLIENT_MAX_DB_PAGES * MLX_CLIENT_DB_SLOTS_PER_PAGE;
+    return v->fCore->GetUAR()->GetDbSlotCapacity();
 }
 
 static uint32_t ClientQpLimit(MlxUserClient_IVars *v)
@@ -509,9 +540,9 @@ MlxUserClient::Start_Impl(IOService * provider)
     OSDictionary *entitlements = NULL;
     if (CopyClientEntitlements(&entitlements) == kIOReturnSuccess && entitlements) {
         ivars->fPrivilegedDiagnostics =
-            entitlements->getObject("com.mlx5.rdma.diagnostic") == kOSBooleanTrue;
+            entitlements->getObject("com.melondma.rdma.diagnostic") == kOSBooleanTrue;
         ivars->fEntitledQuotas =
-            entitlements->getObject("com.mlx5.rdma.entitlement") == kOSBooleanTrue;
+            entitlements->getObject("com.melondma.rdma.entitlement") == kOSBooleanTrue;
         entitlements->release();
     }
     /* RoCE may not be up yet (FwInit stopped at boot pages) —
@@ -720,6 +751,8 @@ static const MlxMethodSpec sMlxMethods[] = {
                   sizeof(struct mlx_query_device_resp)),
     MLX_UC_METHOD(kMlxUCMethodQueryPort, 0,
                   sizeof(struct mlx_query_port_resp)),
+    MLX_UC_METHOD(kMlxUCMethodQueryCapRegs, 0,
+                  sizeof(struct mlx_query_cap_regs_resp)),
     MLX_UC_METHOD(kMlxUCMethodPortStats, 0,
                   sizeof(struct mlx_port_stats_resp)),
     MLX_UC_METHOD(kMlxUCMethodAccessReg, sizeof(struct mlx_access_reg_req),
@@ -794,6 +827,13 @@ static const MlxMethodSpec sMlxMethods[] = {
                   sizeof(struct mlx_query_gid_resp)),
     MLX_UC_METHOD(kMlxUCMethodCCQuery, 0, sizeof(struct mlx_cc_params)),
     MLX_UC_METHOD(kMlxUCMethodCCModify, sizeof(struct mlx_cc_params), 0),
+    MLX_UC_METHOD(kMlxUCMethodCCStats, sizeof(struct mlx_cc_stats_req),
+                  sizeof(struct mlx_cc_stats_resp)),
+    MLX_UC_METHOD(kMlxUCMethodQueryQCounters,
+                  sizeof(struct mlx_q_counters_req),
+                  sizeof(struct mlx_q_counters_resp)),
+    MLX_UC_METHOD(kMlxUCMethodQueryHcaClock, 0,
+                  sizeof(struct mlx_hca_clock_resp)),
     MLX_UC_METHOD(kMlxUCMethodQueryCqCompletions, sizeof(uint32_t),
                   sizeof(uint64_t)),
     MLX_UC_METHOD(kMlxUCMethodGetAsyncEvent, 0,
@@ -913,7 +953,8 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             (struct mlx_query_abi_resp *)output->getBytesNoCopy();
         if (!resp) { output->release(); return kIOReturnNoMemory; }
         resp->version = MLX_UC_ABI_VERSION;
-        resp->features = MLX_UC_FEATURE_RC | MLX_UC_FEATURE_ROCE_V2 |
+        resp->features = MLX_UC_FEATURE_RC | MLX_UC_FEATURE_UC |
+                         MLX_UC_FEATURE_ROCE_V2 |
                          MLX_UC_FEATURE_DIRECT_PATH |
                          MLX_UC_FEATURE_ASYNC_EVENTS |
                          MLX_UC_FEATURE_INDIRECT_MR |
@@ -1048,6 +1089,21 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         return ivars->fRoce->QueryDevice((struct mlx_query_device_resp *)out);
     case kMlxUCMethodQueryPort:
         return ivars->fRoce->QueryPort((struct mlx_query_port_resp *)out);
+    case kMlxUCMethodQueryCapRegs: {
+        if (!out || !ivars->fRoce) return kIOReturnBadArgument;
+        struct mlx_query_cap_regs_resp *resp =
+            (struct mlx_query_cap_regs_resp *)out;
+        memset(resp, 0, sizeof(*resp));
+        resp->version = 1;
+        const MlxHcaCaps &caps = ivars->fCore->GetHCA()->Caps();
+        resp->validMask = (caps.pcamValid ? 1u : 0u) |
+                          (caps.mcamValid ? 2u : 0u) |
+                          (caps.qcamValid ? 4u : 0u);
+        memcpy(resp->pcam, caps.pcam, sizeof(resp->pcam));
+        memcpy(resp->mcam, caps.mcam, sizeof(resp->mcam));
+        memcpy(resp->qcam, caps.qcam, sizeof(resp->qcam));
+        return kIOReturnSuccess;
+    }
     case kMlxUCMethodPortStats:
         if (!out) return kIOReturnBadArgument;
         return ivars->fRoce->PortStats((struct mlx_port_stats_resp *)out);
@@ -1080,6 +1136,19 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         resp->ownedMr = (ivars->fOwnedMr ? ivars->fOwnedMr->getCount() : 0) +
                         (ivars->fOwnedMw ? ivars->fOwnedMw->getCount() : 0);
         resp->ownedAh = ivars->fOwnedAh ? ivars->fOwnedAh->getCount() : 0;
+        /* The decoded health buffer. Firmware fills it only on an assert, so
+         * on a healthy card it is all zeros; that is the answer, not a gap. */
+        MlxHealthSnapshot snap = {};
+        if (health) health->ReadBuffer(&snap);
+        for (uint32_t i = 0; i < 6; i++) resp->assertVar[i] = snap.assertVar[i];
+        resp->assertExitPtr = snap.assertExitPtr;
+        resp->assertCallra = snap.assertCallra;
+        resp->healthTime = snap.time;
+        resp->fwVer = snap.fwVer;
+        resp->hwId = snap.hwId;
+        resp->rfrSeverity = snap.rfrSeverity;
+        resp->iriscIndex = snap.iriscIndex;
+        resp->deviceRemoved = snap.deviceRemoved ? 1u : 0u;
         return kIOReturnSuccess;
     }
     case kMlxUCMethodProbeCompletionVector: {
@@ -1121,7 +1190,10 @@ MlxUserClient::ExternalMethod(uint64_t selector,
                                            &resp->indexProbeStatus,
                                            resp->indexKind,
                                            resp->indexKindPre,
-                                           resp->indexTypeRaw);
+                                           resp->indexTypeRaw,
+                                           resp->indexBind,
+                                           &resp->completionEqCount,
+                                           resp->completionIrqByEq);
         return kIOReturnSuccess;
     }
     case kMlxUCMethodQueryMsixState: {
@@ -1230,14 +1302,20 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         {
             const uint8_t logBf = caps ? caps->logBfRegSize : 0;
             const uint32_t bfRegSize = logBf && logBf < 13 ? (1u << logBf) : 0;
-            const uint32_t uarPageSize = !caps ? 4096u :
-                (caps->uar4k ? 4096u : (1u << caps->logUarPageSize));
+            const uint32_t uarPageSize = caps && caps->uarPageSize ?
+                caps->uarPageSize : MLX_UAR_ADAPTER_PAGE_SIZE;
             resp->bfSupported   = bfRegSize ? 1u : 0u;
             resp->logBfRegSize  = logBf;
             resp->uarPageSize   = uarPageSize;
             resp->bfRegsPerUar  = mlxBfRegsPerUar(uarPageSize, bfRegSize);
             resp->maxInlineData = MLX_UC_MAX_INLINE_DATA;
             resp->maxSge        = MLX_UC_MAX_SGE;
+            resp->cacheLine128  = caps && caps->cacheLine128 ? 1u : 0u;
+            resp->logUarPageSz  = caps ? caps->logUarPageSize : 0u;
+            if (ivars->fCore) {
+                const char *board = ivars->fCore->GetBoardId();
+                if (board) strncpy(resp->boardId, board, sizeof(resp->boardId));
+            }
         }
         if (ivars->fCore)
             ivars->fCore->GetPcieLink(&resp->pcieLinkSpeed,
@@ -1288,7 +1366,8 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             ivars->fCore->CompletionWakeupCount() : 0;
         if (ivars->fCore && ivars->fCore->GetCmd())
             ivars->fCore->GetCmd()->CommandStats(&resp->fwCommands,
-                                                 &resp->fwCommandSleeps);
+                                                 &resp->fwCommandSleeps,
+                                                 &resp->fwCommandSlotWaits);
         return kIOReturnSuccess;
     }
     case kMlxUCMethodQueryStats: {
@@ -1844,6 +1923,22 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         return ivars->fRoce->GetCC() ?
                ivars->fRoce->GetCC()->QueryParams((struct mlx_cc_params *)out) :
                kIOReturnNoResources;
+    case kMlxUCMethodQueryQCounters:
+        if (!in || !out) return kIOReturnBadArgument;
+        if (!ivars->fCore) return kIOReturnNotAttached;
+        return ivars->fCore->QueryQCounters(
+            (const struct mlx_q_counters_req *)in,
+            (struct mlx_q_counters_resp *)out);
+    case kMlxUCMethodQueryHcaClock:
+        if (!out) return kIOReturnBadArgument;
+        if (!ivars->fCore) return kIOReturnNotAttached;
+        return ivars->fCore->ReadHcaClock((struct mlx_hca_clock_resp *)out);
+    case kMlxUCMethodCCStats:
+        return ivars->fRoce->GetCC() ?
+               ivars->fRoce->GetCC()->QueryStats(
+                   (const struct mlx_cc_stats_req *)in,
+                   (struct mlx_cc_stats_resp *)out) :
+               kIOReturnNoResources;
     case kMlxUCMethodCCModify:
         return ivars->fRoce->GetCC() ?
                ivars->fRoce->GetCC()->ModifyParams((const struct mlx_cc_params *)in) :
@@ -1898,7 +1993,8 @@ MlxUserClient::ExternalMethod(uint64_t selector,
     }
     case kMlxUCMethodGetAsyncEvent: {
         struct mlx_async_event *event = (struct mlx_async_event *)out;
-        kern_return_t r = ivars->fRoce->GetAsyncEvent(event);
+        kern_return_t r = ivars->fRoce->GetAsyncEventMatching(
+            event, AsyncEventBelongsToClient, ivars);
         if (r != kIOReturnSuccess) return r;
         /* DEXT events carry raw firmware handles. Publish only this client's
          * generation token; an unowned or stale object must never cross the
@@ -1909,6 +2005,10 @@ MlxUserClient::ExternalMethod(uint64_t selector,
             event->elementHandle = token;
         } else if (event->elementType == MLX_ASYNC_ELEMENT_QP) {
             uint32_t token = TokenForRaw(ivars, MLX_T_QP, event->elementHandle);
+            if (!token) return kIOReturnNotPermitted;
+            event->elementHandle = token;
+        } else if (event->elementType == MLX_ASYNC_ELEMENT_SRQ) {
+            uint32_t token = TokenForRaw(ivars, MLX_T_SRQ, event->elementHandle);
             if (!token) return kIOReturnNotPermitted;
             event->elementHandle = token;
         }
@@ -2198,7 +2298,10 @@ MlxUserClient::ExternalMethod(uint64_t selector,
         ivars->fFastBundle = bundle;
         struct mlx_fast_path_resp *resp = (struct mlx_fast_path_resp *)out;
         resp->version = MLX_FAST_PATH_ABI_VERSION;
-        resp->uarPageSize = 4096;
+        /* The client maps exactly this much; it is the UAR geometry the
+         * driver negotiated, not a constant. The DB record page is host
+         * memory we allocate ourselves and stays 4 KiB. */
+        resp->uarPageSize = ivars->fCore->GetUAR()->UarPageSize();
         resp->dbPageSize = 4096;
         resp->maxBatch = MLX_UC_MAX_POST_BATCH;
         return kIOReturnSuccess;
@@ -2341,11 +2444,16 @@ MlxUserClient::CopyClientMemoryForType_Impl(uint64_t type, uint64_t *options,
 
     IOMemoryDescriptor *desc = NULL;
     if (kind == kMlxUCMemKindUar) {
-        if (handle != 0) return kIOReturnNotPermitted;
-        desc = ivars->fFastBundle->uarMemory;
+        /* The handle is the slot in this client's own UAR pool. Slots the
+         * client has not been given are simply absent, so an out-of-range or
+         * not-yet-allocated one returns nothing rather than a neighbour. */
+        desc = ivars->fCore ? ivars->fCore->GetUAR()->ClientUarMemory(
+            ivars->fFastBundle, handle) : NULL;
+        if (!desc) return kIOReturnNotPermitted;
     } else if (kind == kMlxUCMemKindDbRecord) {
-        if (handle != 0) return kIOReturnNotPermitted;
-        desc = ivars->fFastBundle->dbMemory;
+        desc = ivars->fCore ? ivars->fCore->GetUAR()->ClientDbMemory(
+            ivars->fFastBundle, handle) : NULL;
+        if (!desc) return kIOReturnNotPermitted;
     } else if (kind == kMlxUCMemKindCqe) {
         uint32_t raw = TokenResolve(ivars, handle, MLX_T_CQ);
         if (!raw || !Owns(ivars->fOwnedCq, raw))

@@ -14,7 +14,7 @@
 
 #define MLX_SERVICE_KERNEL_CLASS "IOUserService"
 #define MLX_SERVICE_USER_CLASS   "MlxPCIDriver"
-#define MLX_SERVICE_BUNDLE_ID    "com.mlx5.rdma.dext"
+#define MLX_SERVICE_BUNDLE_ID    "com.melondma.rdma.dext"
 
 static inline CFMutableDictionaryRef
 mlxCreateServiceMatching(void)

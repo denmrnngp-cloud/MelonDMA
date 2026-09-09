@@ -24,6 +24,7 @@
 #include "MlxHCA.hpp"
 #include "MlxRegs.hpp"
 #include "MlxIfcHelpers.hpp"   /* mlxGetBits for EQE parsing */
+#include "MlxPortRegs.hpp"     /* PTYS/PFCC decode */
 
 #include <DriverKit/IOLib.h>
 #include <string.h>
@@ -63,6 +64,7 @@ struct MlxRoCE::State {
     int             pageActiveSign;    /* +1 GIVE / -1 TAKE */
     kern_return_t   pageLastError;     /* first handler error */
     bool            pageErrorLatched;  /* error that affects health */
+    bool            probingCaps;      /* internal PCAM/MCAM/QCAM bootstrap */
 };
 
 MlxRoCE::MlxRoCE() : s(NULL) {}
@@ -110,6 +112,32 @@ MlxRoCE::Init(MlxPCIDriver *core, MlxHCA *hca)
     if (kr != kIOReturnSuccess) { Free(); return kr; }
     kr = s->cc->Init(this, core);
     if (kr != kIOReturnSuccess) { Free(); return kr; }
+
+    /* PCAM/MCAM/QCAM are read-only capability maps. Probe once after the
+     * firmware and vport are ready; an older card may reject one, so this is
+     * deliberately best-effort and never blocks RDMA bring-up. */
+    if (s->hca) {
+        MlxHcaCaps &caps = s->hca->MutableCaps();
+        struct { uint16_t id; uint8_t *dst; bool *valid; const char *name; } maps[] = {
+            { 0x507f, caps.pcam, &caps.pcamValid, "PCAM" },
+            { 0x907f, caps.mcam, &caps.mcamValid, "MCAM" },
+            { 0x4019, caps.qcam, &caps.qcamValid, "QCAM" },
+        };
+        for (auto &map : maps) {
+            uint8_t payload[80] = {};
+            s->probingCaps = true;
+            kern_return_t mapKr = AccessReg(map.id, false, 0, NULL, 0,
+                                             payload, sizeof(payload));
+            s->probingCaps = false;
+            if (mapKr == kIOReturnSuccess) {
+                memcpy(map.dst, payload, sizeof(payload));
+                *map.valid = true;
+                MLX_LOG("%s capability map cached", map.name);
+            } else {
+                MLX_LOG("%s capability map unavailable", map.name);
+            }
+        }
+    }
 
     MLX_LOG("initialized");
     return kIOReturnSuccess;
@@ -203,6 +231,11 @@ MlxRoCE::QueryDevice(struct mlx_query_device_resp *resp)
          * already bounds them (<=128, power of two). */
         resp->maxQpRdAtomic = 4;
         resp->maxQpInitRdAtomic = 4;
+        /* Identity, read from the nic_vport_context at bring-up. Zero means
+         * firmware supplied none, which is an answer rather than a gap. */
+        resp->nodeGuid = s->core->NodeGuid();
+        resp->portGuid = s->core->PortGuid();
+        resp->sysImageGuid = s->core->SysImageGuid();
     }
     return kIOReturnSuccess;
 }
@@ -217,6 +250,22 @@ MlxRoCE::AccessReg(uint16_t registerId, bool write, uint32_t argument,
                    void *dataOut, uint32_t dataOutSize)
 {
     if (!s || !s->core) return kIOReturnNotAttached;
+    const MlxHcaCaps &caps = s->hca->Caps();
+    const bool known = registerId == MLX_REG_ID_PPCNT ||
+                       registerId == MLX_REG_ID_MPEIN ||
+                       registerId == 0x9051 || /* MPCNT */
+                       registerId == MLX_REG_ID_PTYS ||
+                       registerId == MLX_REG_ID_PAOS ||
+                       registerId == MLX_REG_ID_PFCC ||
+                       registerId == 0x507f || registerId == 0x907f ||
+                       registerId == 0x4019;
+    const bool advertised = (registerId == 0x507f && caps.pcamValid) ||
+                            (registerId == 0x907f && caps.mcamValid) ||
+                            (registerId == 0x4019 && caps.qcamValid);
+    if (!known) return kIOReturnUnsupported;
+    if (!s->probingCaps &&
+        (registerId == 0x507f || registerId == 0x907f || registerId == 0x4019) &&
+        !advertised) return kIOReturnUnsupported;
     if (dataInSize > MLX_UC_ACCESS_REG_MAX_DATA ||
         dataOutSize > MLX_UC_ACCESS_REG_MAX_DATA) return kIOReturnBadArgument;
     if ((dataInSize && !dataIn) || (dataOutSize && !dataOut)) return kIOReturnBadArgument;
@@ -335,8 +384,27 @@ MlxRoCE::QueryPort(struct mlx_query_port_resp *resp)
      * tunnel ceiling of 31.5 exactly; the old `* 1000` reported 320 Gbit/s. */
     resp->activeSpeed = speed * 100;       /* 100 Mbps units → Mbps */
     resp->maxMtu = 5;                      /* 4 KiB (RoCEv2 max MTU) */
-    MLX_LOG("QUERY_VPORT_STATE: state=%u (UP=%u) admin=%u maxTxSpeed=%u",
-            state, resp->portState, admin, speed);
+    uint8_t  ptys[64] = {};
+    /* local_port=1, proto_mask=MLX_PTYS_EN(4): the Ethernet protocol view.
+     * proto_mask=MLX_PTYS_IB(1) returns the IB fields and zeroes eth. */
+    mlxSetBits(ptys, 0x00, 32, 0x00010004u);
+    if (AccessReg(0x5004, false, 0x100, ptys, sizeof(ptys),
+                  ptys, sizeof(ptys)) == kIOReturnSuccess) {
+        resp->linkSpeedMbps = mlxPtysSpeedMbps(
+            (uint32_t)mlxGetBits(ptys, MLX_PTYS_ETH_PROTO_OPER, 32));
+    }
+    uint8_t pfcc[32] = {};
+    mlxSetBits(pfcc, 0x08, 8, 1); /* local_port */
+    if (AccessReg(0x5007, false, 0, pfcc, sizeof(pfcc),
+                  pfcc, sizeof(pfcc)) == kIOReturnSuccess) {
+        resp->pauseTx = (uint8_t)mlxGetBits(pfcc, MLX_PFCC_PPTX, 1);
+        resp->pauseRx = (uint8_t)mlxGetBits(pfcc, MLX_PFCC_PPRX, 1);
+        resp->pfcTxMask = (uint8_t)mlxGetBits(pfcc, MLX_PFCC_PFCTX, 8);
+        resp->pfcRxMask = (uint8_t)mlxGetBits(pfcc, MLX_PFCC_PFCRX, 8);
+        resp->pfcPrioMask = (uint8_t)(
+            mlxGetBits(pfcc, MLX_PFCC_PRIO_MASK_TX, 8) |
+            mlxGetBits(pfcc, MLX_PFCC_PRIO_MASK_RX, 8));
+    }
     return kIOReturnSuccess;
 }
 
@@ -351,6 +419,41 @@ MlxRoCE::GetAsyncEvent(struct mlx_async_event *event)
     s->eventTail = (s->eventTail + 1) % 16;
     IOLockUnlock(s->eventLock);
     return kIOReturnSuccess;
+}
+
+kern_return_t
+MlxRoCE::GetAsyncEventMatching(struct mlx_async_event *event,
+                               MlxAsyncEventMatcher matcher,
+                               void *matcherContext)
+{
+    if (!s || !event || !matcher) return kIOReturnBadArgument;
+    IOLockLock(s->eventLock);
+    /* The ring is device-wide because the hardware has one async EQ.  Scan
+     * instead of blindly popping its head: otherwise client B can consume
+     * client A's QP/CQ event, fail the token check later and silently lose it. */
+    uint32_t pos = s->eventTail;
+    while (pos != s->eventHead) {
+        if (!matcher(matcherContext, &s->eventRing[pos])) {
+            pos = (pos + 1) % 16;
+            continue;
+        }
+        *event = s->eventRing[pos];
+        /* Remove the matching element while retaining FIFO order for every
+         * other client.  The ring holds at most 15 items, so this bounded
+         * shift is preferable to exposing a second untrusted queue. */
+        uint32_t cur = pos;
+        uint32_t next = (cur + 1) % 16;
+        while (next != s->eventHead) {
+            s->eventRing[cur] = s->eventRing[next];
+            cur = next;
+            next = (next + 1) % 16;
+        }
+        s->eventHead = (s->eventHead + 15) % 16;
+        IOLockUnlock(s->eventLock);
+        return kIOReturnSuccess;
+    }
+    IOLockUnlock(s->eventLock);
+    return kIOReturnNoResources;
 }
 
 void
@@ -487,6 +590,33 @@ MlxRoCE::HandleEvent(uint32_t type, void *eqe)
                         port ? port : 1);
         break;
     }
+    /* mlx5_ifc_qp_events_bits places qpn_rqn_sqn at event-data bit 0xc8,
+     * i.e. EQE bit 0x1c8.  These are standard verbs async notifications;
+     * keep their object association through the tokenized UserClient ABI. */
+    case MLX_EVENT_TYPE_PATH_MIG:
+        QueueAsyncEvent(MLX_EVENT_PATH_MIG, MLX_ASYNC_ELEMENT_QP,
+                        (uint32_t)mlxGetBits(e, 0x1c8, 24));
+        break;
+    case MLX_EVENT_TYPE_COMM_EST:
+        QueueAsyncEvent(MLX_EVENT_COMM_EST, MLX_ASYNC_ELEMENT_QP,
+                        (uint32_t)mlxGetBits(e, 0x1c8, 24));
+        break;
+    case MLX_EVENT_TYPE_SQ_DRAINED:
+        QueueAsyncEvent(MLX_EVENT_SQ_DRAINED, MLX_ASYNC_ELEMENT_QP,
+                        (uint32_t)mlxGetBits(e, 0x1c8, 24));
+        break;
+    case MLX_EVENT_TYPE_PATH_MIG_FAILED:
+        QueueAsyncEvent(MLX_EVENT_PATH_MIG_ERR, MLX_ASYNC_ELEMENT_QP,
+                        (uint32_t)mlxGetBits(e, 0x1c8, 24));
+        break;
+    case MLX_EVENT_TYPE_WQ_INVAL_REQ_ERROR:
+        QueueAsyncEvent(MLX_EVENT_QP_REQ_ERR, MLX_ASYNC_ELEMENT_QP,
+                        (uint32_t)mlxGetBits(e, 0x1c8, 24));
+        break;
+    case MLX_EVENT_TYPE_WQ_ACCESS_ERROR:
+        QueueAsyncEvent(MLX_EVENT_QP_ACCESS_ERR, MLX_ASYNC_ELEMENT_QP,
+                        (uint32_t)mlxGetBits(e, 0x1c8, 24));
+        break;
     case MLX_EVENT_TYPE_DEVICE_FATAL:
         /* Fail-closed: fence DMA before publishing the event, so a client
          * polling async events can never race a still-live datapath. */
@@ -494,16 +624,67 @@ MlxRoCE::HandleEvent(uint32_t type, void *eqe)
             s->core->GetHealth()->MarkFatal();
         QueueAsyncEvent(MLX_EVENT_DEVICE_FATAL, MLX_ASYNC_ELEMENT_DEVICE, 0);
         break;
+    case MLX_EVENT_TYPE_CMD: {
+        /* mlx5_eqe_cmd: a 32-bit bitmap of completed command slots at the
+         * start of the event data. This event type has always been subscribed
+         * on this EQ; before it was decoded the driver dropped thousands of
+         * them and every command waited out its poll instead. */
+        const uint32_t mask = (uint32_t)mlxGetBits(e, 0x100, 32);
+        if (s->core) s->core->CommandEventArrived(mask);
+        break;
+    }
+    case MLX_EVENT_TYPE_PORT_MODULE_EVENT: {
+        /* mlx5_eqe_port_module: reserved, module, reserved, module_status,
+         * reserved[2], error_type — starting at the event data at byte 32.
+         * Apple reads the same byte (portModuleEvent tests EQE+0x23 low
+         * nibble) and maps 1/2/3 to plugged/unplugged/error. A transceiver
+         * that has been pulled or is failing is otherwise invisible: the port
+         * simply goes down with no reason attached. */
+        const uint8_t module = e[0x21];
+        const uint8_t status = e[0x23] & 0x0f;
+        const uint8_t errorType = e[0x26];
+        switch (status) {
+        case 1: MLX_LOG("module %u plugged", module); break;
+        case 2: MLX_LOG("module %u unplugged", module); break;
+        case 3: MLX_LOG("module %u error, type 0x%02x", module, errorType); break;
+        default: MLX_LOG("module %u unknown status 0x%02x", module, status); break;
+        }
+        break;
+    }
+    case MLX_EVENT_TYPE_SRQ_CATAS_ERROR: {
+        /* mlx5_eqe_qp_srq puts the number in the same dword the completion
+         * event uses for its CQ number, so the offset is shared. */
+        const uint32_t srqn = (uint32_t)mlxGetBits(e, 0x1c8, 24);
+        MLX_LOG("SRQ 0x%x catastrophic error", srqn);
+        QueueAsyncEvent(MLX_EVENT_SRQ_ERR, MLX_ASYNC_ELEMENT_SRQ, srqn);
+        break;
+    }
+    case MLX_EVENT_TYPE_SRQ_LAST_WQE:
+        /* mlx5 reports this against the consuming QP, not the SRQ itself. */
+        QueueAsyncEvent(MLX_EVENT_QP_LAST_WQE_REACHED, MLX_ASYNC_ELEMENT_QP,
+                        (uint32_t)mlxGetBits(e, 0x1c8, 24));
+        break;
+    case MLX_EVENT_TYPE_SRQ_RQ_LIMIT:
+        QueueAsyncEvent(MLX_EVENT_SRQ_LIMIT_REACHED, MLX_ASYNC_ELEMENT_SRQ,
+                        (uint32_t)mlxGetBits(e, 0x1c8, 24));
+        break;
+    case MLX_EVENT_TYPE_CQ_ERROR: {
+        /* mlx5_ifc_cq_error_bits: cqn@event-data+8, syndrome@event-data+0x58. */
+        const uint32_t cqn = (uint32_t)mlxGetBits(e, 0x108, 24);
+        MLX_LOG("CQ 0x%x error, syndrome 0x%02x", cqn, e[0x2b]);
+        QueueAsyncEvent(MLX_EVENT_CQ_ERR, MLX_ASYNC_ELEMENT_CQ, cqn);
+        break;
+    }
     case MLX_EVENT_TYPE_WQ_CATAS_ERROR:
-        /* Conservative fail-closed: a catastrophic WQ error means firmware's
-         * DMA is no longer trustworthy. Fence the whole device rather than
-         * guess which QP to flush (per-QP ERR transition is a follow-up once
-         * the EQE qpn layout is verified on hardware). */
-        if (s->core && s->core->GetHealth())
-            s->core->GetHealth()->MarkFatal();
-        QueueAsyncEvent(MLX_EVENT_WQ_FATAL, MLX_ASYNC_ELEMENT_DEVICE, 0);
+        QueueAsyncEvent(MLX_EVENT_QP_FATAL, MLX_ASYNC_ELEMENT_QP,
+                        (uint32_t)mlxGetBits(e, 0x1c8, 24));
         break;
     default:
+        /* The EQ subscribes to a fixed mask, so anything arriving here is a
+         * type firmware sent unasked. Naming it beats dropping it: this is the
+         * only place the driver would ever learn about one. */
+        MLX_LOG("unhandled async event type 0x%02x sub_type 0x%02x",
+                type, e[3]);
         break;
     }
 }
