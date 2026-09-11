@@ -36,14 +36,15 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-APP=/Applications/MlxRDMA.app
+APP=/Applications/MelonDMA.app
 ACT="$APP/Contents/MacOS/mlx_activate"
+LEGACY_APP=/Applications/MlxRDMA.app
 PLIST_DEXT=MlxRDMA.dext/Contents/Info.plist
 PLIST_LOADER=loader/LoaderInfo.plist
 SIGN_ID="${MLX_SIGN_ID:-Apple Development}"
 PROBE_TOOL="$PWD/build/mlx_rematch_probe"
 APPLE_PAT="AppleEthernetMLX5"
-OUR_PAT="com.melondma.rdma.dext.systemextension/Contents/MacOS/MlxRDMA"
+OUR_PAT="com.melondma.rdma.dext.systemextension/Contents/MacOS/(MlxRDMA|MelonDMA)"
 
 MAX_ROUNDS="${MLX_MAX_ROUNDS:-12}"
 LOCK_DIR="${TMPDIR:-/tmp}/melon-mlx-dev-${UID}.lock"
@@ -85,7 +86,7 @@ running_dext_version() {
     [ -n "$pid" ] || return 0
     path=$(ps -o command= -p "$pid" 2>/dev/null | awk '{print $1}')
     [ -n "$path" ] || return 0
-    plist="${path%/Contents/MacOS/MlxRDMA}/Contents/Info.plist"
+    plist="$(dirname "$path")/../Info.plist"
     [ -f "$plist" ] || return 0
     plutil -extract CFBundleVersion raw "$plist" 2>/dev/null || true
 }
@@ -345,6 +346,12 @@ do_takeover_ready() {
 
 # ---------- commands ----------
 do_driver_release() {
+    # Keep the live deactivation path compatible with installs made before the
+    # application was renamed to MelonDMA.app. New releases still use APP.
+    if [ ! -x "$ACT" ] && [ -x "$LEGACY_APP/Contents/MacOS/mlx_activate" ]; then
+        APP="$LEGACY_APP"
+        ACT="$APP/Contents/MacOS/mlx_activate"
+    fi
     sudo -v 2>/dev/null || fail "interactive sudo needed for driver-release"
     local O OP i out
     O=$(owner)
@@ -370,7 +377,7 @@ do_driver_release() {
     local request_rc=$?
     echo "$out"
     echo "$out" | grep -q 'REQUEST: deactivate com.melondma.rdma.dext' ||
-        fail "loader did not send the deactivation request; check a fresh build/MlxRDMA.app"
+        fail "loader did not send the deactivation request; check a fresh build/MelonDMA.app"
     echo "$out" | grep -q 'REPLACE:' &&
         fail "loader sent replace instead of deactivation"
     if ! echo "$out" | grep -q 'RESULT: completed'; then
@@ -437,9 +444,9 @@ do_doctor() {
         echo "    1) sudo systemextensionsctl reset"
         echo "    2) sudo reboot"
         echo "    3) systemextensionsctl list  → expect 0 extension(s)"
-        echo "    4) sudo rm -rf /Applications/MlxRDMA.app"
+        echo "    4) sudo rm -rf /Applications/MelonDMA.app"
         echo "    5) ./scripts/mlx_dev.sh build   (builds a new version + installs the app)"
-        echo "    6) sudo /Applications/MlxRDMA.app/Contents/MacOS/mlx_activate"
+        echo "    6) sudo /Applications/MelonDMA.app/Contents/MacOS/mlx_activate"
         echo "       → NEEDS APPROVAL → System Settings > Login Items & Extensions > Allow"
         echo "       → repeat the activation → RESULT: completed"
         echo "    7) sudo reboot   (so the persona gets into the kernel catalog)"
@@ -477,7 +484,9 @@ do_build() {
     fi
 
     # rm -rf is mandatory: cp -R onto an existing folder does NOT overwrite but NESTS (notes/35)
-    sudo rm -rf "$APP" && sudo cp -R build/MlxRDMA.app "$APP" || fail "cp to /Applications"
+    sudo rm -rf "$APP" && sudo cp -R build/MelonDMA.app "$APP" || fail "cp to /Applications"
+    # Remove the legacy container so macOS cannot keep presenting MlxRDMA.
+    [ "$APP" = "/Applications/MelonDMA.app" ] && sudo rm -rf "$LEGACY_APP"
     log "installed: $APP ($newver)"
 }
 

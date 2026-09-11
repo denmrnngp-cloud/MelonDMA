@@ -4,24 +4,28 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>MelonDMA</string>
 	<key>CFBundleExecutable</key>
-	<string>MlxRDMA</string>
+	<string>MelonDMA</string>
+	<key>CFBundleIconFile</key>
+	<string>MelonDMA.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.melondma.rdma.dext</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>MlxRDMA</string>
+	<string>MelonDMA</string>
 	<key>CFBundlePackageType</key>
 	<string>DEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.539</string>
+	<string>0.547</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>DriverKit</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>0.539</string>
+	<string>0.547</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>MlxPCIDriver</key>

@@ -2,7 +2,7 @@
 # gate-p1-check.sh - post-reboot verification: activate MlxRDMA.dext and look
 # for the Gate P1 log line (MMIO read of fw_rev) from MlxPCIDriver::Start.
 set -u
-APP=/Applications/MlxRDMA.app
+APP=/Applications/MelonDMA.app
 BIN=$APP/Contents/MacOS/mlx_activate
 
 echo "=== developer mode: $(systemextensionsctl developer 2>/dev/null) ==="

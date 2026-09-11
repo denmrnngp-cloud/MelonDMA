@@ -15,7 +15,7 @@ cd "$ROOT"
 
 APP_ID=com.melondma.rdma.loader
 DEXT_ID=com.melondma.rdma.dext
-APP_NAME=MlxRDMA.app
+APP_NAME=MelonDMA.app
 INSTALL_APP=/Applications/$APP_NAME
 DIST_DIR=${DIST_DIR:-$ROOT/dist}
 PRODUCTION_APP=$DIST_DIR/$APP_NAME
@@ -144,7 +144,7 @@ verify_artifact() {
     local app=${1:-$PRODUCTION_APP}
     local dext=$app/Contents/Library/SystemExtensions/$DEXT_ID.systemextension
     need_file "$app/Contents/MacOS/mlx_activate" "loader executable missing"
-    need_file "$dext/Contents/MacOS/MlxRDMA" "embedded DEXT missing"
+    need_file "$dext/Contents/MacOS/MelonDMA" "embedded DEXT missing"
     codesign --verify --deep --strict --verbose=2 "$app"
     spctl --assess --type execute --verbose=2 "$app"
     xcrun stapler validate "$app"
@@ -247,6 +247,7 @@ install_app() {
     verify_artifact "$PRODUCTION_APP"
     [ -f "$PRODUCTION_PKG" ] || die "production package missing: $PRODUCTION_PKG"
     sudo /usr/sbin/installer -pkg "$PRODUCTION_PKG" -target /
+    sudo rm -rf /Applications/MlxRDMA.app
     "$INSTALL_APP/Contents/MacOS/mlx_activate" --activate
     systemextensionsctl list | grep -Fq "$DEXT_ID" || die "system extension not registered"
     say "install request completed; a cold reboot may be required for first PCI match"

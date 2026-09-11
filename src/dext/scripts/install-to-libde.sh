@@ -34,5 +34,8 @@ mkdir -p "$DEST"
 
 cp "$SRC/Contents/Info.plist" "$DEST/Info.plist"
 cp "$SRC/Contents/MacOS/$EXEC_NAME" "$DEST/$EXEC_NAME"
+if [ -d "$SRC/Contents/Resources" ]; then
+    cp -R "$SRC/Contents/Resources" "$DEST/"
+fi
 
 echo OK; ls -la /Library/DriverExtensions/ "$DEST/"

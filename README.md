@@ -80,7 +80,7 @@ symbols real consumers need, including a real `ibv_qp_to_qp_ex`.
 | `src/dext/usermode/librdma_shim/` | IOUserClient shim library |
 | `src/dext/tools/` | Diagnostic tools (probe, perf, port counters, benches) |
 | `src/dext/scripts/` | Dev-cycle, takeover, hot-update, production scripts |
-| `src/dext/loader/` | The `MlxRDMA.app` activation host |
+| `src/dext/loader/` | The `MelonDMA.app` activation host |
 | `docs/` | Architecture and the inference-client guide |
 
 ---
@@ -153,7 +153,7 @@ driver and developer boot-args.
 The supported bring-up flow is encoded in the scripts (see next section). In
 short:
 
-1. Sign with your Apple Development identity and install `MlxRDMA.app`.
+1. Sign with your Apple Development identity and install `MelonDMA.app`.
 2. Activate the system extension (the loader requests activation; approve it in
    System Settings → Login Items & Extensions).
 3. Reboot once so the kernel catalog knows the new PCI personality.

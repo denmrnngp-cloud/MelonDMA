@@ -164,9 +164,10 @@ build/MlxRDMA: $(DEXT_IMPLS) $(DEXT_SRCS) $(DEXT_HDRS) $(GEN_HDRS) | build
 
 dext: build/MlxRDMA | build
 	rm -rf $(DEXT_BUNDLE)
-	mkdir -p $(DEXT_BUNDLE)/Contents/MacOS
-	cp build/MlxRDMA $(DEXT_BUNDLE)/Contents/MacOS/MlxRDMA
+	mkdir -p $(DEXT_BUNDLE)/Contents/MacOS $(DEXT_BUNDLE)/Contents/Resources
+	cp build/MlxRDMA $(DEXT_BUNDLE)/Contents/MacOS/MelonDMA
 	cp MlxRDMA.dext/Contents/Info.plist $(DEXT_BUNDLE)/Contents/
+	cp MlxRDMA.dext/Contents/Resources/MelonDMA.icns $(DEXT_BUNDLE)/Contents/Resources/
 	@echo "=== built $(DEXT_BUNDLE) (unsigned; make sign) ==="
 
 # Local signing for developer-mode loading (SIP disabled).
@@ -179,14 +180,15 @@ sign: dext
 
 # Host app embedding the dext; activation requires an app using the
 # SystemExtensions framework (systemextensionsctl install no longer exists).
-APP := build/MlxRDMA.app
+APP := build/MelonDMA.app
 
 app: check-plist sign
 	swiftc -O -framework SystemExtensions loader/mlx_activate.swift -o build/mlx_activate
 	rm -rf $(APP)
-	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Library/SystemExtensions
+	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources $(APP)/Contents/Library/SystemExtensions
 	cp build/mlx_activate $(APP)/Contents/MacOS/mlx_activate
 	cp loader/LoaderInfo.plist $(APP)/Contents/Info.plist
+	cp MlxRDMA.dext/Contents/Resources/MelonDMA.icns $(APP)/Contents/Resources/
 	# modern macOS scans *.systemextension (the .dext name is pre-Catalina);
 	# sysextd requires the directory name to match CFBundleIdentifier
 	cp -R $(DEXT_BUNDLE) $(APP)/Contents/Library/SystemExtensions/com.melondma.rdma.dext.systemextension

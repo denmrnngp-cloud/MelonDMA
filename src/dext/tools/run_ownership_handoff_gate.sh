@@ -14,7 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEXT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-ACT="/Applications/MlxRDMA.app/Contents/MacOS/mlx_activate"
+ACT="/Applications/MelonDMA.app/Contents/MacOS/mlx_activate"
 CYCLES="${OWNERSHIP_HANDOFF_CYCLES:-3}"
 TIMEOUT="${OWNERSHIP_HANDOFF_TIMEOUT:-45}"
 STATE="${OWNERSHIP_HANDOFF_STATE:-$DEXT_DIR/build/ownership-handoff.state}"

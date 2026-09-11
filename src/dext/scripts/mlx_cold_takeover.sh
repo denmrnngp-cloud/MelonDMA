@@ -7,9 +7,17 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-APP=/Applications/MlxRDMA.app
+APP=/Applications/MelonDMA.app
 ACT="$APP/Contents/MacOS/mlx_activate"
+if [ ! -x "$ACT" ] && [ -x /Applications/MlxRDMA.app/Contents/MacOS/mlx_activate ]; then
+    # Compatibility with a clean-install cycle started before the app rename.
+    APP=/Applications/MlxRDMA.app
+    ACT="$APP/Contents/MacOS/mlx_activate"
+fi
 TEAM="${MLX_TEAM_ID:-}"
+if [ -z "$TEAM" ] && [ -x "$ACT" ]; then
+    TEAM=$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -1)
+fi
 BUNDLE=com.melondma.rdma.dext
 APPLE=AppleEthernetMLX5
 

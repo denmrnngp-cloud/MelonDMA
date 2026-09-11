@@ -12,7 +12,7 @@ owner() {
 }
 
 active_pid() {
-    pgrep -f '/Library/SystemExtensions/.*/com.melondma.rdma.dext.systemextension/Contents/MacOS/MlxRDMA' |
+    pgrep -f '/Library/SystemExtensions/.*/com.melondma.rdma.dext.systemextension/Contents/MacOS/(MlxRDMA|MelonDMA)' |
         head -1 || true
 }
 
@@ -29,7 +29,7 @@ recover_swap() {
     sudo -v
     pid=$(active_pid)
     [ -n "$pid" ] || {
-        echo "ERROR: stale swap has no live MlxRDMA process to restart." >&2
+        echo "ERROR: stale swap has no live MelonDMA/MlxRDMA process to restart." >&2
         return 1
     }
     sudo kill -TERM "$pid"
@@ -61,10 +61,10 @@ if [ "${1:-}" = "--check" ]; then
         exit 1
     fi
     [ -n "$(active_pid)" ] || {
-        echo "ERROR: no active MlxRDMA process." >&2
+        echo "ERROR: no active MelonDMA/MlxRDMA process." >&2
         exit 1
     }
-    echo "HOT_UPDATE_CHECK PASS: one active MlxRDMA process owns ethernet@0"
+    echo "HOT_UPDATE_CHECK PASS: one active MelonDMA process owns ethernet@0"
     systemextensionsctl list 2>/dev/null | grep -i 'com.melondma.rdma.dext'
     exit 0
 fi
